@@ -52,7 +52,7 @@
     "jsonwebtoken": "^9.0.2",
     "nodemailer": "^10.0.9",
     "uuidv7": "^1.1.0",
-    "zod": "^4.4.3"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.3",
