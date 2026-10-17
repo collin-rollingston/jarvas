@@ -6,6 +6,7 @@ import {
   ComposerPrimitive,
   MessagePrimitive,
   ThreadPrimitive,
+  unstable_useComposerInput,
   useLocalRuntime,
   type ChatModelAdapter,
 } from '@assistant-ui/react';
@@ -32,18 +33,18 @@ interface AssistantChatElement extends HTMLElement {
 }
 
 type ChatLabels = {
-  ready: string;
-  connectAgent: string;
   connected: string;
   notConnected: string;
-  cardTitle: string;
-  cardBody: string;
+  threads: string;
+  newThread: string;
+  currentThread: string;
   emptyTitle: string;
   emptyBody: string;
+  promptLabel: string;
+  suggestions: string[];
   inputLabel: string;
   inputPlaceholder: string;
   send: string;
-  composerNote: string;
 };
 
 const disconnectedAdapter: ChatModelAdapter = {
@@ -63,122 +64,210 @@ function Chat({
   labels: ChatLabels;
   locale: string;
 }) {
+  const [threadKey, setThreadKey] = React.useState(0);
+  const startNewThread = () => setThreadKey((key) => key + 1);
+
+  return (
+    <main
+      className="assistant-chat"
+      aria-label="Assistant chat"
+      lang={locale}
+    >
+      <aside
+        className="thread-sidebar"
+        aria-label={labels.threads}
+      >
+        <div className="brand">
+          <span
+            className="brand-mark"
+            aria-hidden="true"
+          >
+            &#10037;
+          </span>
+          <h1>Jarvas</h1>
+        </div>
+        <button
+          className="new-thread-button"
+          type="button"
+          onClick={startNewThread}
+        >
+          <span
+            className="new-thread-icon"
+            aria-hidden="true"
+          >
+            +
+          </span>
+          {labels.newThread}
+        </button>
+        <div className="thread-list">
+          <p className="sidebar-label">{labels.threads}</p>
+          <div
+            className="thread-row"
+            aria-current="page"
+          >
+            <span
+              className="thread-indicator"
+              aria-hidden="true"
+            />
+            <span>{labels.currentThread}</span>
+          </div>
+        </div>
+      </aside>
+      <section
+        className="chat-panel"
+        aria-label="Assistant conversation"
+      >
+        <header className="chat-toolbar">
+          <button
+            className="mobile-new-thread"
+            type="button"
+            onClick={startNewThread}
+          >
+            <span aria-hidden="true">+</span>
+            {labels.newThread}
+          </button>
+          <h2>{labels.currentThread}</h2>
+          <span
+            className={`connection-state${connected ? ' is-connected' : ''}`}
+            aria-live="polite"
+          >
+            {connected ? labels.connected : labels.notConnected}
+          </span>
+          <slot name="return-link" />
+        </header>
+        <Conversation
+          key={threadKey}
+          connected={connected}
+          adapter={adapter}
+          labels={labels}
+        />
+      </section>
+    </main>
+  );
+}
+
+function Conversation({
+  connected,
+  adapter,
+  labels,
+}: {
+  connected: boolean;
+  adapter: ChatModelAdapter;
+  labels: ChatLabels;
+}) {
   const runtime = useLocalRuntime(adapter);
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
-      <main
-        className="assistant-chat"
-        aria-label="Assistant chat"
-        lang={locale}
-      >
-        <header className="chat-heading">
-          <span
-            className="chat-mark"
-            aria-hidden="true"
-          >
-            ✳
-          </span>
-          <div>
-            <h1>Jarvas</h1>
-            <p>{connected ? labels.ready : labels.connectAgent}</p>
-          </div>
-          <span className={`connection-state${connected ? ' is-connected' : ''}`}>
-            {connected ? labels.connected : labels.notConnected}
-          </span>
-        </header>
-        {!connected && (
-          <section
-            className="connection-card"
-            aria-live="polite"
-          >
-            <span
-              className="connection-icon"
-              aria-hidden="true"
-            >
-              ↗
-            </span>
-            <div>
-              <h2>{labels.cardTitle}</h2>
-              <p>{labels.cardBody}</p>
-            </div>
-          </section>
-        )}
-        <Thread
-          connected={connected}
-          labels={labels}
-        />
-      </main>
+      <ThreadPrimitive.Root className="thread-root">
+        <ThreadPrimitive.Viewport
+          className="thread-viewport"
+          turnAnchor="top"
+        >
+          <AuiIf condition={(state) => state.thread.isEmpty}>
+            <EmptyThread
+              connected={connected}
+              labels={labels}
+            />
+          </AuiIf>
+          <AuiIf condition={(state) => !state.thread.isEmpty}>
+            <>
+              <ThreadPrimitive.Messages>
+                {({ message }) => (
+                  <MessagePrimitive.Root
+                    className={`message ${message.role === 'user' ? 'user-message' : 'assistant-message'}`}
+                  >
+                    <MessagePrimitive.Parts />
+                  </MessagePrimitive.Root>
+                )}
+              </ThreadPrimitive.Messages>
+              <ThreadPrimitive.ViewportFooter className="composer-footer">
+                <Composer
+                  connected={connected}
+                  labels={labels}
+                />
+              </ThreadPrimitive.ViewportFooter>
+            </>
+          </AuiIf>
+        </ThreadPrimitive.Viewport>
+      </ThreadPrimitive.Root>
     </AssistantRuntimeProvider>
   );
 }
 
-function Thread({ connected, labels }: { connected: boolean; labels: ChatLabels }) {
+function EmptyThread({ connected, labels }: { connected: boolean; labels: ChatLabels }) {
+  const composer = unstable_useComposerInput({ disabled: !connected });
+
   return (
-    <ThreadPrimitive.Root className="thread-root">
-      <ThreadPrimitive.Viewport
-        className="thread-viewport"
-        turnAnchor="top"
+    <div className="empty-thread">
+      <div className="empty-heading">
+        <h3>{labels.emptyTitle}</h3>
+        <p>{labels.emptyBody}</p>
+      </div>
+      <Composer
+        connected={connected}
+        labels={labels}
+      />
+      <div
+        className="prompt-list"
+        role="group"
+        aria-label={labels.promptLabel}
       >
-        <AuiIf condition={(state) => state.thread.isEmpty}>
-          <div className="empty-thread">
-            <span
-              className="empty-glyph"
-              aria-hidden="true"
-            >
-              ✳
-            </span>
-            <h2>{labels.emptyTitle}</h2>
-            <p>{labels.emptyBody}</p>
-          </div>
-        </AuiIf>
-        <ThreadPrimitive.Messages>
-          {({ message }) => (
-            <MessagePrimitive.Root
-              className={`message ${message.role === 'user' ? 'user-message' : 'assistant-message'}`}
-            >
-              <MessagePrimitive.Parts />
-            </MessagePrimitive.Root>
-          )}
-        </ThreadPrimitive.Messages>
-        <ThreadPrimitive.ViewportFooter className="composer-footer">
-          <ComposerPrimitive.Root className="composer">
-            <ComposerPrimitive.Input
-              aria-label={labels.inputLabel}
-              placeholder={labels.inputPlaceholder}
-              className="composer-input"
-              rows={1}
-              disabled={!connected}
-            />
-            <ComposerPrimitive.Send
-              className="send-button"
-              disabled={!connected}
-              aria-label={labels.send}
-            >
-              ↑
-            </ComposerPrimitive.Send>
-          </ComposerPrimitive.Root>
-          <p className="composer-note">{labels.composerNote}</p>
-        </ThreadPrimitive.ViewportFooter>
-      </ThreadPrimitive.Viewport>
-    </ThreadPrimitive.Root>
+        {labels.suggestions.map((suggestion) => (
+          <button
+            className="prompt-button"
+            key={suggestion}
+            type="button"
+            disabled={!connected}
+            onClick={() => composer.setText(suggestion)}
+          >
+            {suggestion}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function Composer({ connected, labels }: { connected: boolean; labels: ChatLabels }) {
+  return (
+    <ComposerPrimitive.Root className="composer">
+      <ComposerPrimitive.Input
+        aria-label={labels.inputLabel}
+        placeholder={labels.inputPlaceholder}
+        className="composer-input"
+        rows={1}
+        disabled={!connected}
+      />
+      <ComposerPrimitive.Send
+        className="send-button"
+        disabled={!connected}
+        aria-label={labels.send}
+      >
+        &#8593;
+      </ComposerPrimitive.Send>
+    </ComposerPrimitive.Root>
   );
 }
 
 const DEFAULT_LABELS: ChatLabels = {
-  ready: 'Your assistant is ready',
-  connectAgent: 'Connect an agent to get started',
   connected: 'Connected',
   notConnected: 'Not connected',
-  cardTitle: 'Your workspace, ready for an agent',
-  cardBody:
-    'The chat interface is installed locally. Connect your agent to start a conversation.',
-  emptyTitle: 'What would you like to work on?',
+  threads: 'Threads',
+  newThread: 'New thread',
+  currentThread: 'New chat',
+  emptyTitle: 'How can I help you today?',
   emptyBody: 'Your tasks and plans will be ready to discuss here.',
+  promptLabel: 'Try one of these prompts',
+  suggestions: [
+    'Plan my day',
+    'Break down a task',
+    'Help me prioritize',
+    'Capture a task',
+  ],
   inputLabel: 'Message your assistant',
-  inputPlaceholder: 'Message your assistant…',
+  inputPlaceholder: 'Send a message...',
   send: 'Send message',
-  composerNote: 'Your agent connection will enable chat.',
 };
 
 class AssistantChat extends HTMLElement implements AssistantChatElement {
