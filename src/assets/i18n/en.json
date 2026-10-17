@@ -1,4 +1,21 @@
 {
+  "AUI": {
+    "NAV_LABEL": "Assistant",
+    "RETURN_TO_APP": "Back to tasks",
+    "READY": "Your assistant is ready",
+    "CONNECT_AGENT": "Connect an agent to get started",
+    "CONNECTED": "Connected",
+    "NOT_CONNECTED": "Not connected",
+    "CARD_TITLE": "Your workspace, ready for an agent",
+    "CARD_BODY": "The chat interface is installed locally. Connect your agent to start a conversation. Your tasks stay in this app until you choose an agent.",
+    "EMPTY_TITLE": "What would you like to work on?",
+    "EMPTY_BODY": "Your tasks and plans will be ready to discuss here.",
+    "INPUT_LABEL": "Message your assistant",
+    "INPUT_PLACEHOLDER": "Message your assistant…",
+    "SEND": "Send message",
+    "COMPOSER_NOTE": "Your agent connection will enable chat.",
+    "LOAD_ERROR": "The local assistant interface could not be loaded. Build app packages and reload the app."
+  },
   "APP": {
     "B_INSTALL": {
       "IGNORE": "Ignore",

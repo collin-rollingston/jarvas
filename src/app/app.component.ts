@@ -406,6 +406,10 @@ export class AppComponent implements OnDestroy, AfterViewInit {
     return outlet.activatedRouteData.page || 'one';
   }
 
+  isAssistantChat(): boolean {
+    return this._routerOutlet?.activatedRouteData.chatShell === true;
+  }
+
   /**
    * The background context menu is scoped to the task-list / work-view routes
    * (`tag/:id/tasks`, `project/:id/tasks`) so it never opens on unrelated pages

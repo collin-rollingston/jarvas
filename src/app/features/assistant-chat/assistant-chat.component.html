@@ -1,0 +1,8 @@
+<a class="return-link" routerLink="/" [attr.aria-label]="T.AUI.RETURN_TO_APP | translate">
+  {{ T.AUI.RETURN_TO_APP | translate }}
+</a>
+<assistant-chat-ui #chatUi></assistant-chat-ui>
+
+@if (loadError()) {
+  <p class="load-error" role="alert">{{ loadError() }}</p>
+}

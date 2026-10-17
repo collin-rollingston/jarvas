@@ -70,6 +70,24 @@ develop plugins inside this folder. SolidJS/Vite plugins such as
 
 ## Development Workflow
 
+### First-party assistant chat UI
+
+`assistant-chat-ui/` builds the app's first-party chat shell as one local custom
+element bundle. Its pinned React and `@assistant-ui/react` dependencies live in
+this isolated workspace, not the root app dependencies. The build packages its
+JavaScript into `src/assets/bundled-plugins/assistant-chat-ui/`; the Angular
+`/assistant` route loads that asset on demand. The shipped UI does not load code,
+fonts, styles, or other assets from a remote host. Its local third-party license
+notice is in [assistant-chat-ui/LICENSES.md](assistant-chat-ui/LICENSES.md).
+
+Run `npm run build:assistant-chat-ui` at the repository root to build only this
+bundle; standard frontend serve scripts run this step automatically. The full
+`npm run build:packages` also builds it along with the other packages. The route
+is a shell pilot: the composer stays disabled until the app provides an
+`ASSISTANT_CHAT_ADAPTER` implementing the host-owned streaming contract in
+`src/app/features/assistant-chat/assistant-chat.model.ts`. No agent endpoint is
+configured by this package.
+
 Scripts vary per plugin; check its `package.json`. Most TypeScript plugins have:
 
 ```bash
