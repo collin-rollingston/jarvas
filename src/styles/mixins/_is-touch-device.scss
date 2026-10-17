@@ -1,0 +1,58 @@
+// NOTE: rather than using media queries we do this to assure JS and CSS method are the same
+@mixin touchOnlyDevice {
+  :host-context(.isTouchOnly) & {
+    @content;
+  }
+}
+
+@mixin noTouchOnly {
+  :host-context(.isNoTouchOnly) & {
+    @content;
+  }
+}
+
+@mixin touchPrimaryDevice {
+  :host-context(.isTouchPrimary) & {
+    @content;
+  }
+}
+
+@mixin mousePrimaryDevice($isGlobal: false) {
+  @if $isGlobal {
+    .isMousePrimary & {
+      @content;
+    }
+  } @else {
+    :host-context(.isMousePrimary) & {
+      @content;
+    }
+  }
+}
+
+// Highlight that does not stick after a tap. Touch browsers keep `:hover` (and
+// `:focus` on tapped links/buttons) on the last tapped element until the next
+// tap elsewhere, so a tapped row stays highlighted like a web page. Instead:
+// hover only where a pointer can hover, keyboard focus via `:focus-visible`,
+// and `:active` for the immediate touch-down feedback a native list row gives.
+// Same specificity as the plain `&:hover, &:focus` pair it replaces.
+@mixin interactiveHighlight {
+  @media (hover: hover) {
+    &:hover {
+      @content;
+    }
+  }
+
+  &:focus-visible,
+  &:active {
+    @content;
+  }
+}
+
+// Hover-only effect (no press state), e.g. revealing controls or a lift/zoom.
+@mixin hoverWithPointer {
+  @media (hover: hover) {
+    &:hover {
+      @content;
+    }
+  }
+}

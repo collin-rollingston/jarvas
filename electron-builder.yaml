@@ -1,0 +1,253 @@
+appId: superProductivity
+productName: Super Productivity
+artifactName: ${name}-${arch}.${ext}
+
+files:
+  - electron/**/*
+  - '!electron/**/*.ts'
+  - '!electron/**/*.test.cjs'
+  - '!electron/**/*.js.map'
+  - .tmp/angular-dist/**/*
+  - 'embedded.provisionprofile'
+  # Exclude Nx binaries - they're build tools, not runtime dependencies
+  - '!**/@nx/nx-darwin-*/**'
+  - '!**/@nx/nx-linux-*/**'
+  - '!**/@nx/nx-win32-*/**'
+  # Capacitor (mobile shim) - never required from electron/ at runtime
+  - '!**/@capacitor/**'
+  - '!**/@capawesome/**'
+  - '!**/capacitor-plugin-safe-area/**'
+  # sharp + libvips native binaries - only used by tools/generate-*-icon.js
+  # during local dev; ~33 MB of unused weight in the asar otherwise
+  - '!**/sharp/**'
+  - '!**/@img/**'
+  # Nx LMDB cache and Rollup pulled in transitively by build tooling
+  - '!**/@lmdb/**'
+  - '!**/@rollup/**'
+  # Compiled into the Angular CSS bundle; the node_modules copy is unused
+  - '!**/@material-symbols/**'
+  # @noble/ciphers and hash-wasm are imported by the Angular bundle and
+  # inlined by the bundler (WASM is base64-embedded). The node_modules
+  # copies are dead weight at runtime.
+  - '!**/@noble/**'
+  - '!**/hash-wasm/**'
+  # uuidv7 is imported by src/ (Angular bundle inlines it); not used by electron/
+  - '!**/uuidv7/**'
+#afterSign: ./tools/notarizeMacApp.js
+
+directories:
+  output: './.tmp/app-builds'
+
+beforePack: ./tools/beforePack.js
+
+# Post-pack hook that installs a shell wrapper for Linux builds to force
+# --ozone-platform=x11 in Snap+Wayland sessions.
+# See tools/afterPack.js + build/linux/snap-wrapper.sh and
+# docs/research/snap-wayland-gpu-fix-research.md.
+afterPack: ./tools/afterPack.js
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - arm64
+        - x64
+    - target: portable
+      arch:
+        - arm64
+        - x64
+  publish:
+    - github
+nsis:
+  # Hardcoded to avoid spaces (SignPath converts spaces to dots). Also referenced in build.yml.
+  # Deliberately no ${arch}: NsisTarget.finishBuild emits the universal installer
+  # *and* one per arch whenever the resolved artifactName contains ${arch} AND
+  # 2+ archs are configured, so every release submitted the same payload twice
+  # (892 MB of exe against a size-based yearly quota, which we exhausted in Aug
+  # 2026 and which blocked Windows releases entirely).
+  # The universal installer selects the payload at runtime via IsNativeARM64 /
+  # RunningX64 (app-builder-lib templates/nsis/include/extractAppPackage.nsh),
+  # so keeping only it halves the signing volume without asking users which
+  # architecture they are on. Do not reintroduce ${arch} without re-checking
+  # the quota headroom.
+  artifactName: Super-Productivity-Setup.${ext}
+  # allow to install to custom location
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  # We ship no in-app auto-updater: electron-updater is not a dependency and the
+  # autoUpdater block in electron/start-app.ts is commented out. elevate.exe is
+  # only ever invoked by electron-updater to apply privileged (per-machine)
+  # updates, so electron-builder bundles it here as dead weight that AV engines
+  # frequently false-positive on. Drop it. Safe because perMachine is not true
+  # (with perMachine: true, packElevateHelper: false is ignored). See #8135.
+  packElevateHelper: false
+portable:
+  # No ${arch}, for the same reason as nsis.artifactName above: the universal
+  # portable covers both archs and halves what we submit for signing. The
+  # release workflow creates the old architecture-specific names after signing.
+  artifactName: ${name}.${ext}
+appx:
+  applicationId: SuperProductivity
+  displayName: Super Productivity
+  publisherDisplayName: johannesjo
+  publisher: CN=___-___
+  identityName: ___johannesjo.SuperProductivity
+
+linux:
+  # Fix for issue #5259: Set executable name without spaces for snap compatibility
+  executableName: superproductivity
+  category: Office;ProjectManagement
+  mimeTypes:
+    - x-scheme-handler/superproductivity
+  desktop:
+    entry:
+      # Must equal LINUX_DESKTOP_NAME in electron/start-app.ts, which pins the
+      # XDG app id that Electron 42+ uses for both the X11 WM_CLASS and the
+      # Wayland app_id. Enforced by tools/verify-linux-wm-class.test.js.
+      # Reverts #9634: `superproductivity-bin` matched the Wayland app_id only on
+      # Electron <= 41, where it came from the renamed binary's basename (#9450).
+      # The Electron 43 bump (#9571, v18.20.0) moved it to the XDG app id, so the
+      # `-bin` value now matches nothing on either session type.
+      StartupWMClass: superproductivity
+  target:
+    - AppImage
+    - deb
+    - snap
+    - rpm
+  publish:
+    - github
+
+rpm:
+  # Fix for issue #5368: Prevent /usr/lib/.build-id/ collisions with other Electron apps
+  fpm: ['--rpm-rpmbuild-define=_build_id_links none']
+# leads to Error: Please specify executable name as linux.executableName instead of linux.desktop.Exec
+#  desktop:
+#    Name: Super Productivity
+#    Comment: A todo list and time tracking app
+#    Exec: superProductivity
+#    Terminal: false
+#    Type: Application
+#    Icon: build/icon.png
+#    GenericName: ToDo List and Time Tracker
+
+snap:
+  # We upload the .snap to the Snap Store ourselves via Canonical's snapcraft
+  # container in CI (build.yml). electron-builder's snap target has a
+  # hard-coded fallback to `snapStore` in `findSnapPublishConfig` (snap.js):
+  # if `snap.publish` is unset, it falls through `linux.publish`/`config.publish`
+  # to `{ provider: "snapStore" }`, then invokes `snapcraft` on the runner
+  # during upload — and we no longer install snapcraft there (it was an
+  # unreliable `sudo snap install`). Setting `snap.publish: github` overrides
+  # that fallback. The .snap also lands on the GitHub release as a side effect,
+  # which is harmless (and a useful manual-download fallback).
+  publish: github
+  grade: stable
+  allowNativeWayland: true
+  autoStart: true
+  base: core22
+  confinement: strict
+  environment:
+    # Fix for issue #4920: Isolate fontconfig cache to prevent GTK dialog rendering issues
+    # https://github.com/super-productivity/super-productivity/issues/4920
+    FC_CACHEDIR: $SNAP_USER_DATA/.cache/fontconfig
+    # Fix for issue #7298: tray icon renders as three dots on Ubuntu 24.04+ snap.
+    # Chromium's StatusIconLinuxDbus writes the tray PNG to TMPDIR and sends
+    # its path to gnome-shell via the SNI IconThemePath property. The default
+    # /tmp inside a strict snap is bind-mounted to
+    # /tmp/snap-private-tmp/snap.<name>/tmp with mode 0700 on the parent, so
+    # gnome-shell (outside the mount namespace) cannot stat the file and
+    # falls back to 'image-loading-symbolic' (three dots). $XDG_RUNTIME_DIR
+    # (= /run/user/$UID) is visible to both sides, so redirecting Chromium's
+    # temp writes there restores icon rendering. Matches Signal Desktop's
+    # snap and the official Electron snapcraft guide. electron-builder's
+    # SnapOptions docstring claims this as a default but snap.js no longer
+    # injects it (see node_modules/app-builder-lib/out/targets/snap.js).
+    TMPDIR: $XDG_RUNTIME_DIR
+  plugs:
+    - default # Includes: home, desktop, desktop-legacy, x11, wayland, etc.
+    - password-manager-service
+    - system-observe
+    - login-session-observe
+    # Fix for issue #6031: Add filesystem access for local file sync
+    # https://github.com/super-productivity/super-productivity/issues/6031
+    - removable-media # Allows sync to external drives/USB storage
+    # Lets the opt-in local REST API / assistant endpoint listen on 127.0.0.1.
+    # Not in electron-builder's `default` plugs; today listening may only work
+    # through browser-support's seccomp rules, which core24 no longer includes.
+    # Auto-connects, so users see no prompt.
+    - network-bind
+    # Override electron-builder's hardcoded gnome-3-28-1804 content snap (core20 era)
+    # with gnome-42-2204 (core22 era) for up-to-date Mesa drivers and GSettings schemas.
+    # The plug name must match the template key to replace it rather than duplicate it.
+    # The explicit `content` attribute tells snapd to match the gnome-42-2204 slot.
+    # Pattern from Tidal HiFi: https://github.com/Mastermindzh/tidal-hifi
+    # gnome-42-2204 has global auto-connect (granted June 2022).
+    # Ref: electron-builder#9452, electron-builder#8548 (closed, not planned)
+    - gnome-3-28-1804:
+        interface: content
+        content: gnome-42-2204
+        target: $SNAP/gnome-platform
+        default-provider: gnome-42-2204
+
+flatpak:
+  runtimeVersion: '25.08'
+  finishArgs:
+    - --share=network
+    - --share=ipc
+    - --socket=x11
+    - --socket=wayland
+    - --socket=fallback-x11
+    - --socket=pulseaudio
+    - --device=dri
+    - --filesystem=home
+    - --talk-name=org.freedesktop.Notifications
+    - --talk-name=org.kde.StatusNotifierWatcher
+    - --talk-name=org.gnome.Mutter.IdleMonitor
+    - --talk-name=org.freedesktop.secrets
+    - --system-talk-name=org.freedesktop.login1
+    - --env=XCURSOR_PATH=/run/host/user-share/icons:/run/host/share/icons
+    - --env=ELECTRON_TRASH=gio
+
+mac:
+  appId: com.super-productivity.app
+  icon: build/icon.icns
+  type: distribution
+  category: public.app-category.productivity
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  provisioningProfile: embedded.provisionprofile
+  darkModeSupport: true
+  notarize: true
+  extendInfo:
+    ITSAppUsesNonExemptEncryption: false
+    # hardened runtime denies Apple Events without it; used by the app-auto-track plugin
+    NSAppleEventsUsageDescription: Super Productivity reads the frontmost app and window title to suggest which task to track.
+  publish:
+    - github
+  target:
+    #    - zip
+    - target: dmg
+      arch:
+        - arm64
+        - x64
+        - universal
+
+dmg:
+  sign: true
+  publish:
+    - github
+
+pkg:
+  publish: never
+# HERE: electron-builder.mas.yaml
+#mas:
+#  type: distribution
+#  category: public.app-category.productivity
+#  entitlements: build/entitlements.mas.plist
+#  entitlementsInherit: build/entitlements.mas.inherit.plist
+#  provisioningProfile: prod.provisionprofile
+#  icon: build/icon.icns
+#  hardenedRuntime: true
+#  publish: never

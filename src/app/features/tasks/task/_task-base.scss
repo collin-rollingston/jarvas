@@ -1,0 +1,307 @@
+@use '../../../../styles/_globals.scss' as *;
+@use 'task.component.mixins' as *;
+
+// TASK BOX STYLES
+// ---------------
+// NOTE: needs to come first to be overwritten by :host.isCurrent
+// NOTE: needs to be very light, because we're on a lighter background for the dark theme
+:host-context(.isDarkTheme) {
+  color: var(--text-color);
+}
+
+:host-context(.isDarkTheme).isSelected,
+:host-context(.isDarkTheme).isCurrent {
+  color: var(--text-color-most-intense);
+}
+
+:host {
+  --task-button-spacer: 1px;
+  --play-icon-size: 22px;
+  --mini-badge-size: var(--s2);
+
+  display: block;
+  position: relative;
+
+  color: var(--text-color);
+
+  // Rows are separated by a hairline (flat list look). Themes that want boxed
+  // tasks set --task-separator: none and give --task-border a value instead.
+  border-top: var(--task-separator);
+
+  &:not(:last-of-type) {
+    margin-bottom: var(--task-list-row-gap);
+  }
+
+  &:last-of-type {
+    border-bottom: var(--task-separator);
+  }
+
+  &.isSelected {
+    z-index: var(--z-is-selected-host);
+    //position: sticky;
+    //top: 16px;
+  }
+
+  &.isCurrent {
+    z-index: var(--z-is-current-host);
+    position: sticky;
+    top: var(--s);
+  }
+
+  &:focus {
+    z-index: var(--z-focus-host);
+    outline: none !important;
+  }
+
+  &.highlight-searched-task {
+    z-index: var(--z-focus-host);
+  }
+}
+
+.inner-wrapper {
+  position: relative;
+  // NOTE: -1 px because we move the box slightly up
+  padding: calc(var(--task-inner-padding-top-bottom) - 1px) 0
+    var(--task-inner-padding-top-bottom);
+  margin-bottom: 0;
+}
+
+.box {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  top: 0;
+  transition: var(--transition-standard);
+  transition-property: background-color, box-shadow;
+  border: var(--task-border);
+  border-radius: var(--task-border-radius);
+  box-shadow: none;
+
+  background: var(--task-c-bg);
+
+  :host-context(.isDarkTheme).isDone & {
+    background: var(--task-c-bg-done);
+  }
+
+  // Temporary attention highlight for a task revealed via navigation, e.g. from
+  // a search result (LayoutService.highlightTaskBriefly, #5476). An outline, so
+  // it stays clearly visible even once focus moves elsewhere, and it
+  // traces whatever radius the box already has — no border-radius of its own, so
+  // nothing can leak into the sub-task boxes (which are deliberately square).
+  :host.highlight-searched-task
+    > swipe-block
+    ::ng-deep
+    > .inner-wrapper
+    > .inner-wrapper
+    > & {
+    outline: var(--focus-ring-width) solid var(--c-accent);
+  }
+
+  :host.isCurrent.isCurrent.isCurrent.isCurrent.isCurrent
+    > swipe-block
+    ::ng-deep
+    > .inner-wrapper
+    > .inner-wrapper
+    > & {
+    background: var(--task-c-current-bg);
+    border-radius: var(--task-border-radius);
+    box-shadow: var(--task-current-shadow);
+  }
+
+  // Time conflict no longer draws a border/bar on the task box — it's surfaced as
+  // a danger "!" icon next to the schedule control instead (see .time-conflict-ico
+  // in _task-controls.scss and the template).
+  :host:first-child .inner-wrapper > & {
+    border-top-left-radius: var(--task-border-radius);
+    border-top-right-radius: var(--task-border-radius);
+  }
+
+  :host:last-child .inner-wrapper > & {
+    border-bottom-left-radius: var(--task-border-radius);
+    border-bottom-right-radius: var(--task-border-radius);
+  }
+}
+
+.sub-tasks {
+  margin: var(--s) var(--s) var(--s) var(--s3);
+  position: relative;
+
+  @include mq(xs) {
+    //margin: var(--s) var(--s2) var(--s) var(--s3);
+    margin: var(--s) var(--s) var(--s) var(--s5);
+  }
+
+  ::ng-deep .box {
+    box-shadow: var(--task-shadow-sub-task);
+    border-color: var(--sub-task-border-color);
+    border-radius: 0;
+    top: -1px;
+    // Overlap neighbours by 1px so adjacent subtask borders collapse to a single
+    // hairline. Was light-only (dark relied on a shadow); dark now uses a border
+    // too, so it needs the collapse as well.
+    bottom: 0;
+
+    @include darkTheme {
+      background: var(--sub-task-c-bg);
+    }
+  }
+
+  // No hairline on the first subtask (the block flows out of the parent's
+  // first line) and none below the last (the parent's own bottom line or the
+  // next task's top line closes it).
+  ::ng-deep task:first-of-type {
+    border-top: none;
+  }
+
+  ::ng-deep task:last-of-type {
+    border-bottom: none;
+  }
+
+  // The temporary search highlight uses a descendant selector, which leaks
+  // into subtask boxes because Angular emulated encapsulation shares the same
+  // _ngcontent attribute across all instances of the same component type.
+  // Without this, a highlighted parent would outline every subtask box too.
+  :host.highlight-searched-task & .inner-wrapper > .box {
+    outline: none;
+  }
+}
+
+:host-context(.isDarkTheme) ::ng-deep .isDone.isDone .box {
+  background: var(--sub-task-c-bg-done);
+}
+
+.first-line {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  flex-wrap: nowrap;
+  user-select: none;
+  justify-content: space-between;
+  @include grabCursor();
+  min-height: var(--task-first-line-min-height);
+  touch-action: pan-y;
+
+  @include mq(xs, max) {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+
+  //@include smallMainContainer{
+  //  flex-wrap: wrap;
+  //  justify-content: flex-end;
+  //}
+}
+
+.title-and-left-btns-wrapper {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  justify-content: center;
+  min-height: 36px;
+  flex-grow: 1;
+  flex-shrink: 1;
+  flex-basis: 70%;
+  // Without this the automatic minimum size keeps the wrapper at its min-content
+  // width, which the nowrap .parent-title carries as the full untruncated parent
+  // name. On narrow screens the wrapper then outgrows .first-line and, because we
+  // center here, the overflow is split evenly left and right — pushing the start
+  // of the title off the left edge (#9750).
+  min-width: 0;
+  // we cannot do this since this cuts of the box shadow of the task edit
+  //overflow: hidden;
+  -webkit-tap-highlight-color: transparent;
+
+  @include mq(xs, max) {
+    //margin-bottom: 5px;
+    //flex-shrink: 0;
+    flex-basis: 50%;
+  }
+
+  @include isDoneForFirstLine {
+    opacity: var(--task-is-done-dim-opacity);
+
+    ::ng-deep .display-value {
+      text-decoration: line-through;
+    }
+  }
+}
+
+// The task open in the detail panel has a surface highlight, distinct from
+// keyboard focus and multi-selection. Keep it on the owning row's box.
+:host.isSelected > swipe-block ::ng-deep > .inner-wrapper > .inner-wrapper > .box {
+  // Override theme resting surfaces, including nested task surfaces.
+  background: var(--task-c-selected-bg) !important;
+}
+
+// Multi-selection stays on the owning row, across SwipeBlock's projection wrapper.
+// The tint is what separates it from the focus ring below (a 1px vs 2px line in
+// one colour was not readable as two states). The 1px outline stays as the
+// fallback channel: `background` on this box is contested — the `isCurrent` chain
+// and the `isSelected` !important rule below both win, and several bundled themes
+// (velvet, and the `:not(.isSelected):not(.isCurrent)` hover rules) force it with
+// !important — whereas nothing else draws an outline here. It also survives
+// forced-colors mode, where author backgrounds are dropped.
+:host.isMultiSelected > swipe-block ::ng-deep > .inner-wrapper > .inner-wrapper > .box {
+  background: var(--task-c-multi-selected-bg);
+  outline: 1px solid var(--palette-primary-400);
+  outline-offset: -1px;
+}
+
+// Marks the row the user is on: the keyboard target inside a multi-selection,
+// and the clicked row when pointing. Two selectors, because a bare `:focus`
+// would leave the ring stuck on a tapped row for the rest of the session (the
+// host is `tabindex="0"`, so a tap focuses it):
+//   - `:focus` while mouse intent is active — covers clicks, and the scripted
+//     navigation and focus restoration this ring was restored for.
+//   - `:focus-visible` on its own — keyboard focus on a touch device, where no
+//     pointer other than a pen sets mouse intent.
+// Known edge: on a hybrid device, a row that was tapped and left focused picks
+// up the ring once the user moves the mouse and intent flips back.
+:host-context(.isMousePrimary):focus
+  > swipe-block
+  ::ng-deep
+  > .inner-wrapper
+  > .inner-wrapper
+  > .box,
+:host:focus-visible > swipe-block ::ng-deep > .inner-wrapper > .inner-wrapper > .box {
+  outline: var(--focus-ring-width) solid var(--palette-primary-400);
+  outline-offset: calc(-1 * var(--focus-ring-width));
+}
+
+// Touch selection mode: the leading slot shows an empty ring that fills solid
+// with the accent when selected (no tick inside).
+.select-ring {
+  flex: 0 0 var(--task-icon-size);
+  width: var(--task-icon-size);
+  height: var(--task-icon-size);
+  // Same slot and margin as the done-toggle it replaces (_task-controls.scss)
+  // so the title does not shift when the mode toggles.
+  margin-left: var(--s);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+
+  &::before {
+    content: '';
+    width: var(--done-toggle-glyph-size);
+    height: var(--done-toggle-glyph-size);
+    border-radius: 50%;
+    border: var(--s-quarter) solid var(--c-accent);
+    box-sizing: border-box;
+    transition: var(--transition-fast);
+    transition-property: background-color;
+  }
+
+  &.isOn::before {
+    background: var(--c-accent);
+  }
+}
+
+// In touch selection mode a tap anywhere on the row toggles it: row controls
+// (schedule / deadline / attachment / checklist / panel buttons) let the tap
+// fall through to the host. The subtask toggle stays live so nested rows can
+// be reached.
+:host.isTouchSelectionMode .all-controls-wrapper .ico-btn {
+  pointer-events: none;
+}

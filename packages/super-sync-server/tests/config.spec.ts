@@ -1,0 +1,409 @@
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+
+const originalEnv = { ...process.env };
+
+const resetEnv = (): void => {
+  process.env = { ...originalEnv };
+};
+
+// Import after env is set
+const importConfig = async () => {
+  return await import('../src/config');
+};
+
+describe('parseCorsOrigin', () => {
+  beforeEach(() => {
+    resetEnv();
+  });
+
+  afterEach(() => {
+    resetEnv();
+  });
+
+  describe('exact string origins', () => {
+    it('should return string as-is when no wildcard present', async () => {
+      const { parseCorsOrigin } = await importConfig();
+      const result = parseCorsOrigin('https://app.super-productivity.com');
+      expect(result).toBe('https://app.super-productivity.com');
+    });
+
+    it('should trim whitespace from exact origins', async () => {
+      const { parseCorsOrigin } = await importConfig();
+      const result = parseCorsOrigin('  https://example.com  ');
+      expect(result).toBe('https://example.com');
+    });
+  });
+
+  describe('wildcard subdomain origins', () => {
+    it('should convert https://*.example.com to RegExp', async () => {
+      const { parseCorsOrigin } = await importConfig();
+      const result = parseCorsOrigin('https://*.example.com');
+      expect(result).toBeInstanceOf(RegExp);
+      expect((result as RegExp).test('https://foo.example.com')).toBe(true);
+      expect((result as RegExp).test('https://bar.example.com')).toBe(true);
+    });
+
+    it('should match subdomain with port', async () => {
+      const { parseCorsOrigin } = await importConfig();
+      const result = parseCorsOrigin('http://*.localhost:4200');
+      expect(result).toBeInstanceOf(RegExp);
+      expect((result as RegExp).test('http://dev.localhost:4200')).toBe(true);
+    });
+
+    it('should match preview deployment pattern', async () => {
+      const { parseCorsOrigin } = await importConfig();
+      const result = parseCorsOrigin('https://*.super-productivity-preview.pages.dev');
+      expect(result).toBeInstanceOf(RegExp);
+      expect(
+        (result as RegExp).test('https://f5382282.super-productivity-preview.pages.dev'),
+      ).toBe(true);
+    });
+
+    it('should not match base domain without subdomain', async () => {
+      const { parseCorsOrigin } = await importConfig();
+      const result = parseCorsOrigin('https://*.example.com');
+      expect((result as RegExp).test('https://example.com')).toBe(false);
+    });
+
+    it('should not match different domain', async () => {
+      const { parseCorsOrigin } = await importConfig();
+      const result = parseCorsOrigin('https://*.example.com');
+      expect((result as RegExp).test('https://foo.otherdomain.com')).toBe(false);
+    });
+
+    it('should not match with path injection', async () => {
+      const { parseCorsOrigin } = await importConfig();
+      const result = parseCorsOrigin('https://*.example.com');
+      expect((result as RegExp).test('https://foo.example.com/path')).toBe(false);
+    });
+
+    it('should normalize domain to lowercase for case-insensitive matching', async () => {
+      const { parseCorsOrigin } = await importConfig();
+      const result = parseCorsOrigin('https://*.EXAMPLE.COM');
+
+      // Browsers send Origin header in lowercase per RFC 6454
+      expect((result as RegExp).test('https://sub.example.com')).toBe(true);
+      expect((result as RegExp).test('https://sub.EXAMPLE.COM')).toBe(true);
+    });
+
+    it('should normalize subdomain pattern domain to lowercase', async () => {
+      const { parseCorsOrigin } = await importConfig();
+      const result = parseCorsOrigin('https://*.Preview.Example.COM');
+
+      expect((result as RegExp).test('https://abc.preview.example.com')).toBe(true);
+    });
+  });
+
+  describe('validation errors', () => {
+    it('should reject multiple wildcards', async () => {
+      const { parseCorsOrigin } = await importConfig();
+      expect(() => parseCorsOrigin('https://*.*.example.com')).toThrow(
+        'multiple wildcards not allowed',
+      );
+    });
+
+    it('should reject wildcard in domain position', async () => {
+      const { parseCorsOrigin } = await importConfig();
+      expect(() => parseCorsOrigin('https://example.*')).toThrow(
+        'wildcard only allowed as subdomain',
+      );
+    });
+
+    it('should reject wildcard without domain', async () => {
+      const { parseCorsOrigin } = await importConfig();
+      expect(() => parseCorsOrigin('https://*')).toThrow(
+        'wildcard only allowed as subdomain',
+      );
+    });
+
+    it('should reject wildcard in protocol', async () => {
+      const { parseCorsOrigin } = await importConfig();
+      expect(() => parseCorsOrigin('*://example.com')).toThrow(
+        'wildcard only allowed as subdomain',
+      );
+    });
+
+    it('should reject wildcard in path', async () => {
+      const { parseCorsOrigin } = await importConfig();
+      expect(() => parseCorsOrigin('https://example.com/*')).toThrow(
+        'wildcard only allowed as subdomain',
+      );
+    });
+
+    it('should reject empty origin', async () => {
+      const { parseCorsOrigin } = await importConfig();
+      expect(() => parseCorsOrigin('')).toThrow('cannot be empty');
+    });
+
+    it('should reject whitespace-only origin', async () => {
+      const { parseCorsOrigin } = await importConfig();
+      expect(() => parseCorsOrigin('   ')).toThrow('cannot be empty');
+    });
+  });
+
+  describe('parseCorsOrigin security', () => {
+    it('should reject domain confusion in wildcard patterns', async () => {
+      const { parseCorsOrigin } = await importConfig();
+      const result = parseCorsOrigin('https://*.super-productivity-preview.pages.dev');
+
+      expect(
+        (result as RegExp).test('https://evil.com.super-productivity-preview.pages.dev'),
+      ).toBe(false);
+      expect(
+        (result as RegExp).test('https://a.b.super-productivity-preview.pages.dev'),
+      ).toBe(false);
+    });
+
+    it('should only allow alphanumeric and hyphens in wildcard subdomains', async () => {
+      const { parseCorsOrigin } = await importConfig();
+      const result = parseCorsOrigin('https://*.example.com');
+
+      // Should match valid subdomains
+      expect((result as RegExp).test('https://abc123.example.com')).toBe(true);
+      expect((result as RegExp).test('https://abc-123.example.com')).toBe(true);
+
+      // Should reject subdomains with dots
+      expect((result as RegExp).test('https://sub.domain.example.com')).toBe(false);
+      expect((result as RegExp).test('https://evil.com.example.com')).toBe(false);
+    });
+  });
+});
+
+describe('loadConfigFromEnv - CORS_ORIGINS parsing', () => {
+  beforeEach(() => {
+    resetEnv();
+  });
+
+  afterEach(() => {
+    resetEnv();
+  });
+
+  it('should parse comma-separated origins with wildcards', async () => {
+    process.env.CORS_ORIGINS =
+      'https://app.example.com,https://*.preview.example.com,http://localhost:4200';
+
+    const { loadConfigFromEnv } = await importConfig();
+    const config = loadConfigFromEnv();
+
+    expect(config.cors.allowedOrigins).toHaveLength(3);
+    expect(config.cors.allowedOrigins![0]).toBe('https://app.example.com');
+    expect(config.cors.allowedOrigins![1]).toBeInstanceOf(RegExp);
+    expect(config.cors.allowedOrigins![2]).toBe('http://localhost:4200');
+  });
+
+  it('should throw error on invalid wildcard pattern in CORS_ORIGINS', async () => {
+    process.env.CORS_ORIGINS = 'https://*';
+
+    const { loadConfigFromEnv } = await importConfig();
+    expect(() => loadConfigFromEnv()).toThrow('wildcard only allowed as subdomain');
+  });
+
+  it('should handle wildcard syntax in CORS_ORIGINS', async () => {
+    process.env.CORS_ORIGINS = 'https://*.super-productivity-preview.pages.dev';
+
+    const { loadConfigFromEnv } = await importConfig();
+    const config = loadConfigFromEnv();
+
+    expect(config.cors.allowedOrigins).toHaveLength(1);
+    const pattern = config.cors.allowedOrigins![0] as RegExp;
+    expect(pattern.test('https://abc123.super-productivity-preview.pages.dev')).toBe(
+      true,
+    );
+  });
+
+  it('should parse wildcard patterns even when universal wildcard is present', async () => {
+    process.env.CORS_ORIGINS = 'https://app.com,*,https://*.preview.com';
+
+    const { loadConfigFromEnv } = await importConfig();
+    const config = loadConfigFromEnv();
+
+    expect(config.cors.allowedOrigins).toHaveLength(3);
+    expect(config.cors.allowedOrigins![0]).toBe('https://app.com');
+    expect(config.cors.allowedOrigins![1]).toBe('*');
+    expect(config.cors.allowedOrigins![2]).toBeInstanceOf(RegExp);
+
+    // Verify the RegExp works
+    const pattern = config.cors.allowedOrigins![2] as RegExp;
+    expect(pattern.test('https://abc123.preview.com')).toBe(true);
+  });
+});
+
+describe('loadConfigFromEnv - server bind address', () => {
+  beforeEach(() => {
+    resetEnv();
+  });
+
+  afterEach(() => {
+    resetEnv();
+  });
+
+  it('should bind to all IPv4 interfaces by default', async () => {
+    const { loadConfigFromEnv } = await importConfig();
+    const config = loadConfigFromEnv();
+
+    expect(config.host).toBe('0.0.0.0');
+  });
+
+  it('should load HOST from environment', async () => {
+    process.env.HOST = '::';
+
+    const { loadConfigFromEnv } = await importConfig();
+    const config = loadConfigFromEnv();
+
+    expect(config.host).toBe('::');
+  });
+
+  it('should trim HOST from environment', async () => {
+    process.env.HOST = '  127.0.0.1  ';
+
+    const { loadConfigFromEnv } = await importConfig();
+    const config = loadConfigFromEnv();
+
+    expect(config.host).toBe('127.0.0.1');
+  });
+
+  it('should reject an empty HOST', async () => {
+    process.env.HOST = '';
+
+    const { loadConfigFromEnv } = await importConfig();
+
+    expect(() => loadConfigFromEnv()).toThrow('Invalid HOST: must not be empty');
+  });
+
+  it('should reject a whitespace-only HOST', async () => {
+    process.env.HOST = '   ';
+
+    const { loadConfigFromEnv } = await importConfig();
+
+    expect(() => loadConfigFromEnv()).toThrow('Invalid HOST: must not be empty');
+  });
+
+  it('should reject HOST values with protocol or path', async () => {
+    process.env.HOST = 'http://0.0.0.0';
+
+    const { loadConfigFromEnv } = await importConfig();
+
+    expect(() => loadConfigFromEnv()).toThrow('without protocol or path');
+  });
+});
+
+describe('DEFAULT_CORS_ORIGINS', () => {
+  beforeEach(() => {
+    resetEnv();
+  });
+
+  afterEach(() => {
+    resetEnv();
+  });
+
+  it('should default to the stable app origin only', async () => {
+    const { loadConfigFromEnv } = await importConfig();
+    const config = loadConfigFromEnv();
+
+    expect(config.cors.allowedOrigins).toEqual(['https://app.super-productivity.com']);
+  });
+
+  // Every self-hosted instance inherits this default with `credentials: true`. A pattern
+  // here grants credentialed cross-origin access to infrastructure the operator does not
+  // control, so the default must stay free of wildcards. Preview origins belong in our
+  // own deployment's CORS_ORIGINS. (Wildcard PARSING is still supported and covered by
+  // the parseCorsOrigin tests above — this guards only what ships as the default.)
+  it('should not ship any wildcard or preview origin as a default', async () => {
+    const { loadConfigFromEnv } = await importConfig();
+    const config = loadConfigFromEnv();
+
+    const origins = config.cors.allowedOrigins!;
+    expect(origins.some((origin) => origin instanceof RegExp)).toBe(false);
+    expect(
+      origins.some(
+        (origin) => typeof origin === 'string' && origin.includes('preview.pages.dev'),
+      ),
+    ).toBe(false);
+  });
+});
+
+describe('loadConfigFromEnv - TRUST_PROXY parsing', () => {
+  beforeEach(() => {
+    resetEnv();
+  });
+
+  afterEach(() => {
+    resetEnv();
+  });
+
+  it('should default to loopback and uniquelocal when TRUST_PROXY is unset', async () => {
+    delete process.env.TRUST_PROXY;
+
+    const { loadConfigFromEnv, SERVER_TRUST_PROXY } = await importConfig();
+    const config = loadConfigFromEnv();
+
+    expect(config.trustProxy).toEqual(['loopback', 'uniquelocal']);
+    expect(config.trustProxy).toEqual(SERVER_TRUST_PROXY);
+  });
+
+  it('should parse a comma-separated list of keywords and address ranges', async () => {
+    process.env.TRUST_PROXY = 'loopback, uniquelocal ,100.64.0.0/10';
+
+    const { loadConfigFromEnv } = await importConfig();
+    const config = loadConfigFromEnv();
+
+    expect(config.trustProxy).toEqual(['loopback', 'uniquelocal', '100.64.0.0/10']);
+  });
+
+  it('should accept plain IPv4 and IPv6 addresses and ranges', async () => {
+    process.env.TRUST_PROXY = '10.0.0.5,fd00::/8,::1';
+
+    const { loadConfigFromEnv } = await importConfig();
+    const config = loadConfigFromEnv();
+
+    expect(config.trustProxy).toEqual(['10.0.0.5', 'fd00::/8', '::1']);
+  });
+
+  it('should accept IPv4-mapped IPv6 addresses and ranges', async () => {
+    process.env.TRUST_PROXY = '::ffff:100.64.0.1,::ffff:100.64.0.0/106';
+
+    const { loadConfigFromEnv } = await importConfig();
+    const config = loadConfigFromEnv();
+
+    expect(config.trustProxy).toEqual(['::ffff:100.64.0.1', '::ffff:100.64.0.0/106']);
+  });
+
+  it('should accept an IPv4 range written as a netmask', async () => {
+    process.env.TRUST_PROXY = '10.0.0.0/255.0.0.0';
+
+    const { loadConfigFromEnv } = await importConfig();
+    const config = loadConfigFromEnv();
+
+    expect(config.trustProxy).toEqual(['10.0.0.0/255.0.0.0']);
+  });
+
+  it('should ignore empty entries', async () => {
+    process.env.TRUST_PROXY = ',loopback,,';
+
+    const { loadConfigFromEnv } = await importConfig();
+    const config = loadConfigFromEnv();
+
+    expect(config.trustProxy).toEqual(['loopback']);
+  });
+
+  it('should keep the default when TRUST_PROXY is empty', async () => {
+    process.env.TRUST_PROXY = '';
+
+    const { loadConfigFromEnv, SERVER_TRUST_PROXY } = await importConfig();
+    const config = loadConfigFromEnv();
+
+    expect(config.trustProxy).toEqual(SERVER_TRUST_PROXY);
+  });
+
+  // The hop-count form, the trust-everything form and a stray word all leave
+  // X-Forwarded-For spoofable or unset, so none of them may reach fastify.
+  it.each(['1', 'true', 'loopback,tailscale'])(
+    'should reject TRUST_PROXY=%s',
+    async (value) => {
+      process.env.TRUST_PROXY = value;
+
+      const { loadConfigFromEnv } = await importConfig();
+      expect(() => loadConfigFromEnv()).toThrow(/Invalid TRUST_PROXY/);
+    },
+  );
+});

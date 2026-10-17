@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "supersync.fullname" . }}
+  labels:
+    {{- include "supersync.labels" . | nindent 4 }}
+data:
+  PORT: {{ .Values.supersync.port | quote }}
+  HOST: {{ .Values.supersync.host | quote }}
+  NODE_ENV: {{ .Values.supersync.nodeEnv | quote }}
+  {{- if .Values.supersync.publicUrl }}
+  PUBLIC_URL: {{ .Values.supersync.publicUrl | quote }}
+  {{- end }}
+  CORS_ORIGINS: {{ .Values.supersync.cors.origins | quote }}
+  {{- if .Values.supersync.trustProxy }}
+  TRUST_PROXY: {{ .Values.supersync.trustProxy | quote }}
+  {{- end }}
+  OLD_OPS_CLEANUP_DELETE_BATCH_SIZE: {{ .Values.supersync.cleanup.oldOpsDeleteBatchSize | int | quote }}
+  OLD_OPS_CLEANUP_MAX_DELETED_PER_RUN: {{ .Values.supersync.cleanup.oldOpsMaxDeletedPerRun | int | quote }}
+  {{- if ne (toString .Values.supersync.cleanup.hourUtc) "" }}
+  OLD_OPS_CLEANUP_HOUR_UTC: {{ .Values.supersync.cleanup.hourUtc | quote }}
+  {{- end }}
+  {{- if .Values.supersync.webauthn.rpName }}
+  WEBAUTHN_RP_NAME: {{ .Values.supersync.webauthn.rpName | quote }}
+  {{- end }}
+  {{- if .Values.supersync.webauthn.rpId }}
+  WEBAUTHN_RP_ID: {{ .Values.supersync.webauthn.rpId | quote }}
+  {{- end }}
+  {{- if .Values.supersync.webauthn.origin }}
+  WEBAUTHN_ORIGIN: {{ .Values.supersync.webauthn.origin | quote }}
+  {{- end }}
+  {{- if .Values.supersync.smtp.enabled }}
+  SMTP_HOST: {{ .Values.supersync.smtp.host | quote }}
+  SMTP_PORT: {{ .Values.supersync.smtp.port | quote }}
+  SMTP_SECURE: {{ .Values.supersync.smtp.secure | quote }}
+  SMTP_FROM: {{ .Values.supersync.smtp.from | quote }}
+  {{- end }}
+  {{- /*
+    All five must be set together or none at all: the server treats a partial set as a
+    configuration error and refuses to boot, because a policy naming the wrong controller is
+    worse than no policy. Gating on contactName alone (as this block used to) emitted the
+    other four as empty strings, turning a half-filled values.yaml into a CrashLoopBackOff.
+  */}}
+  {{- $p := .Values.supersync.privacy }}
+  {{- if and $p.contactName $p.addressStreet $p.addressCity $p.addressCountry $p.contactEmail }}
+  PRIVACY_CONTACT_NAME: {{ $p.contactName | quote }}
+  PRIVACY_ADDRESS_STREET: {{ $p.addressStreet | quote }}
+  PRIVACY_ADDRESS_CITY: {{ $p.addressCity | quote }}
+  PRIVACY_ADDRESS_COUNTRY: {{ $p.addressCountry | quote }}
+  PRIVACY_CONTACT_EMAIL: {{ $p.contactEmail | quote }}
+  {{- if $p.hostingProvider }}
+  PRIVACY_HOSTING_PROVIDER: {{ $p.hostingProvider | quote }}
+  {{- end }}
+  {{- if $p.supervisoryAuthority }}
+  PRIVACY_SUPERVISORY_AUTHORITY: {{ $p.supervisoryAuthority | quote }}
+  {{- end }}
+  {{- else if or $p.contactName $p.addressStreet $p.addressCity $p.addressCountry $p.contactEmail }}
+  {{- fail "supersync.privacy: set all of contactName, addressStreet, addressCity, addressCountry and contactEmail, or none. A partial set makes the server refuse to boot." }}
+  {{- end }}
+  {{- if .Values.supersync.dataRegion }}
+  PRIVACY_DATA_REGION: {{ .Values.supersync.dataRegion | quote }}
+  {{- end }}
+  {{- if .Values.supersync.allowedEmails }}
+  ALLOWED_EMAILS: {{ .Values.supersync.allowedEmails | quote }}
+  {{- end }}
+  {{- if .Values.supersync.defaultStorageQuotaBytes }}
+  SUPERSYNC_DEFAULT_STORAGE_QUOTA_BYTES: {{ .Values.supersync.defaultStorageQuotaBytes | int | quote }}
+  {{- end }}
+  {{- if .Values.supersync.captureConnectorEnabled }}
+  CAPTURE_CONNECTOR_ENABLED: "true"
+  {{- end }}

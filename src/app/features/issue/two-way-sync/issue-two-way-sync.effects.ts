@@ -1,0 +1,762 @@
+import { Injectable, inject } from '@angular/core';
+import { Store } from '@ngrx/store';
+import { createEffect, ofType } from '@ngrx/effects';
+import { EMPTY, Observable, first, firstValueFrom, from, timer } from 'rxjs';
+import { catchError, concatMap, filter, map, mergeMap, takeUntil } from 'rxjs/operators';
+import { LOCAL_ACTIONS } from '../../../util/local-actions.token';
+import { REMOTE_ISSUE_DELETE_DEFER_MS } from '../../../app.constants';
+import { TaskService } from '../../tasks/task.service';
+import { Task } from '../../tasks/task.model';
+import { selectAllTasks } from '../../tasks/store/task.selectors';
+import { IssueProviderService } from '../issue-provider.service';
+import { TaskSharedActions } from '../../../root-store/meta/task-shared.actions';
+import { IssueSyncAdapterRegistryService } from './issue-sync-adapter-registry.service';
+import { computePushDecisions, issueValuesEqual } from './compute-push-decisions';
+import { FieldMapping, FieldSyncConfig } from './issue-sync.model';
+import { IssueSyncAdapter } from './issue-sync-adapter.interface';
+import { IssueProvider, IssueProviderKey } from '../issue.model';
+import { IssueLog } from '../../../core/log';
+import { HttpErrorResponse } from '@angular/common/http';
+import { CaldavSyncAdapterService } from '../providers/caldav/caldav-sync-adapter.service';
+import { PlainspaceSyncAdapterService } from '../providers/plainspace/plainspace-sync-adapter.service';
+import { SnackService } from '../../../core/snack/snack.service';
+import {
+  DeletedTaskIssueSidecarService,
+  DeletedTaskIssueInfo,
+} from './deleted-task-issue-sidecar.service';
+import { DeletedTagTitlesSidecarService } from './deleted-tag-titles-sidecar.service';
+import { selectEnabledIssueProviders } from '../store/issue-provider.selectors';
+import { getErrorTxt } from '../../../util/get-error-text';
+import { T } from '../../../t.const';
+import { PlannerActions } from '../../planner/store/planner.actions';
+import { deleteTag, deleteTags } from '../../tag/store/tag.actions';
+import { IssueSyncAdapterResolverService } from './issue-sync-adapter-resolver.service';
+import { shortSyntax } from '../../tasks/short-syntax';
+import { selectShortSyntaxConfig } from '../../config/store/global-config.reducer';
+import { DEFAULT_GLOBAL_CONFIG } from '../../config/default-global-config.const';
+import { selectAllTagsWithoutMyDay } from '../../tag/store/tag.reducer';
+import { selectUnarchivedProjects } from '../../project/store/project.selectors';
+import { PluginIssueProviderRegistryService } from '../../../plugins/issue-provider/plugin-issue-provider-registry.service';
+
+const SYNCABLE_TASK_FIELDS: ReadonlySet<string> = new Set([
+  'isDone',
+  'title',
+  'notes',
+  'dueWithTime',
+  'dueDay',
+  'timeEstimate',
+  'tagIds',
+]);
+
+/**
+ * A provider's write may reject with this marker to signal an *expected*
+ * limitation rather than a real failure — e.g. the CalDAV plugin can't yet edit
+ * or delete a single occurrence of a recurring event (#7492). When it does,
+ * two-way sync stays silent: the user changed/removed their task, not the
+ * calendar. Explicit calendar actions (agenda reschedule/delete) don't consult
+ * this and still surface the message, which is the honest feedback there.
+ */
+const isExpectedSyncSkipError = (err: unknown): boolean =>
+  typeof err === 'object' &&
+  err !== null &&
+  (err as { isExpectedSyncSkip?: boolean }).isExpectedSyncSkip === true;
+
+const toSortedStringArray = (value: unknown): string[] =>
+  Array.isArray(value)
+    ? value
+        .filter((v): v is string => typeof v === 'string')
+        .slice()
+        .sort()
+    : [];
+
+// Lookup map to extract taskId and changes from each action type,
+// replacing chained if/else with manual casts.
+const ACTION_EXTRACTORS: Record<
+  string,
+  (action: unknown) => { taskId: string; changes: Record<string, unknown> }
+> = {
+  [TaskSharedActions.applyShortSyntax.type]: (action) => {
+    const a = action as ReturnType<typeof TaskSharedActions.applyShortSyntax>;
+    const changes: Record<string, unknown> = { ...a.taskChanges };
+    if (a.schedulingInfo?.dueWithTime) {
+      changes['dueWithTime'] = a.schedulingInfo.dueWithTime;
+    }
+    if (a.schedulingInfo?.day) {
+      changes['dueDay'] = a.schedulingInfo.day;
+    }
+    return { taskId: a.task.id, changes };
+  },
+  [TaskSharedActions.scheduleTaskWithTime.type]: (action) => {
+    const a = action as ReturnType<typeof TaskSharedActions.scheduleTaskWithTime>;
+    return { taskId: a.task.id, changes: { dueWithTime: a.dueWithTime } };
+  },
+  [TaskSharedActions.reScheduleTaskWithTime.type]: (action) => {
+    const a = action as ReturnType<typeof TaskSharedActions.reScheduleTaskWithTime>;
+    return { taskId: a.task.id, changes: { dueWithTime: a.dueWithTime } };
+  },
+  [TaskSharedActions.unscheduleTask.type]: (action) => {
+    const a = action as ReturnType<typeof TaskSharedActions.unscheduleTask>;
+    return { taskId: a.id, changes: { dueWithTime: undefined } };
+  },
+  [TaskSharedActions.updateTask.type]: (action) => {
+    const a = action as ReturnType<typeof TaskSharedActions.updateTask>;
+    return {
+      taskId: a.task.id.toString(),
+      changes: a.task.changes as Partial<Task>,
+    };
+  },
+  [TaskSharedActions.addTagToTask.type]: (action) => {
+    const a = action as ReturnType<typeof TaskSharedActions.addTagToTask>;
+    return { taskId: a.taskId, changes: { tagIds: undefined } };
+  },
+  [PlannerActions.planTaskForDay.type]: (action) => {
+    const a = action as ReturnType<typeof PlannerActions.planTaskForDay>;
+    return { taskId: a.task.id, changes: { dueDay: a.day } };
+  },
+  [PlannerActions.transferTask.type]: (action) => {
+    const a = action as ReturnType<typeof PlannerActions.transferTask>;
+    return { taskId: a.task.id, changes: { dueDay: a.newDay } };
+  },
+};
+
+@Injectable()
+export class IssueTwoWaySyncEffects {
+  private readonly _actions$ = inject(LOCAL_ACTIONS);
+  private readonly _store = inject(Store);
+  private readonly _taskService = inject(TaskService);
+  private readonly _issueProviderService = inject(IssueProviderService);
+  private readonly _adapterRegistry = inject(IssueSyncAdapterRegistryService);
+  private readonly _snackService = inject(SnackService);
+  private readonly _deletedTaskIssueSidecar = inject(DeletedTaskIssueSidecarService);
+  private readonly _deletedTagTitlesSidecar = inject(DeletedTagTitlesSidecarService);
+  private readonly _adapterResolver = inject(IssueSyncAdapterResolverService);
+  private readonly _pluginRegistry = inject(PluginIssueProviderRegistryService);
+  private _syncOriginatedTaskIds = new Set<string>();
+  private static readonly _MAX_SYNC_ORIGINATED_IDS = 1000;
+
+  constructor() {
+    const caldavAdapter = inject(CaldavSyncAdapterService);
+    this._adapterRegistry.register('CALDAV', caldavAdapter);
+    const plainspaceAdapter = inject(PlainspaceSyncAdapterService);
+    this._adapterRegistry.register('PLAINSPACE', plainspaceAdapter);
+  }
+
+  pushFieldsOnTaskUpdate$: Observable<unknown> = createEffect(
+    () =>
+      this._actions$.pipe(
+        ofType(
+          TaskSharedActions.updateTask,
+          TaskSharedActions.applyShortSyntax,
+          TaskSharedActions.scheduleTaskWithTime,
+          TaskSharedActions.reScheduleTaskWithTime,
+          TaskSharedActions.unscheduleTask,
+          TaskSharedActions.addTagToTask,
+          PlannerActions.planTaskForDay,
+          PlannerActions.transferTask,
+        ),
+        map((action) => ACTION_EXTRACTORS[action.type](action)),
+        filter(({ taskId, changes }) => {
+          if (this._syncOriginatedTaskIds.delete(taskId)) {
+            return false;
+          }
+          // Skip poll-originated updates that include sync bookkeeping fields
+          if ('issueLastSyncedValues' in changes || 'issueWasUpdated' in changes) {
+            return false;
+          }
+          return Object.keys(changes).some((key) => SYNCABLE_TASK_FIELDS.has(key));
+        }),
+        concatMap(({ taskId, changes }) =>
+          this._taskService.getByIdOnce$(taskId).pipe(
+            map((fullTask) => ({
+              fullTask,
+              changes,
+            })),
+          ),
+        ),
+        filter(({ fullTask }) => {
+          if (
+            !fullTask ||
+            !fullTask.issueType ||
+            !fullTask.issueProviderId ||
+            !fullTask.issueId
+          ) {
+            return false;
+          }
+          return !!this._getAdapter(fullTask.issueType);
+        }),
+        concatMap(({ fullTask, changes }) =>
+          this._pushChanges$(fullTask, changes).pipe(
+            catchError((err) => {
+              // Expected provider limitation (e.g. a single recurring occurrence,
+              // #7492) — the local task edit stands; don't alarm the user.
+              if (isExpectedSyncSkipError(err)) {
+                return EMPTY;
+              }
+              IssueLog.err('Two-way sync push failed', err);
+              this._snackService.open({
+                type: 'ERROR',
+                msg: T.F.ISSUE.S.TWO_WAY_SYNC_PUSH_FAILED,
+                translateParams: { errorMsg: getErrorTxt(err) },
+              });
+              return EMPTY;
+            }),
+          ),
+        ),
+      ),
+    { dispatch: false },
+  );
+
+  pushTagChangesAfterTagDelete$: Observable<unknown> = createEffect(
+    () =>
+      this._actions$.pipe(
+        ofType(deleteTag, deleteTags),
+        // Titles arrive via sidecar (set by TagService before dispatch), not
+        // on the action payload — keeps user-visible tag titles out of the
+        // exportable op-log.
+        map(() => this._deletedTagTitlesSidecar.consume()),
+        filter((deletedTagTitles) => deletedTagTitles.length > 0),
+        concatMap((deletedTagTitles) =>
+          this._store.select(selectAllTasks).pipe(
+            first(),
+            map((tasks) =>
+              tasks.filter((task) =>
+                this._isTaskAffectedByDeletedTagTitles(task, deletedTagTitles),
+              ),
+            ),
+            concatMap((tasks) => from(tasks)),
+          ),
+        ),
+        filter((task) => {
+          if (this._syncOriginatedTaskIds.delete(task.id)) {
+            return false;
+          }
+          if (!task.issueType || !task.issueProviderId || !task.issueId) {
+            return false;
+          }
+          return !!this._getAdapter(task.issueType);
+        }),
+        concatMap((task) =>
+          this._pushChanges$(task, { tagIds: task.tagIds }).pipe(
+            catchError((err) => {
+              if (isExpectedSyncSkipError(err)) {
+                return EMPTY;
+              }
+              IssueLog.err('Two-way sync tag delete push failed', err);
+              this._snackService.open({
+                type: 'ERROR',
+                msg: T.F.ISSUE.S.TWO_WAY_SYNC_PUSH_FAILED,
+                translateParams: { errorMsg: getErrorTxt(err) },
+              });
+              return EMPTY;
+            }),
+          ),
+        ),
+      ),
+    { dispatch: false },
+  );
+
+  deleteIssueOnTaskDelete$: Observable<unknown> = createEffect(
+    () =>
+      this._actions$.pipe(
+        ofType(TaskSharedActions.deleteTask),
+        filter(
+          ({ task }) => !!task.issueId && !!task.issueType && !!task.issueProviderId,
+        ),
+        filter(({ task }) => !!this._getAdapter(task.issueType!)),
+        // restoreDeletedTask can undo the local delete; nothing can undo the
+        // remote one, so it waits out the undo window. mergeMap rather than
+        // concatMap, or N deletes would queue up N windows.
+        // shortcut: in-memory timer — quitting inside the window drops the
+        // remote delete (orphaned remote item); persist pending deletes if
+        // that is reported.
+        mergeMap(({ task }) =>
+          timer(REMOTE_ISSUE_DELETE_DEFER_MS).pipe(
+            takeUntil(
+              this._actions$.pipe(
+                ofType(TaskSharedActions.restoreDeletedTask),
+                filter(({ task: restored }) => restored.id === task.id),
+              ),
+            ),
+            concatMap(() => this._deleteRemoteIssue$(task)),
+            // The provider can be removed inside the window; getCfgOnce$ then
+            // throws, and an escaped error would tear down every other pending
+            // deferred delete.
+            catchError((err) => {
+              IssueLog.err('Deferred remote issue delete failed', err);
+              return EMPTY;
+            }),
+          ),
+        ),
+      ),
+    { dispatch: false },
+  );
+
+  deleteIssueOnBulkTaskDelete$: Observable<unknown> = createEffect(
+    () =>
+      this._actions$.pipe(
+        ofType(TaskSharedActions.deleteTasks),
+        concatMap(() => {
+          const issueInfos = this._deletedTaskIssueSidecar.consume();
+          if (!issueInfos.length) {
+            return EMPTY;
+          }
+          return from(issueInfos).pipe(
+            filter((info) => !!this._getAdapter(info.issueType)),
+            concatMap((info) => this._deleteRemoteIssue$(info)),
+          );
+        }),
+      ),
+    { dispatch: false },
+  );
+
+  autoCreateIssueOnTaskAdd$: Observable<unknown> = createEffect(
+    () =>
+      this._actions$.pipe(
+        ofType(TaskSharedActions.addTask),
+        filter(({ task, issue }) => !task.issueId && !issue),
+        filter(({ task }) => !task.parentId),
+        filter(({ task }) => !!task.projectId),
+        concatMap(({ task, isIgnoreShortSyntax }) =>
+          this._store.select(selectEnabledIssueProviders).pipe(
+            first(),
+            map((providers) =>
+              providers.find(
+                (p) =>
+                  p.defaultProjectId === task.projectId && this._hasAutoCreateEnabled(p),
+              ),
+            ),
+            filter((provider): provider is IssueProvider => !!provider),
+            concatMap((provider) => {
+              const adapter = this._getAdapter(provider.issueProviderKey);
+              if (!adapter?.createIssue) {
+                return EMPTY;
+              }
+              return this._issueProviderService
+                .getCfgOnce$(provider.id, provider.issueProviderKey)
+                .pipe(
+                  concatMap((cfg) =>
+                    from(
+                      this._getTitleWithoutShortSyntax(task, isIgnoreShortSyntax),
+                    ).pipe(
+                      concatMap((title) =>
+                        from(adapter.createIssue!(title, cfg)).pipe(
+                          map((created) => ({ ...created, title })),
+                        ),
+                      ),
+                      concatMap(async ({ issueId, issueNumber, issueData, title }) => {
+                        this._trackSyncOriginatedTask(task.id);
+                        try {
+                          const titlePrefix =
+                            issueNumber != null ? `#${issueNumber} ` : '';
+                          const syncValues = adapter.extractSyncValues(issueData);
+                          // Keep a title that changed since the add (short syntax
+                          // landed, or the user renamed it during the round-trip);
+                          // never write the action's raw snapshot back.
+                          const currentTask = await firstValueFrom(
+                            this._taskService.getByIdOnce$(task.id),
+                          );
+                          const localTitle =
+                            currentTask && currentTask.title !== task.title
+                              ? currentTask.title
+                              : title;
+                          this._taskService.update(task.id, {
+                            issueId,
+                            issueType: provider.issueProviderKey,
+                            issueProviderId: provider.id,
+                            issueLastUpdated: Date.now(),
+                            issueWasUpdated: false,
+                            issueLastSyncedValues: syncValues,
+                            title: titlePrefix
+                              ? `${titlePrefix}${localTitle}`
+                              : localTitle,
+                          });
+
+                          // Push initial task values (e.g. dueWithTime from short syntax)
+                          // that were set before the issue was linked
+                          await this._pushInitialValues(
+                            task,
+                            issueId,
+                            adapter,
+                            cfg,
+                            syncValues,
+                          );
+                        } catch (e) {
+                          this._syncOriginatedTaskIds.delete(task.id);
+                          throw e;
+                        }
+                      }),
+                    ),
+                  ),
+                );
+            }),
+            catchError((err) => {
+              IssueLog.err('Auto-create issue failed', err);
+              this._snackService.open({
+                type: 'ERROR',
+                msg: T.F.ISSUE.S.AUTO_CREATE_FAILED,
+                translateParams: { errorMsg: getErrorTxt(err) },
+              });
+              return EMPTY;
+            }),
+          ),
+        ),
+      ),
+    { dispatch: false },
+  );
+
+  /**
+   * The short-syntax effect cleans the title on the same addTask, but its parse
+   * is async (lazy date-parser import) and nothing orders it against this
+   * effect. Parse here with the same inputs so the remote issue is never
+   * created with the raw tokens (#10024).
+   */
+  private async _getTitleWithoutShortSyntax(
+    task: Task,
+    isIgnoreShortSyntax?: boolean,
+  ): Promise<string> {
+    if (isIgnoreShortSyntax) {
+      return task.title;
+    }
+    const [cfg, tags, projects] = await Promise.all([
+      firstValueFrom(this._store.select(selectShortSyntaxConfig)),
+      firstValueFrom(this._store.select(selectAllTagsWithoutMyDay)),
+      firstValueFrom(this._store.select(selectUnarchivedProjects)),
+    ]);
+    const r = await shortSyntax(
+      task,
+      cfg || DEFAULT_GLOBAL_CONFIG.shortSyntax,
+      tags,
+      projects,
+    );
+    return r?.taskChanges.title ?? task.title;
+  }
+
+  private async _pushInitialValues(
+    task: Task,
+    issueId: string,
+    adapter: {
+      getFieldMappings(): FieldMapping[];
+      getSyncConfig(cfg: unknown): FieldSyncConfig;
+      pushChanges(
+        issueId: string,
+        changes: Record<string, unknown>,
+        cfg: unknown,
+      ): Promise<void>;
+    },
+    cfg: IssueProvider,
+    syncValues: Record<string, unknown>,
+  ): Promise<void> {
+    // Re-fetch task from the store to get post-meta-reducer values
+    // (e.g. dueWithTime from short syntax parsing like @2pm)
+    const currentTask = await firstValueFrom(this._taskService.getByIdOnce$(task.id));
+    const fieldMappings = adapter.getFieldMappings();
+    const syncConfig = adapter.getSyncConfig(cfg);
+    const ctx = { issueId };
+    const toPush: Record<string, unknown> = {};
+
+    for (const mapping of fieldMappings) {
+      const dir = syncConfig[mapping.taskField] ?? mapping.defaultDirection;
+      if (dir !== 'pushOnly' && dir !== 'both') {
+        continue;
+      }
+      const taskValue = currentTask[mapping.taskField as keyof Task];
+      if (taskValue == null) {
+        continue;
+      }
+      const issueValue = mapping.toIssueValue(taskValue, ctx);
+      if (issueValue == null) {
+        continue;
+      }
+      // Only push if task value differs from the created issue value
+      if (issueValue !== syncValues[mapping.issueField]) {
+        toPush[mapping.issueField] = issueValue;
+      }
+    }
+
+    if (Object.keys(toPush).length > 0) {
+      await adapter.pushChanges(issueId, toPush, cfg);
+      // Update sync baseline and issueLastUpdated to prevent poll from
+      // treating our own push as an external update
+      const updatedSyncValues = { ...syncValues, ...toPush };
+      this._trackSyncOriginatedTask(task.id);
+      this._taskService.update(task.id, {
+        issueLastSyncedValues: updatedSyncValues,
+        issueLastUpdated: Date.now(),
+      });
+    }
+  }
+
+  private _hasAutoCreateEnabled(provider: IssueProvider): boolean {
+    // Agenda-view providers (e.g. Google Calendar) should never auto-create issues
+    if (this._pluginRegistry.getUseAgendaView(provider.issueProviderKey)) {
+      return false;
+    }
+    // Plainspace-backed projects are collaborative by definition: a task added
+    // there is pushed up so the team sees it (symmetric with auto-import). The
+    // bound provider is itself the opt-in, so there is no separate flag — but
+    // only once it is actually configured. An enabled-but-unbound provider
+    // (mid-connect, spaceId/token still null) would otherwise POST an invalid
+    // create and error-snack on every add; skip silently until it's ready.
+    if (provider.issueProviderKey === 'PLAINSPACE') {
+      const ps = provider as { spaceId?: string | null; token?: string | null };
+      return !!ps.spaceId && !!ps.token;
+    }
+    // Check for plugin providers (both plugin:* and migrated keys like GITHUB)
+    const pluginCfg = (provider as { pluginConfig?: Record<string, unknown> })
+      .pluginConfig;
+    if (pluginCfg) {
+      return !!(pluginCfg as Record<string, unknown>)?.['isAutoCreateIssues'];
+    }
+    return false;
+  }
+
+  private _isTaskAffectedByDeletedTagTitles(
+    task: Task,
+    deletedTagTitles: string[],
+  ): boolean {
+    if (!task.issueType || !task.issueId || !task.issueLastSyncedValues) {
+      return false;
+    }
+
+    const adapter = this._getAdapter(task.issueType);
+    if (!adapter) {
+      return false;
+    }
+
+    const deletedTitleSet = new Set(deletedTagTitles);
+    const parsed = parseInt(task.issueId, 10);
+    const ctx = {
+      issueId: task.issueId,
+      issueNumber: Number.isNaN(parsed) ? undefined : parsed,
+    };
+
+    for (const mapping of adapter.getFieldMappings()) {
+      if (mapping.taskField !== 'tagIds') {
+        continue;
+      }
+      const lastValue = task.issueLastSyncedValues[mapping.issueField];
+      const labels = toSortedStringArray(
+        lastValue != null ? mapping.toTaskValue(lastValue, ctx) : [],
+      );
+      if (labels.some((label) => deletedTitleSet.has(label))) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private _getAdapter(issueType: string): IssueSyncAdapter<unknown> | undefined {
+    return this._adapterResolver.getAdapter(issueType);
+  }
+
+  private _deleteRemoteIssue$(info: DeletedTaskIssueInfo | Task): Observable<unknown> {
+    if (!info.issueType || !info.issueProviderId || !info.issueId) {
+      return EMPTY;
+    }
+    const issueType = info.issueType;
+    const issueProviderId = info.issueProviderId;
+    const issueId = info.issueId;
+    const adapter = this._adapterRegistry.get(issueType);
+    if (!adapter?.deleteIssue) {
+      return EMPTY;
+    }
+    return this._issueProviderService
+      .getCfgOnce$(issueProviderId, issueType as IssueProviderKey)
+      .pipe(
+        concatMap((cfg) =>
+          from(adapter.deleteIssue!(issueId, cfg)).pipe(
+            catchError((err) => {
+              // Expected provider limitation (e.g. a single recurring occurrence,
+              // #7492) — the local task is already removed; stay silent.
+              if (isExpectedSyncSkipError(err)) {
+                return EMPTY;
+              }
+              // 404/410 means the remote issue is already gone — treat as success
+              // to avoid false "delete failed" toasts (e.g. when polling detects
+              // a remote deletion and then deleteIssue is called on the same issue)
+              const status = err instanceof HttpErrorResponse ? err.status : err?.status;
+              if (status === 404 || status === 410) {
+                return EMPTY;
+              }
+              IssueLog.err('Delete remote issue failed', err);
+              this._snackService.open({
+                type: 'ERROR',
+                msg: T.F.ISSUE.S.DELETE_REMOTE_FAILED,
+              });
+              return EMPTY;
+            }),
+          ),
+        ),
+      );
+  }
+
+  private _pushChanges$(task: Task, changes: Partial<Task>): Observable<unknown> {
+    if (!task.issueType || !task.issueProviderId || !task.issueId) {
+      return EMPTY;
+    }
+    const issueType = task.issueType as IssueProviderKey;
+    const issueProviderId = task.issueProviderId;
+    const issueId = task.issueId;
+    const adapter = this._getAdapter(issueType);
+    if (!adapter) {
+      return EMPTY;
+    }
+
+    return this._issueProviderService.getCfgOnce$(issueProviderId, issueType).pipe(
+      concatMap(async (cfg) => {
+        const fieldMappings = adapter.getFieldMappings();
+        const syncConfig = adapter.getSyncConfig(cfg);
+
+        // Early exit: check if any changed field is pushable before fetching
+        const hasPushableField = fieldMappings.some((m) => {
+          if (!(m.taskField in changes)) {
+            return false;
+          }
+          const dir = syncConfig[m.taskField] ?? m.defaultDirection;
+          return dir === 'pushOnly' || dir === 'both';
+        });
+        if (!hasPushableField) {
+          return;
+        }
+
+        const freshIssue = await adapter.fetchIssue(issueId, cfg);
+        const freshValues = adapter.extractSyncValues(freshIssue);
+        // Re-fetch task to get post-meta-reducer values (e.g. short syntax parsed title)
+        const currentTask = await firstValueFrom(this._taskService.getByIdOnce$(task.id));
+        // the snapshot predates pushes queued before it; their baseline is newer
+        const syncState = currentTask ?? task;
+        const lastSyncedValues = syncState.issueLastSyncedValues ?? {};
+        const taskFieldChanges: Record<string, unknown> = {};
+        for (const mapping of fieldMappings) {
+          if (mapping.taskField in changes) {
+            // Use current task value (post-parsing) not raw action value
+            taskFieldChanges[mapping.taskField] =
+              currentTask?.[mapping.taskField as keyof Task] ??
+              changes[mapping.taskField];
+          }
+        }
+
+        const parsed = parseInt(issueId, 10);
+        const issueNumber = Number.isNaN(parsed) ? undefined : parsed;
+        const ctx = { issueId, issueNumber };
+
+        const decisions = computePushDecisions(
+          taskFieldChanges,
+          fieldMappings,
+          syncConfig,
+          freshValues,
+          // A task with no baseline at all was linked before two-way sync (e.g.
+          // a migrated built-in provider, whose effects always pushed). If the
+          // issue is unchanged since the task last saw it, its current values
+          // are what the task last pulled, so the user's change can win; a
+          // single missing field still means "first sync" and is skipped.
+          syncState.issueLastSyncedValues ??
+            (adapter.getIssueLastUpdated?.(freshIssue) === syncState.issueLastUpdated
+              ? freshValues
+              : {}),
+          ctx,
+        );
+
+        const toPush: Record<string, unknown> = {};
+        for (const d of decisions) {
+          if (d.action === 'push') {
+            toPush[d.field] = d.issueValue;
+          }
+        }
+
+        const didPush = Object.keys(toPush).length > 0;
+        if (didPush) {
+          await adapter.pushChanges(issueId, toPush, cfg);
+        } else {
+          return;
+        }
+
+        const pushedDecisions = decisions.filter((d) => d.action === 'push');
+        const pushedIssueFields = new Set(pushedDecisions.map((d) => d.field));
+        const hasProviderOwnedSkip = decisions.some(
+          (d) =>
+            d.action === 'skip' &&
+            (d.reasonCode === 'provider-changed' || d.reasonCode === 'no-baseline'),
+        );
+
+        // Detect remote changes in mapped fields we did NOT push this cycle — e.g.
+        // the task was completed in Plainspace (isDone flipped) while the user was
+        // pushing an unrelated rename/reschedule from SP. `freshIssue` was fetched
+        // before our write, so `freshValues` still carries that un-pulled change.
+        // Advancing issueLastUpdated past it would make the poll's "updatedAt
+        // unchanged" guard treat it as already-seen and never pull it — silently
+        // dropping the remote completion. Keep the old marker so the next poll
+        // reconciles it. (hasProviderOwnedSkip already covers the changed fields.)
+        const hasUnpulledRemoteChange = fieldMappings.some((m) => {
+          if (pushedIssueFields.has(m.issueField)) {
+            return false;
+          }
+          if (!(m.issueField in lastSyncedValues)) {
+            return false;
+          }
+          return !issueValuesEqual(
+            freshValues[m.issueField],
+            lastSyncedValues[m.issueField],
+          );
+        });
+        // A field the issue reports but the baseline lacks was never compared;
+        // a stale marker lets the next poll seed the full baseline and pull it.
+        // An undefined value (e.g. CalDAV `note`) has nothing to pull, and JSON
+        // sync drops such keys from the baseline anyway.
+        const hasUnseededField = fieldMappings.some(
+          (m) =>
+            freshValues[m.issueField] !== undefined &&
+            !(m.issueField in lastSyncedValues),
+        );
+        const keepIssueLastUpdatedStale =
+          hasProviderOwnedSkip || hasUnpulledRemoteChange || hasUnseededField;
+
+        // Only advance baselines for fields we actually wrote. Fresh provider
+        // values for skipped or unrelated fields still need the polling path to
+        // pull them into the task before they become the new baseline.
+        const updatedSyncValues: Record<string, unknown> = { ...lastSyncedValues };
+        for (const pushDecision of pushedDecisions) {
+          updatedSyncValues[pushDecision.field] = pushDecision.issueValue;
+        }
+
+        // After push, re-fetch the issue to get the provider's updated marker
+        // (e.g. CalDAV etag changes on write). Fall back to Date.now() for
+        // providers that don't implement getIssueLastUpdated.
+        let issueLastUpdated = Date.now();
+        if (didPush && !keepIssueLastUpdatedStale && adapter.getIssueLastUpdated) {
+          const postPushIssue = await adapter.fetchIssue(issueId, cfg);
+          issueLastUpdated = adapter.getIssueLastUpdated(postPushIssue);
+        }
+
+        // Update sync values and issueLastUpdated to prevent poll from
+        // treating our own push as an external update. If any changed field was
+        // provider-owned, or the remote has an un-pulled change in another mapped
+        // field, keep the old issueLastUpdated so polling can pull it.
+        this._trackSyncOriginatedTask(task.id);
+        try {
+          this._taskService.update(task.id, {
+            issueLastSyncedValues: updatedSyncValues,
+            ...(keepIssueLastUpdatedStale ? {} : { issueLastUpdated }),
+          });
+        } catch (e) {
+          this._syncOriginatedTaskIds.delete(task.id);
+          throw e;
+        }
+      }),
+    );
+  }
+
+  private _trackSyncOriginatedTask(taskId: string): void {
+    this._syncOriginatedTaskIds.add(taskId);
+    if (
+      this._syncOriginatedTaskIds.size > IssueTwoWaySyncEffects._MAX_SYNC_ORIGINATED_IDS
+    ) {
+      // Evict oldest entry (Set preserves insertion order) instead of clearing all
+      const oldest = this._syncOriginatedTaskIds.values().next().value;
+      if (oldest !== undefined) {
+        this._syncOriginatedTaskIds.delete(oldest);
+      }
+    }
+  }
+}

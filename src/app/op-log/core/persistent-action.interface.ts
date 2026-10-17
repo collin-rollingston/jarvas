@@ -1,0 +1,50 @@
+import { Action } from '@ngrx/store';
+import { EntityType, LwwUpdateMode, OpType } from './operation.types';
+
+/**
+ * Action-envelope keys. An LWW Update action spreads its entity flat
+ * (`{ ...entity, type, meta }`), so these shadow same-named entity fields
+ * such as SimpleCounter.type (see convertOpToAction).
+ */
+export const ENVELOPE_SHADOWED_KEYS = ['type', 'meta'] as const;
+
+export interface PersistentActionMeta {
+  isPersistent?: boolean; // When false, the action is blacklisted and not persisted
+  entityType: EntityType;
+  entityId?: string; // Optional if entityIds is provided
+  entityIds?: string[]; // For batch operations
+  opType: OpType;
+  isRemote?: boolean; // TRUE if from Sync (prevents re-logging)
+  // TRUE only when the op being applied was authored by a DIFFERENT client
+  // (set during bulk apply when op.clientId !== this device's clientId).
+  // Distinct from isRemote, which is also TRUE for replay of the device's OWN
+  // ops during hydration. Reducers that preserve per-device "local-only"
+  // settings (e.g. sync config) must key off THIS flag, not isRemote, so they
+  // don't clobber the device's own settings while replaying its own ops.
+  isApplyingFromOtherClient?: boolean;
+  isBulk?: boolean; // TRUE for batch operations
+  lwwUpdateMode?: LwwUpdateMode;
+  recreatesEntityAfterDelete?: boolean;
+  // Authenticated project-move footprint surfaced from the encrypted
+  // LwwUpdatePayload.projectMoveFootprint. Reducers relocate task families from
+  // THIS field, never the plaintext `entityIds` envelope. GHSA-8pxh-mgc7-gp3g.
+  projectMoveFootprint?: readonly string[];
+  // LWW Update only: the payload entity's ENVELOPE_SHADOWED_KEYS fields,
+  // carried here by convertOpToAction because the envelope overwrites them.
+  lwwShadowedFields?: Readonly<Record<string, unknown>>;
+}
+
+export interface PersistentAction extends Action {
+  type: string; // Standard NgRx action type
+  meta: PersistentActionMeta;
+  // NOTE: `any` is intentional here - NgRx action payloads are dynamic and the code
+  // immediately casts to specific action types. Using `unknown` would require double
+  // casts (as unknown as SpecificType) throughout the codebase without type safety benefit.
+  [key: string]: any; // Dynamic payload properties (NgRx action payloads)
+}
+
+// Helper type guard - only actions with explicit isPersistent: true are persisted
+export const isPersistentAction = (action: Action): action is PersistentAction => {
+  const a = action as PersistentAction;
+  return !!a && !!a.meta && a.meta.isPersistent === true;
+};

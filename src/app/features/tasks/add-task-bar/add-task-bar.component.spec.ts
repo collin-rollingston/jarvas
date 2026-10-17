@@ -1,0 +1,1626 @@
+import { ComponentFixture, fakeAsync, flush, TestBed, tick } from '@angular/core/testing';
+import { BehaviorSubject, Observable, of } from 'rxjs';
+import { Store } from '@ngrx/store';
+import { MatDialog } from '@angular/material/dialog';
+import { TranslateModule, TranslateService } from '@ngx-translate/core';
+import { AddTaskBarComponent } from './add-task-bar.component';
+import { TaskService } from '../task.service';
+import { WorkContextService } from '../../work-context/work-context.service';
+import { ProjectService } from '../../project/project.service';
+import { TagService } from '../../tag/tag.service';
+import { GlobalConfigService } from '../../config/global-config.service';
+import { AddTaskBarIssueSearchService } from './add-task-bar-issue-search.service';
+import { SnackService } from '../../../core/snack/snack.service';
+import { WorkContextType } from '../../work-context/work-context.model';
+import { Project } from '../../project/project.model';
+import { WorkContext } from '../../work-context/work-context.model';
+import { LocalizationConfig, MiscConfig } from '../../config/global-config.model';
+import { first } from 'rxjs/operators';
+import { NoopAnimationsModule } from '@angular/platform-browser/animations';
+import { signal, Signal } from '@angular/core';
+import { AddTaskSuggestion } from './add-task-suggestions.model';
+import { PlannerActions } from '../../planner/store/planner.actions';
+import { TaskCopy, TaskReminderOptionId } from '../task.model';
+import { DateTimeFormatService } from 'src/app/core/date-time-format/date-time-format.service';
+import { DEFAULT_LOCALE } from 'src/app/core/locale.constants';
+import { DateService } from '../../../core/date/date.service';
+import { getDbDateStr } from '../../../util/get-db-date-str';
+import { TaskRepeatCfgService } from '../../task-repeat-cfg/task-repeat-cfg.service';
+import { SS } from '../../../core/persistence/storage-keys.const';
+import { BodyClass } from '../../../app.constants';
+import { IosKeyboardService } from '../../../core/theme/ios-keyboard.service';
+import { IS_ANDROID_WEB_VIEW_TOKEN } from '../../../util/is-android-web-view';
+
+type ProjectServiceSignals = {
+  list$: Observable<Project[]>;
+  listSorted$: Observable<Project[]>;
+  listSortedForUI$: Observable<Project[]>;
+  listInTreeOrderForUI$: Observable<Project[]>;
+  listSortedForUI: Signal<Project[]>;
+  listInTreeOrderForUI: Signal<Project[]>;
+  listSorted: Signal<Project[]>;
+};
+
+type TagServiceSignals = {
+  tags$: Observable<any[]>;
+  tagsNoMyDayAndNoList$: Observable<any[]>;
+  tagsNoMyDayAndNoListSorted$: Observable<any[]>;
+  tagsNoMyDayAndNoListInTreeOrder$: Observable<any[]>;
+  tagsSortedForUI$: Observable<any[]>;
+  tagsSorted$: Observable<any[]>;
+  tagsNoMyDayAndNoListSorted: Signal<any[]>;
+  tagsNoMyDayAndNoListInTreeOrder: Signal<any[]>;
+  tagsSorted: Signal<any[]>;
+  tagsSortedForUI: Signal<any[]>;
+};
+
+describe('AddTaskBarComponent', () => {
+  let component: AddTaskBarComponent;
+  let fixture: ComponentFixture<AddTaskBarComponent>;
+  let mockTaskService: jasmine.SpyObj<TaskService>;
+  let mockWorkContextService: jasmine.SpyObj<WorkContextService>;
+  let mockProjectService: jasmine.SpyObj<ProjectService>;
+  let mockTagService: jasmine.SpyObj<TagService>;
+  let mockGlobalConfigService: jasmine.SpyObj<GlobalConfigService>;
+  let mockStore: jasmine.SpyObj<Store>;
+  let mockMatDialog: jasmine.SpyObj<MatDialog>;
+  let mockSnackService: jasmine.SpyObj<SnackService>;
+  let mockAddTaskBarIssueSearchService: jasmine.SpyObj<AddTaskBarIssueSearchService>;
+  let mockDateService: jasmine.SpyObj<DateService>;
+
+  // Mock data
+  const mockProjects: Project[] = [
+    {
+      id: 'INBOX_PROJECT',
+      title: 'Inbox',
+      isArchived: false,
+      isHiddenFromMenu: false,
+      theme: { primary: '#3f51b5' },
+      icon: 'inbox',
+    } as Project,
+    {
+      id: 'project-1',
+      title: 'Project 1',
+      isArchived: false,
+      isHiddenFromMenu: false,
+      theme: { primary: '#4caf50' },
+      icon: 'folder',
+    } as Project,
+    {
+      id: 'project-2',
+      title: 'Project 2',
+      isArchived: false,
+      isHiddenFromMenu: false,
+      theme: { primary: '#ff9800' },
+      icon: 'folder',
+    } as Project,
+    {
+      id: 'default-project',
+      title: 'Default Project',
+      isArchived: false,
+      isHiddenFromMenu: false,
+      theme: { primary: '#9c27b0' },
+      icon: 'folder',
+    } as Project,
+  ];
+
+  const mockProjectWorkContext: WorkContext = {
+    id: 'project-1',
+    title: 'Project 1',
+    type: WorkContextType.PROJECT,
+  } as WorkContext;
+
+  const mockTagWorkContext: WorkContext = {
+    id: 'TODAY',
+    title: 'Today',
+    type: WorkContextType.TAG,
+  } as WorkContext;
+
+  const mockLocalizationConfig: LocalizationConfig = {
+    firstDayOfWeek: 1,
+  };
+
+  const mockMiscConfig: MiscConfig = {
+    defaultProjectId: null,
+    isAutMarkParentAsDone: false,
+    isConfirmBeforeExit: false,
+    isConfirmBeforeExitWithoutFinishDay: false,
+    isTurnOffMarkdown: false,
+    isAutoAddWorkedOnToToday: false,
+    isMinimizeToTray: false,
+    isTrayShowCurrentTask: false,
+    startOfNextDay: 4,
+    taskNotesTpl: '',
+    isDisableAnimations: false,
+  };
+
+  const createProjectSignals = (projects: Project[]): ProjectServiceSignals => {
+    const projects$ = of(projects);
+    return {
+      list$: projects$,
+      listSorted$: projects$,
+      listSortedForUI$: projects$,
+      listInTreeOrderForUI$: projects$,
+      listSortedForUI: signal(projects),
+      listInTreeOrderForUI: signal(projects),
+      listSorted: signal(projects),
+    };
+  };
+
+  const createTagSignals = (tags: any[]): TagServiceSignals => {
+    const tags$ = of(tags);
+    return {
+      tags$,
+      tagsNoMyDayAndNoList$: tags$,
+      tagsNoMyDayAndNoListSorted$: tags$,
+      tagsNoMyDayAndNoListInTreeOrder$: tags$,
+      tagsSortedForUI$: tags$,
+      tagsSorted$: tags$,
+      tagsNoMyDayAndNoListSorted: signal(tags),
+      tagsNoMyDayAndNoListInTreeOrder: signal(tags),
+      tagsSorted: signal(tags),
+      tagsSortedForUI: signal(tags),
+    };
+  };
+
+  const mockDateTimeFormatService = jasmine.createSpyObj('DateTimeFormatService', [
+    'currentLocale',
+    'textLocale',
+    // Reached by the actions bar's date chip as soon as a state has a time on it
+    'formatTime',
+  ]);
+  mockDateTimeFormatService.currentLocale.and.returnValue('en-US');
+  mockDateTimeFormatService.textLocale.and.returnValue('en-US');
+  mockDateTimeFormatService.formatTime.and.callFake((timestamp: number) =>
+    new Date(timestamp).toLocaleTimeString('en-US', {
+      hour: 'numeric',
+      minute: 'numeric',
+    }),
+  );
+
+  beforeEach(async () => {
+    // The state service seeds its note draft (and thus isNoteExpanded) from
+    // sessionStorage, which persists across the whole Karma run. Clear it so a
+    // note left behind by another test can't make the note panel start expanded.
+    sessionStorage.removeItem(SS.ADD_TASK_BAR_TXT);
+    sessionStorage.removeItem(SS.ADD_TASK_BAR_NOTE);
+
+    // Create spies
+    mockTaskService = jasmine.createSpyObj('TaskService', [
+      'add',
+      'getByIdOnce$',
+      'scheduleTask',
+      'moveToCurrentWorkContext',
+    ]);
+    mockWorkContextService = jasmine.createSpyObj('WorkContextService', [], {
+      activeWorkContext$: new BehaviorSubject<WorkContext | null>(null),
+    });
+    mockProjectService = jasmine.createSpyObj(
+      'ProjectService',
+      [],
+      createProjectSignals(mockProjects),
+    );
+    mockTagService = jasmine.createSpyObj(
+      'TagService',
+      [],
+      createTagSignals([
+        {
+          id: 'tag-1',
+          title: 'Test Tag',
+          theme: { primary: '#2196f3' },
+          icon: 'label',
+        },
+      ]),
+    );
+    mockGlobalConfigService = jasmine.createSpyObj('GlobalConfigService', [], {
+      cfg: signal({
+        reminder: { defaultTaskRemindOption: TaskReminderOptionId.AtStart },
+      }),
+      lang$: new BehaviorSubject<LocalizationConfig>(mockLocalizationConfig),
+      misc$: new BehaviorSubject<MiscConfig>(mockMiscConfig),
+      tasks$: new BehaviorSubject({ defaultProjectId: null }),
+      shortSyntax$: of({}),
+      localization: () => ({ timeLocale: DEFAULT_LOCALE }),
+    });
+    mockStore = jasmine.createSpyObj('Store', ['select', 'dispatch', 'pipe']);
+    mockStore.pipe.and.returnValue(of([]));
+    mockStore.select.and.returnValue(of([]));
+    mockMatDialog = jasmine.createSpyObj('MatDialog', ['open']);
+    mockSnackService = jasmine.createSpyObj('SnackService', ['open']);
+    mockAddTaskBarIssueSearchService = jasmine.createSpyObj(
+      'AddTaskBarIssueSearchService',
+      ['getFilteredIssueSuggestions$', 'addTaskFromExistingTaskOrIssue'],
+    );
+    mockDateService = jasmine.createSpyObj('DateService', [
+      'todayStr',
+      'getStartOfNextDayDiffMs',
+      'getLogicalTodayDate',
+    ]);
+    mockDateService.todayStr.and.callFake(() => getDbDateStr(new Date()));
+    mockDateService.getStartOfNextDayDiffMs.and.returnValue(0);
+    mockDateService.getLogicalTodayDate.and.callFake(() => new Date());
+    // Setup method returns
+    mockAddTaskBarIssueSearchService.getFilteredIssueSuggestions$.and.returnValue(of([]));
+
+    await TestBed.configureTestingModule({
+      imports: [AddTaskBarComponent, NoopAnimationsModule, TranslateModule.forRoot()],
+      providers: [
+        { provide: TaskService, useValue: mockTaskService },
+        { provide: WorkContextService, useValue: mockWorkContextService },
+        { provide: ProjectService, useValue: mockProjectService },
+        { provide: TagService, useValue: mockTagService },
+        { provide: DateTimeFormatService, useValue: mockDateTimeFormatService },
+        { provide: DateService, useValue: mockDateService },
+        { provide: GlobalConfigService, useValue: mockGlobalConfigService },
+        { provide: Store, useValue: mockStore },
+        { provide: MatDialog, useValue: mockMatDialog },
+        { provide: SnackService, useValue: mockSnackService },
+        {
+          provide: AddTaskBarIssueSearchService,
+          useValue: mockAddTaskBarIssueSearchService,
+        },
+      ],
+    }).compileComponents();
+
+    // Set up translations first
+    const translateService = TestBed.inject(TranslateService);
+    translateService.setTranslation('en', {
+      F: {
+        TASK: {
+          ADD_TASK_BAR: {
+            PLACEHOLDER_SEARCH: 'Search tasks...',
+            PLACEHOLDER_CREATE: 'Add task...',
+            TOOLTIP_ADD_TASK: 'Add task',
+            TOOLTIP_ADD_TO_TOP: 'Add to top',
+            TOOLTIP_ADD_TO_BOTTOM: 'Add to bottom',
+          },
+        },
+      },
+    });
+    translateService.use('en');
+
+    fixture = TestBed.createComponent(AddTaskBarComponent);
+    component = fixture.componentInstance;
+  });
+
+  describe('highlightSegments', () => {
+    it('splits the input by the ranges parsed from that exact text', () => {
+      component.stateService.updateInputTxt('Buy milk #shop');
+      component.stateService.updateSyntaxHighlight({
+        forText: 'Buy milk #shop',
+        ranges: [{ start: 9, end: 14, type: 'tag' }],
+      });
+
+      expect(component.highlightSegments()).toEqual([
+        { text: 'Buy milk ', type: null },
+        { text: '#shop', type: 'tag' },
+      ]);
+    });
+
+    // The parse is async: the keystroke paints before its ranges exist, so
+    // dropping every range on a mismatch blanks the overlay for a frame.
+    it('keeps ranges inside the unchanged common prefix while the parse catches up', () => {
+      component.stateService.updateSyntaxHighlight({
+        forText: 'Buy milk #shop',
+        ranges: [{ start: 9, end: 14, type: 'tag' }],
+      });
+      component.stateService.updateInputTxt('Buy milk #shop t');
+
+      expect(component.highlightSegments()).toEqual([
+        { text: 'Buy milk ', type: null },
+        { text: '#shop', type: 'tag' },
+        { text: ' t', type: null },
+      ]);
+    });
+
+    it('drops ranges the edit could have moved', () => {
+      component.stateService.updateSyntaxHighlight({
+        forText: 'Buy milk #shop',
+        ranges: [{ start: 9, end: 14, type: 'tag' }],
+      });
+      // Edit lands before the range, so its position is no longer trustworthy.
+      component.stateService.updateInputTxt('Buy some milk #shop');
+
+      expect(component.highlightSegments()).toEqual([
+        { text: 'Buy some milk #shop', type: null },
+      ]);
+    });
+
+    it('renders nothing in search mode', () => {
+      component.stateService.updateInputTxt('Buy milk #shop');
+      component.stateService.updateSyntaxHighlight({
+        forText: 'Buy milk #shop',
+        ranges: [{ start: 9, end: 14, type: 'tag' }],
+      });
+      component.isSearchMode.set(true);
+
+      expect(component.highlightSegments()).toEqual([]);
+    });
+  });
+
+  describe('mobile keyboard positioning', () => {
+    let hadTouchPrimaryClass: boolean;
+    let hadIOSClass: boolean;
+
+    beforeEach(() => {
+      hadTouchPrimaryClass = document.body.classList.contains(BodyClass.isTouchPrimary);
+      hadIOSClass = document.body.classList.contains(BodyClass.isIOS);
+      document.body.classList.add(BodyClass.isTouchPrimary);
+      document.body.classList.remove(BodyClass.isIOS);
+      fixture.nativeElement.classList.add('global');
+      fixture.nativeElement.style.setProperty('--keyboard-height', '336px');
+      // Non-zero for every case in this block, so the assertions below pin
+      // whether each offset stacks with the bottom inset or supersedes it.
+      fixture.nativeElement.style.setProperty('--safe-area-bottom', '48px');
+      fixture.nativeElement.style.setProperty('--keyboard-overlay-offset', '0px');
+      fixture.nativeElement.style.setProperty('--s', '8px');
+      fixture.nativeElement.style.setProperty('--s2', '16px');
+      fixture.nativeElement.style.setProperty('--transition-duration-m', '0ms');
+      fixture.detectChanges();
+    });
+
+    afterEach(() => {
+      document.body.classList.toggle(BodyClass.isTouchPrimary, hadTouchPrimaryClass);
+      document.body.classList.toggle(BodyClass.isIOS, hadIOSClass);
+    });
+
+    // iOS keeps the overlay-offset-only rule on purpose — its inset source never
+    // zeroes out while the keyboard is up, so folding it in would lift the bar
+    // off the keyboard. See the iOS block in the component stylesheet.
+    it('uses the overlay-only keyboard offset for the iOS global bar', () => {
+      document.body.classList.add(BodyClass.isIOS);
+
+      expect(getComputedStyle(fixture.nativeElement).bottom).toBe('16px');
+    });
+
+    it('keeps the global bar above an iOS keyboard that still overlays the viewport', () => {
+      document.body.classList.add(BodyClass.isIOS);
+      fixture.nativeElement.style.setProperty('--keyboard-overlay-offset', '40px');
+
+      expect(getComputedStyle(fixture.nativeElement).bottom).toBe('56px');
+    });
+
+    // The offset is bound on the host from IosKeyboardService rather than
+    // inherited from <html>, where writing it restyles the whole list (#9779).
+    it('takes the iOS keyboard offset from IosKeyboardService', () => {
+      document.body.classList.add(BodyClass.isIOS);
+      fixture.componentRef.setInput('isGlobalBarVariant', true);
+      const iosKeyboardService = TestBed.inject(IosKeyboardService);
+
+      iosKeyboardService.keyboardOverlayOffset.set('40px');
+      fixture.detectChanges();
+      expect(getComputedStyle(fixture.nativeElement).bottom).toBe('56px');
+
+      // Hidden again: the host binding goes away and the :root default applies.
+      iosKeyboardService.keyboardOverlayOffset.set(null);
+      fixture.detectChanges();
+      expect(getComputedStyle(fixture.nativeElement).bottom).toBe('16px');
+    });
+
+    // Inline bars (planner, plan-tomorrow) never read the offset, so they do
+    // not get the style write either: with the signal set, this host (not
+    // flagged as the global variant) keeps the :root default.
+    it('does not bind the keyboard offset on inline bars', () => {
+      document.body.classList.add(BodyClass.isIOS);
+      TestBed.inject(IosKeyboardService).keyboardOverlayOffset.set('40px');
+      fixture.detectChanges();
+
+      expect(getComputedStyle(fixture.nativeElement).bottom).toBe('16px');
+    });
+
+    it('does not add the safe area to the keyboard offset for non-iOS touch builds', () => {
+      expect(getComputedStyle(fixture.nativeElement).bottom).toBe('352px');
+    });
+
+    it('keeps the global bar above the bottom safe area without a keyboard', () => {
+      fixture.nativeElement.style.setProperty('--keyboard-height', '0px');
+      fixture.nativeElement.style.setProperty('--safe-area-bottom', '48px');
+
+      expect(getComputedStyle(fixture.nativeElement).bottom).toBe('64px');
+    });
+
+    it('keeps the top-positioned layout for mouse-primary iOS devices', () => {
+      document.body.classList.remove(BodyClass.isTouchPrimary);
+      const layoutBeforeIOSClass = fixture.nativeElement.getBoundingClientRect();
+
+      document.body.classList.add(BodyClass.isIOS);
+      const layoutAfterIOSClass = fixture.nativeElement.getBoundingClientRect();
+
+      expect(layoutAfterIOSClass.top).toBe(layoutBeforeIOSClass.top);
+      expect(layoutAfterIOSClass.height).toBe(layoutBeforeIOSClass.height);
+    });
+  });
+
+  describe('onTaskSuggestionSelected', () => {
+    it('leaves an existing task in place when defaults are disabled', async () => {
+      fixture.componentRef.setInput('isNoDefaults', true);
+      fixture.detectChanges();
+
+      const task = {
+        id: 'task-1',
+        title: 'Existing task',
+        subTaskIds: [],
+      } as Partial<TaskCopy> as TaskCopy;
+      const suggestion = {
+        title: task.title,
+        taskId: task.id,
+        projectId: 'project-1',
+      } as AddTaskSuggestion;
+      const emitSpy = spyOn(component.afterTaskAdd, 'emit');
+      mockTaskService.getByIdOnce$.and.returnValue(of(task));
+
+      await component.onTaskSuggestionSelected(suggestion);
+
+      expect(mockTaskService.moveToCurrentWorkContext).not.toHaveBeenCalled();
+      expect(mockSnackService.open).not.toHaveBeenCalled();
+      expect(emitSpy.calls.mostRecent().args[0] as unknown).toEqual({
+        taskId: task.id,
+        isAddToBottom: false,
+        isNewTask: false,
+      });
+    });
+
+    it('plans existing tasks for the provided planner day instead of moving them to today', async () => {
+      // Set component input using fixture.componentRef.setInput for planForDay
+      fixture.componentRef.setInput('planForDay', '2024-05-20');
+      // Set local signal directly for isAddToBottom
+      component.isAddToBottom.set(true);
+      fixture.detectChanges();
+
+      const task: TaskCopy = {
+        id: 'task-1',
+        title: 'Test task',
+        subTaskIds: [],
+      } as Partial<TaskCopy> as TaskCopy;
+
+      mockTaskService.getByIdOnce$.and.returnValue(of(task));
+      const suggestion: AddTaskSuggestion = {
+        title: 'Test task',
+        taskId: 'task-1',
+        projectId: 'project-1',
+      } as AddTaskSuggestion;
+
+      await component.onTaskSuggestionSelected(suggestion);
+
+      expect(mockStore.dispatch).toHaveBeenCalledWith(
+        PlannerActions.planTaskForDay({
+          task,
+          day: '2024-05-20',
+          isAddToTop: false,
+        }),
+      );
+      expect(mockTaskService.moveToCurrentWorkContext).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('addTask', () => {
+    it('should not add a task when the visible input is empty', async () => {
+      component.stateService.updateCleanText('Stale task');
+      component.stateService.updateInputTxt('   ');
+
+      await component.addTask();
+
+      expect(mockTaskService.add).not.toHaveBeenCalled();
+    });
+
+    it('should keep the active tag selected for subsequent tasks in tag context', async () => {
+      const tagWorkContext: WorkContext = {
+        id: 'tag-1',
+        title: 'Test Tag',
+        type: WorkContextType.TAG,
+      } as WorkContext;
+      (
+        mockWorkContextService.activeWorkContext$ as BehaviorSubject<WorkContext | null>
+      ).next(tagWorkContext);
+      mockTaskService.add.and.returnValues('task-1', 'task-2');
+
+      fixture.detectChanges();
+
+      component.stateService.updateInputTxt('First task');
+      component.stateService.updateCleanText('First task');
+      await component.addTask();
+
+      expect(component.stateService.state().tagIds).toEqual(['tag-1']);
+
+      component.stateService.updateInputTxt('Second task');
+      component.stateService.updateCleanText('Second task');
+      await component.addTask();
+
+      const secondCall = mockTaskService.add.calls.mostRecent();
+      const secondTaskData = secondCall.args[2] as Partial<TaskCopy>;
+      expect(secondTaskData.tagIds).toEqual(['tag-1']);
+    });
+
+    // #5461: a repeat-preset task with no explicit date must default to the
+    // logical "today" (offset-aware), not the calendar date. These assert the
+    // component reads DateService.todayStr() — a regression to getDbDateStr()
+    // would yield the real wall-clock date instead of the mocked '2024-05-19'.
+    it('should use logical today for the dueDay of a repeat-preset task without a date', async () => {
+      mockDateService.todayStr.and.returnValue('2024-05-19');
+      mockTaskService.add.and.returnValue('task-1');
+
+      component.stateService.updateInputTxt('Daily standup');
+      component.stateService.updateCleanText('Daily standup');
+      component.stateService.updateRepeatSetting({
+        type: 'PRESET',
+        quickSetting: 'DAILY',
+      });
+
+      await component.addTask();
+
+      const taskData = mockTaskService.add.calls.mostRecent()
+        .args[2] as Partial<TaskCopy>;
+      expect(taskData.dueDay).toBe('2024-05-19');
+    });
+
+    it('should use logical today for the repeat-config startDate when no date is set', async () => {
+      mockDateService.todayStr.and.returnValue('2024-05-19');
+      mockTaskService.add.and.returnValue('task-1');
+      const addRepeatCfgSpy = spyOn(
+        TestBed.inject(TaskRepeatCfgService),
+        'addTaskRepeatCfgToTask',
+      );
+
+      component.stateService.updateInputTxt('Daily standup');
+      component.stateService.updateCleanText('Daily standup');
+      component.stateService.updateRepeatSetting({
+        type: 'PRESET',
+        quickSetting: 'DAILY',
+      });
+
+      await component.addTask();
+
+      expect(addRepeatCfgSpy).toHaveBeenCalled();
+      const repeatCfg = addRepeatCfgSpy.calls.mostRecent().args[2];
+      expect(repeatCfg.startDate).toBe('2024-05-19');
+    });
+
+    // A Monday-to-Friday schedule has no weekend occurrence, so the occurrence
+    // engine starts the task on the Monday regardless (getFirstRepeatOccurrence
+    // scans the config's weekday flags from startDate). Leaving the Saturday in
+    // the config leaves a start date the recurrence never lands on, and every
+    // later quick setting the repeat dialog derives from it — "weekly on
+    // current weekday" — comes out as a Saturday recurrence.
+    it('should start a menu-picked workday repeat on the Monday after a weekend date', async () => {
+      mockTaskService.add.and.returnValue('task-1');
+      const addRepeatCfgSpy = spyOn(
+        TestBed.inject(TaskRepeatCfgService),
+        'addTaskRepeatCfgToTask',
+      );
+
+      component.stateService.updateInputTxt('Standup');
+      component.stateService.updateCleanText('Standup');
+      // 2026-03-28 is a Saturday, 2026-03-30 the Monday after it
+      component.stateService.updateDate('2026-03-28');
+      component.stateService.updateRepeatSetting({
+        type: 'PRESET',
+        quickSetting: 'MONDAY_TO_FRIDAY',
+      });
+
+      await component.addTask();
+
+      const taskData = mockTaskService.add.calls.mostRecent()
+        .args[2] as Partial<TaskCopy>;
+      expect(taskData.dueDay).toBe('2026-03-30');
+      const repeatCfg = addRepeatCfgSpy.calls.mostRecent().args[2];
+      expect(repeatCfg.startDate).toBe('2026-03-30');
+    });
+
+    // Guards the design, not the roll: nothing here can fail from a change to
+    // rollWeekendDateForRepeat. It pins that the bar never rewrites the day the
+    // user picked, which is what keeps the roll free of provenance tracking.
+    it('should leave the picked weekend date on the bar', async () => {
+      mockTaskService.add.and.returnValue('task-1');
+      spyOn(TestBed.inject(TaskRepeatCfgService), 'addTaskRepeatCfgToTask');
+
+      component.stateService.updateInputTxt('Standup');
+      component.stateService.updateCleanText('Standup');
+      component.stateService.updateDate('2026-03-28');
+      component.stateService.updateRepeatSetting({
+        type: 'PRESET',
+        quickSetting: 'MONDAY_TO_FRIDAY',
+      });
+      expect(component.stateService.state().date).toBe('2026-03-28');
+
+      await component.addTask();
+
+      expect(component.stateService.state().repeat).toBeNull();
+      expect(component.stateService.state().date).toBe('2026-03-28');
+    });
+
+    // The timed path writes a timestamp instead of a dueDay, and reads the same
+    // day. Only the day is excluded, not the hour.
+    it('should keep the time when a timed workday repeat starts on the Monday', async () => {
+      mockTaskService.add.and.returnValue('task-1');
+      const addRepeatCfgSpy = spyOn(
+        TestBed.inject(TaskRepeatCfgService),
+        'addTaskRepeatCfgToTask',
+      );
+
+      component.stateService.updateInputTxt('Standup');
+      component.stateService.updateCleanText('Standup');
+      component.stateService.updateDate('2026-03-28', '09:30');
+      component.stateService.updateRepeatSetting({
+        type: 'PRESET',
+        quickSetting: 'MONDAY_TO_FRIDAY',
+      });
+
+      await component.addTask();
+
+      const taskData = mockTaskService.add.calls.mostRecent()
+        .args[2] as Partial<TaskCopy>;
+      expect(getDbDateStr(taskData.dueWithTime!)).toBe('2026-03-30');
+      const due = new Date(taskData.dueWithTime!);
+      expect(`${due.getHours()}:${due.getMinutes()}`).toBe('9:30');
+      expect(addRepeatCfgSpy.calls.mostRecent().args[2].startDate).toBe('2026-03-30');
+    });
+
+    // Nothing rolls the fallback to today on the way in — a recurrence with no
+    // date never passes a date through the parser — so the config would keep a
+    // weekend start date the user cannot see while the task itself is created
+    // on the Monday the occurrence engine moves it to.
+    it('should start a date-less workday repeat on the Monday after a weekend today', async () => {
+      // 2024-05-19 is a Sunday, 2024-05-20 the Monday after it
+      mockDateService.todayStr.and.returnValue('2024-05-19');
+      mockTaskService.add.and.returnValue('task-1');
+      const addRepeatCfgSpy = spyOn(
+        TestBed.inject(TaskRepeatCfgService),
+        'addTaskRepeatCfgToTask',
+      );
+
+      component.stateService.updateInputTxt('Standup');
+      component.stateService.updateCleanText('Standup');
+      component.stateService.updateRepeatSetting({
+        type: 'PRESET',
+        quickSetting: 'MONDAY_TO_FRIDAY',
+      });
+
+      await component.addTask();
+
+      const taskData = mockTaskService.add.calls.mostRecent()
+        .args[2] as Partial<TaskCopy>;
+      expect(taskData.dueDay).toBe('2024-05-20');
+      expect(addRepeatCfgSpy.calls.mostRecent().args[2].startDate).toBe('2024-05-20');
+    });
+
+    // The contextual monthly presets read the picked date, so "the 1st of the
+    // month" has to mean the month the user picked into, not the month the bar
+    // happens to be open in. Dates far enough out to stay true whatever day the
+    // suite runs on.
+    it('should anchor a monthly-first-day repeat to the month of the picked date', async () => {
+      mockTaskService.add.and.returnValue('task-1');
+      const addRepeatCfgSpy = spyOn(
+        TestBed.inject(TaskRepeatCfgService),
+        'addTaskRepeatCfgToTask',
+      );
+
+      component.stateService.updateInputTxt('Pay rent');
+      component.stateService.updateCleanText('Pay rent');
+      component.stateService.updateDate('2099-09-15');
+      component.stateService.updateRepeatSetting({
+        type: 'PRESET',
+        quickSetting: 'MONTHLY_FIRST_DAY',
+      });
+
+      await component.addTask();
+
+      expect(addRepeatCfgSpy.calls.mostRecent().args[2].startDate).toBe('2099-10-01');
+    });
+
+    it('should anchor a monthly-last-day repeat to the month of the picked date', async () => {
+      mockTaskService.add.and.returnValue('task-1');
+      const addRepeatCfgSpy = spyOn(
+        TestBed.inject(TaskRepeatCfgService),
+        'addTaskRepeatCfgToTask',
+      );
+
+      component.stateService.updateInputTxt('Pay rent');
+      component.stateService.updateCleanText('Pay rent');
+      component.stateService.updateDate('2099-09-15');
+      component.stateService.updateRepeatSetting({
+        type: 'PRESET',
+        quickSetting: 'MONTHLY_LAST_DAY',
+      });
+
+      await component.addTask();
+
+      expect(addRepeatCfgSpy.calls.mostRecent().args[2].startDate).toBe('2099-09-30');
+    });
+
+    it('should copy entered notes to an inline repeat preset config (discussion #937)', async () => {
+      mockTaskService.add.and.returnValue('task-1');
+      const addRepeatCfgSpy = spyOn(
+        TestBed.inject(TaskRepeatCfgService),
+        'addTaskRepeatCfgToTask',
+      );
+
+      component.stateService.updateInputTxt('Daily standup');
+      component.stateService.updateCleanText('Daily standup');
+      component.stateService.updateRepeatSetting({
+        type: 'PRESET',
+        quickSetting: 'DAILY',
+      });
+      component.stateService.noteTxt.set('  Join from the meeting room  ');
+
+      await component.addTask();
+
+      const repeatCfg = addRepeatCfgSpy.calls.mostRecent().args[2];
+      expect(repeatCfg.notes).toBe('Join from the meeting room');
+    });
+
+    it('seeds skipOverdue ON for an inline Daily repeat (#8644)', async () => {
+      mockTaskService.add.and.returnValue('task-1');
+      const addRepeatCfgSpy = spyOn(
+        TestBed.inject(TaskRepeatCfgService),
+        'addTaskRepeatCfgToTask',
+      );
+
+      component.stateService.updateInputTxt('Daily standup');
+      component.stateService.updateCleanText('Daily standup');
+      component.stateService.updateRepeatSetting({
+        type: 'PRESET',
+        quickSetting: 'DAILY',
+      });
+
+      await component.addTask();
+
+      expect(addRepeatCfgSpy.calls.mostRecent().args[2].skipOverdue).toBe(true);
+    });
+
+    it('keeps skipOverdue OFF for an inline Monthly repeat (#8644)', async () => {
+      mockTaskService.add.and.returnValue('task-1');
+      const addRepeatCfgSpy = spyOn(
+        TestBed.inject(TaskRepeatCfgService),
+        'addTaskRepeatCfgToTask',
+      );
+
+      component.stateService.updateInputTxt('Pay rent');
+      component.stateService.updateCleanText('Pay rent');
+      component.stateService.updateRepeatSetting({
+        type: 'PRESET',
+        quickSetting: 'MONTHLY_CURRENT_DATE',
+      });
+
+      await component.addTask();
+
+      expect(addRepeatCfgSpy.calls.mostRecent().args[2].skipOverdue).toBe(false);
+    });
+
+    it('creates a CUSTOM config for an interval repeat, restricted to the start weekday', async () => {
+      // 2024-05-19 is a Sunday
+      mockDateService.todayStr.and.returnValue('2024-05-19');
+      mockTaskService.add.and.returnValue('task-1');
+      const addRepeatCfgSpy = spyOn(
+        TestBed.inject(TaskRepeatCfgService),
+        'addTaskRepeatCfgToTask',
+      );
+
+      component.stateService.updateInputTxt('Review');
+      component.stateService.updateCleanText('Review');
+      component.stateService.updateRepeatSetting({
+        type: 'INTERVAL',
+        repeatCycle: 'WEEKLY',
+        repeatEvery: 2,
+      });
+
+      await component.addTask();
+
+      const repeatCfg = addRepeatCfgSpy.calls.mostRecent().args[2];
+      expect(repeatCfg.quickSetting).toBe('CUSTOM');
+      expect(repeatCfg.repeatCycle).toBe('WEEKLY');
+      expect(repeatCfg.repeatEvery).toBe(2);
+      expect(repeatCfg.startDate).toBe('2024-05-19');
+      expect(repeatCfg.sunday).toBe(true);
+      expect(repeatCfg.monday).toBe(false);
+      expect(repeatCfg.friday).toBe(false);
+    });
+
+    it('should seed dueDay for an interval repeat without a date, like a preset', async () => {
+      mockDateService.todayStr.and.returnValue('2024-05-19');
+      mockTaskService.add.and.returnValue('task-1');
+
+      component.stateService.updateInputTxt('Water flowers');
+      component.stateService.updateCleanText('Water flowers');
+      component.stateService.updateRepeatSetting({
+        type: 'INTERVAL',
+        repeatCycle: 'DAILY',
+        repeatEvery: 3,
+      });
+
+      await component.addTask();
+
+      const taskData = mockTaskService.add.calls.mostRecent()
+        .args[2] as Partial<TaskCopy>;
+      expect(taskData.dueDay).toBe('2024-05-19');
+    });
+
+    it('keeps skipOverdue OFF for an every-N-days interval (#8644)', async () => {
+      mockTaskService.add.and.returnValue('task-1');
+      const addRepeatCfgSpy = spyOn(
+        TestBed.inject(TaskRepeatCfgService),
+        'addTaskRepeatCfgToTask',
+      );
+
+      component.stateService.updateInputTxt('Water flowers');
+      component.stateService.updateCleanText('Water flowers');
+      component.stateService.updateRepeatSetting({
+        type: 'INTERVAL',
+        repeatCycle: 'DAILY',
+        repeatEvery: 3,
+      });
+
+      await component.addTask();
+
+      expect(addRepeatCfgSpy.calls.mostRecent().args[2].skipOverdue).toBe(false);
+    });
+
+    it('should not open the repeat dialog for an interval repeat', async () => {
+      mockTaskService.add.and.returnValue('task-1');
+      const addRepeatCfgSpy = spyOn(
+        TestBed.inject(TaskRepeatCfgService),
+        'addTaskRepeatCfgToTask',
+      );
+      mockMatDialog.open.calls.reset();
+
+      component.stateService.updateInputTxt('Review');
+      component.stateService.updateCleanText('Review');
+      component.stateService.updateRepeatSetting({
+        type: 'INTERVAL',
+        repeatCycle: 'WEEKLY',
+        repeatEvery: 2,
+      });
+
+      await component.addTask();
+
+      expect(addRepeatCfgSpy).toHaveBeenCalled();
+      expect(mockMatDialog.open).not.toHaveBeenCalled();
+    });
+
+    it('should pass deadlineDay when a deadline date is set without a time', async () => {
+      mockTaskService.add.and.returnValue('task-1');
+
+      component.stateService.updateInputTxt('Buy milk');
+      component.stateService.updateCleanText('Buy milk');
+      component.stateService.updateDeadline('2026-06-15', null);
+
+      await component.addTask();
+
+      const taskData = mockTaskService.add.calls.mostRecent()
+        .args[2] as Partial<TaskCopy>;
+      expect(taskData.deadlineDay).toBe('2026-06-15');
+      expect(taskData.deadlineWithTime).toBeUndefined();
+    });
+
+    it('should pass deadlineWithTime and deadlineRemindAt when a deadline is set with a time and reminder', async () => {
+      mockTaskService.add.and.returnValue('task-1');
+
+      component.stateService.updateInputTxt('Dentist appointment');
+      component.stateService.updateCleanText('Dentist appointment');
+      component.stateService.updateDeadline('2026-06-15', '14:30');
+      component.stateService.updateDeadlineRemindOption(TaskReminderOptionId.AtStart);
+
+      await component.addTask();
+
+      const taskData = mockTaskService.add.calls.mostRecent()
+        .args[2] as Partial<TaskCopy>;
+      const expectedTimestamp = new Date(2026, 5, 15, 14, 30, 0, 0).getTime();
+      expect(taskData.deadlineWithTime).toBe(expectedTimestamp);
+      expect(taskData.deadlineRemindAt).toBe(expectedTimestamp);
+    });
+
+    it('should pass the trimmed note text as notes when a note is entered', async () => {
+      mockTaskService.add.and.returnValue('task-1');
+
+      component.stateService.updateInputTxt('Buy milk');
+      component.stateService.updateCleanText('Buy milk');
+      component.stateService.noteTxt.set('  remember the oat milk  ');
+
+      await component.addTask();
+
+      const taskData = mockTaskService.add.calls.mostRecent()
+        .args[2] as Partial<TaskCopy>;
+      expect(taskData.notes).toBe('remember the oat milk');
+    });
+
+    it('should not set notes when the note is empty or whitespace', async () => {
+      mockTaskService.add.and.returnValue('task-1');
+
+      component.stateService.updateInputTxt('Buy milk');
+      component.stateService.updateCleanText('Buy milk');
+      component.stateService.noteTxt.set('   ');
+
+      await component.addTask();
+
+      const taskData = mockTaskService.add.calls.mostRecent()
+        .args[2] as Partial<TaskCopy>;
+      expect(taskData.notes).toBeUndefined();
+    });
+  });
+
+  describe('onSubmitBtnClick', () => {
+    it('should add the task and refocus the input for rapid entry', async () => {
+      mockTaskService.add.and.returnValue('task-1');
+      const focusSpy = spyOn(component, 'focusInput');
+      component.stateService.updateInputTxt('Buy milk');
+      component.stateService.updateCleanText('Buy milk');
+
+      component.onSubmitBtnClick();
+      // Wait for the addTask promise (and its .finally) to settle.
+      await Promise.resolve();
+
+      expect(mockTaskService.add).toHaveBeenCalled();
+      expect(focusSpy).toHaveBeenCalled();
+    });
+
+    it('should refocus the input even when nothing is added', async () => {
+      const focusSpy = spyOn(component, 'focusInput');
+      component.stateService.updateInputTxt('   ');
+
+      component.onSubmitBtnClick();
+      await Promise.resolve();
+
+      expect(mockTaskService.add).not.toHaveBeenCalled();
+      expect(focusSpy).toHaveBeenCalled();
+    });
+
+    it('should NOT refocus for CUSTOM repeat (it opens a dialog)', async () => {
+      mockTaskService.add.and.returnValue('task-1');
+      const focusSpy = spyOn(component, 'focusInput');
+      component.stateService.updateInputTxt('Buy milk');
+      component.stateService.updateCleanText('Buy milk');
+      component.stateService.updateRepeatSetting({ type: 'DIALOG' });
+
+      component.onSubmitBtnClick();
+      await Promise.resolve();
+
+      expect(mockTaskService.add).toHaveBeenCalled();
+      expect(focusSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('note panel', () => {
+    it('toggleNote should flip the expanded state', () => {
+      // focusInput re-focuses the title input, which tries to open the
+      // autocomplete in the test harness — irrelevant to this assertion.
+      spyOn(component, 'focusInput');
+      expect(component.stateService.isNoteExpanded()).toBe(false);
+
+      component.toggleNote();
+      expect(component.stateService.isNoteExpanded()).toBe(true);
+
+      component.toggleNote();
+      expect(component.stateService.isNoteExpanded()).toBe(false);
+    });
+
+    it('Ctrl+2 on the title input toggles the note', () => {
+      // _focusNote runs on expand; focusInput on collapse — both irrelevant here.
+      spyOn(component, 'focusInput');
+      expect(component.stateService.isNoteExpanded()).toBe(false);
+
+      component.onInputKeydown(new KeyboardEvent('keydown', { key: '2', ctrlKey: true }));
+
+      expect(component.stateService.isNoteExpanded()).toBe(true);
+    });
+
+    it('toggleNote is a no-op in search mode (note field is create-mode only)', () => {
+      component.isSearchMode.set(true);
+
+      component.toggleNote();
+
+      expect(component.stateService.isNoteExpanded()).toBe(false);
+    });
+
+    it('expandNote is a no-op in search mode (Ctrl+Enter cannot strand the flag)', () => {
+      component.isSearchMode.set(true);
+
+      component.expandNote();
+
+      expect(component.stateService.isNoteExpanded()).toBe(false);
+    });
+
+    it('Ctrl+Enter on the title input expands the note without adding a task', () => {
+      const addTaskSpy = spyOn(component, 'addTask');
+
+      component.onInputKeydown(
+        new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true }),
+      );
+
+      expect(component.stateService.isNoteExpanded()).toBe(true);
+      expect(addTaskSpy).not.toHaveBeenCalled();
+    });
+
+    it('Ctrl+Enter inside the note submits the task', () => {
+      const addTaskSpy = spyOn(component, 'addTask');
+
+      component.onNoteKeydown(
+        new KeyboardEvent('keydown', { key: 'Enter', metaKey: true }),
+      );
+
+      expect(addTaskSpy).toHaveBeenCalled();
+    });
+
+    it('Escape inside the note collapses it instead of submitting', () => {
+      const addTaskSpy = spyOn(component, 'addTask');
+      spyOn(component, 'focusInput');
+      component.stateService.isNoteExpanded.set(true);
+
+      component.onNoteKeydown(new KeyboardEvent('keydown', { key: 'Escape' }));
+
+      expect(component.stateService.isNoteExpanded()).toBe(false);
+      expect(addTaskSpy).not.toHaveBeenCalled();
+    });
+
+    it('typing in the note textarea writes back to noteTxt (two-way bind)', () => {
+      component.stateService.isNoteExpanded.set(true);
+      fixture.detectChanges();
+
+      const textarea = fixture.nativeElement.querySelector(
+        'textarea.note-input',
+      ) as HTMLTextAreaElement;
+      expect(textarea).toBeTruthy();
+
+      textarea.value = 'a multi\nline note';
+      textarea.dispatchEvent(new Event('input'));
+      fixture.detectChanges();
+
+      expect(component.stateService.noteTxt()).toBe('a multi\nline note');
+    });
+  });
+
+  describe('defaultProject$ observable', () => {
+    it('should use logical today for the default date in TODAY context', () => {
+      mockDateService.todayStr.and.returnValue('2024-05-19');
+      (
+        mockWorkContextService.activeWorkContext$ as BehaviorSubject<WorkContext | null>
+      ).next(mockTagWorkContext);
+
+      fixture.detectChanges();
+
+      expect(component.stateService.state().date).toBe('2024-05-19');
+    });
+
+    it('should return current project when in project work context', async () => {
+      // Set project work context
+      (
+        mockWorkContextService.activeWorkContext$ as BehaviorSubject<WorkContext | null>
+      ).next(mockProjectWorkContext);
+
+      const defaultProject = await component.defaultProject$.pipe(first()).toPromise();
+
+      expect(defaultProject?.id).toBe('project-1');
+      expect(defaultProject?.title).toBe('Project 1');
+    });
+
+    it('should return configured default project when in tag context and defaultProjectId is set', async () => {
+      // Set tag work context
+      (
+        mockWorkContextService.activeWorkContext$ as BehaviorSubject<WorkContext | null>
+      ).next(mockTagWorkContext);
+
+      // Set default project in tasks config
+      (mockGlobalConfigService.tasks$ as BehaviorSubject<any>).next({
+        defaultProjectId: 'default-project',
+      });
+
+      const defaultProject = await component.defaultProject$.pipe(first()).toPromise();
+
+      expect(defaultProject?.id).toBe('default-project');
+      expect(defaultProject?.title).toBe('Default Project');
+    });
+
+    it('should return INBOX_PROJECT when in tag context and no defaultProjectId configured', async () => {
+      // Set tag work context
+      (
+        mockWorkContextService.activeWorkContext$ as BehaviorSubject<WorkContext | null>
+      ).next(mockTagWorkContext);
+
+      // Ensure no default project is configured
+      const configWithoutDefault: MiscConfig = {
+        ...mockLocalizationConfig,
+        ...mockMiscConfig,
+        defaultProjectId: null,
+      };
+      (mockGlobalConfigService.misc$ as BehaviorSubject<MiscConfig>).next(
+        configWithoutDefault,
+      );
+
+      const defaultProject = await component.defaultProject$.pipe(first()).toPromise();
+
+      expect(defaultProject?.id).toBe('INBOX_PROJECT');
+      expect(defaultProject?.title).toBe('Inbox');
+    });
+
+    it('should return INBOX_PROJECT when in tag context and defaultProjectId is false', async () => {
+      // Set tag work context
+      (
+        mockWorkContextService.activeWorkContext$ as BehaviorSubject<WorkContext | null>
+      ).next(mockTagWorkContext);
+
+      // Set defaultProjectId to false
+      const configWithFalseDefault: MiscConfig = {
+        ...mockLocalizationConfig,
+        ...mockMiscConfig,
+        defaultProjectId: false,
+      };
+      (mockGlobalConfigService.misc$ as BehaviorSubject<MiscConfig>).next(
+        configWithFalseDefault,
+      );
+
+      const defaultProject = await component.defaultProject$.pipe(first()).toPromise();
+
+      expect(defaultProject?.id).toBe('INBOX_PROJECT');
+      expect(defaultProject?.title).toBe('Inbox');
+    });
+
+    it('should return INBOX_PROJECT when configured defaultProjectId does not exist in projects', async () => {
+      // Set tag work context
+      (
+        mockWorkContextService.activeWorkContext$ as BehaviorSubject<WorkContext | null>
+      ).next(mockTagWorkContext);
+
+      // Set a non-existent default project
+      const configWithNonExistentDefault: MiscConfig = {
+        ...mockLocalizationConfig,
+        ...mockMiscConfig,
+        defaultProjectId: 'non-existent-project',
+      };
+      (mockGlobalConfigService.misc$ as BehaviorSubject<MiscConfig>).next(
+        configWithNonExistentDefault,
+      );
+
+      const defaultProject = await component.defaultProject$.pipe(first()).toPromise();
+
+      expect(defaultProject?.id).toBe('INBOX_PROJECT');
+      expect(defaultProject?.title).toBe('Inbox');
+    });
+
+    it('should prioritize project context over default project setting', async () => {
+      // Set project work context
+      (
+        mockWorkContextService.activeWorkContext$ as BehaviorSubject<WorkContext | null>
+      ).next(mockProjectWorkContext);
+
+      // Set a different default project in config
+      const configWithDefault: MiscConfig = {
+        ...mockLocalizationConfig,
+        ...mockMiscConfig,
+        defaultProjectId: 'default-project',
+      };
+      (mockGlobalConfigService.misc$ as BehaviorSubject<MiscConfig>).next(
+        configWithDefault,
+      );
+
+      const defaultProject = await component.defaultProject$.pipe(first()).toPromise();
+
+      // Should return the project from context, not the configured default
+      expect(defaultProject?.id).toBe('project-1');
+      expect(defaultProject?.title).toBe('Project 1');
+    });
+
+    it('should react to changes in work context', async () => {
+      // Start with tag context
+      (
+        mockWorkContextService.activeWorkContext$ as BehaviorSubject<WorkContext | null>
+      ).next(mockTagWorkContext);
+
+      // Set default project in tasks config
+      (mockGlobalConfigService.tasks$ as BehaviorSubject<any>).next({
+        defaultProjectId: 'default-project',
+      });
+
+      let defaultProject = await component.defaultProject$.pipe(first()).toPromise();
+      expect(defaultProject?.id).toBe('default-project');
+
+      // Switch to project context
+      (
+        mockWorkContextService.activeWorkContext$ as BehaviorSubject<WorkContext | null>
+      ).next(mockProjectWorkContext);
+
+      defaultProject = await component.defaultProject$.pipe(first()).toPromise();
+      expect(defaultProject?.id).toBe('project-1');
+    });
+
+    it('should react to changes in default project configuration', async () => {
+      // Set tag context
+      (
+        mockWorkContextService.activeWorkContext$ as BehaviorSubject<WorkContext | null>
+      ).next(mockTagWorkContext);
+
+      // Start with no default project
+      (mockGlobalConfigService.tasks$ as BehaviorSubject<any>).next({
+        defaultProjectId: null,
+      });
+
+      let defaultProject = await component.defaultProject$.pipe(first()).toPromise();
+      expect(defaultProject?.id).toBe('INBOX_PROJECT');
+
+      // Change to configured default project
+      (mockGlobalConfigService.tasks$ as BehaviorSubject<any>).next({
+        defaultProjectId: 'default-project',
+      });
+
+      defaultProject = await component.defaultProject$.pipe(first()).toPromise();
+      expect(defaultProject?.id).toBe('default-project');
+    });
+
+    it('should handle null work context gracefully', async () => {
+      // Set null work context
+      (
+        mockWorkContextService.activeWorkContext$ as BehaviorSubject<WorkContext | null>
+      ).next(null);
+
+      // Set default project in tasks config
+      (mockGlobalConfigService.tasks$ as BehaviorSubject<any>).next({
+        defaultProjectId: 'default-project',
+      });
+
+      const defaultProject = await component.defaultProject$.pipe(first()).toPromise();
+
+      expect(defaultProject?.id).toBe('default-project');
+    });
+  });
+
+  describe('defaultProject$ with empty projects', () => {
+    let componentEmptyProjects: AddTaskBarComponent;
+    let fixtureEmptyProjects: ComponentFixture<AddTaskBarComponent>;
+    let mockProjectServiceEmpty: jasmine.SpyObj<ProjectService>;
+
+    beforeEach(async () => {
+      // Reset TestBed to allow reconfiguration
+      TestBed.resetTestingModule();
+
+      // Create a separate mock for empty projects list
+      mockProjectServiceEmpty = jasmine.createSpyObj(
+        'ProjectService',
+        [],
+        createProjectSignals([]),
+      );
+
+      await TestBed.configureTestingModule({
+        imports: [AddTaskBarComponent, NoopAnimationsModule, TranslateModule.forRoot()],
+        providers: [
+          { provide: TaskService, useValue: mockTaskService },
+          { provide: WorkContextService, useValue: mockWorkContextService },
+          { provide: ProjectService, useValue: mockProjectServiceEmpty },
+          { provide: TagService, useValue: mockTagService },
+          { provide: GlobalConfigService, useValue: mockGlobalConfigService },
+          { provide: DateTimeFormatService, useValue: mockDateTimeFormatService },
+          { provide: DateService, useValue: mockDateService },
+          { provide: Store, useValue: mockStore },
+          { provide: MatDialog, useValue: mockMatDialog },
+          { provide: SnackService, useValue: mockSnackService },
+          {
+            provide: AddTaskBarIssueSearchService,
+            useValue: mockAddTaskBarIssueSearchService,
+          },
+        ],
+      }).compileComponents();
+
+      // Set up translations first
+      const translateService = TestBed.inject(TranslateService);
+      translateService.setTranslation('en', {
+        F: {
+          TASK: {
+            ADD_TASK_BAR: {
+              PLACEHOLDER_SEARCH: 'Search tasks...',
+              PLACEHOLDER_CREATE: 'Add task...',
+              TOOLTIP_ADD_TASK: 'Add task',
+              TOOLTIP_ADD_TO_TOP: 'Add to top',
+              TOOLTIP_ADD_TO_BOTTOM: 'Add to bottom',
+            },
+          },
+        },
+      });
+      translateService.use('en');
+
+      fixtureEmptyProjects = TestBed.createComponent(AddTaskBarComponent);
+      componentEmptyProjects = fixtureEmptyProjects.componentInstance;
+    });
+
+    it('should handle empty projects list gracefully', async () => {
+      // Set tag context
+      (
+        mockWorkContextService.activeWorkContext$ as BehaviorSubject<WorkContext | null>
+      ).next(mockTagWorkContext);
+
+      const configWithDefault: MiscConfig = {
+        ...mockLocalizationConfig,
+        ...mockMiscConfig,
+        defaultProjectId: 'default-project',
+      };
+      (mockGlobalConfigService.misc$ as BehaviorSubject<MiscConfig>).next(
+        configWithDefault,
+      );
+
+      const defaultProject = await componentEmptyProjects.defaultProject$
+        .pipe(first())
+        .toPromise();
+
+      expect(defaultProject).toBeUndefined();
+    });
+  });
+
+  describe('_setProjectInitially', () => {
+    it('should use projectId from additionalFields instead of defaultProject$', () => {
+      // Set tag work context (would normally fall back to INBOX_PROJECT)
+      (
+        mockWorkContextService.activeWorkContext$ as BehaviorSubject<WorkContext | null>
+      ).next(mockTagWorkContext);
+
+      fixture.componentRef.setInput('additionalFields', { projectId: 'project-2' });
+      fixture.detectChanges();
+
+      expect(component.stateService.state().projectId).toBe('project-2');
+    });
+
+    it('should fall back to defaultProject$ when additionalFields has no projectId', () => {
+      (
+        mockWorkContextService.activeWorkContext$ as BehaviorSubject<WorkContext | null>
+      ).next(mockTagWorkContext);
+
+      fixture.componentRef.setInput('additionalFields', { isDone: false });
+      fixture.detectChanges();
+
+      expect(component.stateService.state().projectId).toBe('INBOX_PROJECT');
+    });
+  });
+
+  describe('document click handling', () => {
+    beforeEach(() => {
+      fixture.detectChanges();
+    });
+
+    it('should emit done when clicking outside and no dialog is open', () => {
+      const doneSpy = spyOn(component.done, 'emit');
+      const event = {
+        target: document.createElement('div'),
+      } as unknown as MouseEvent;
+
+      component.onDocumentClick(event);
+
+      expect(doneSpy).toHaveBeenCalled();
+    });
+
+    it('should not emit done when schedule dialog is open', () => {
+      const doneSpy = spyOn(component.done, 'emit');
+      component.onScheduleDialogOpenChange(true);
+      const event = {
+        target: document.createElement('div'),
+      } as unknown as MouseEvent;
+
+      component.onDocumentClick(event);
+
+      expect(doneSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('IME handling (Integration)', () => {
+    let inputEl: HTMLTextAreaElement;
+
+    beforeEach(() => {
+      component.stateService.updateInputTxt('New Task');
+      fixture.detectChanges();
+      inputEl = fixture.debugElement.nativeElement.querySelector('.main-input');
+    });
+
+    const dispatchEnterKeydown = (options: {
+      isComposing: boolean;
+      keyCode?: number;
+    }): void => {
+      const event = new KeyboardEvent('keydown', {
+        key: 'Enter',
+        isComposing: options.isComposing,
+      });
+
+      if (options.keyCode) {
+        Object.defineProperty(event, 'keyCode', { value: options.keyCode });
+      }
+
+      inputEl.dispatchEvent(event);
+      fixture.detectChanges();
+    };
+
+    it('should not add a task when Enter is pressed during IME composition', () => {
+      dispatchEnterKeydown({ isComposing: true });
+      expect(mockTaskService.add).not.toHaveBeenCalled();
+    });
+
+    it('should not add a task when Enter is pressed with keyCode 229 even if isComposing is false', () => {
+      dispatchEnterKeydown({ isComposing: false, keyCode: 229 });
+      expect(mockTaskService.add).not.toHaveBeenCalled();
+    });
+
+    it('should add a task when Enter is pressed and NOT in IME composition', () => {
+      dispatchEnterKeydown({ isComposing: false });
+      expect(mockTaskService.add).toHaveBeenCalled();
+    });
+  });
+
+  describe('single-line title (auto-growing textarea)', () => {
+    let inputEl: HTMLTextAreaElement;
+
+    beforeEach(() => {
+      fixture.detectChanges();
+      inputEl = fixture.debugElement.nativeElement.querySelector('.main-input');
+    });
+
+    it('collapses newlines from a pasted title so it stays single-line', () => {
+      inputEl.value = 'first line\nsecond\r\nthird';
+      inputEl.dispatchEvent(new Event('input'));
+      fixture.detectChanges();
+
+      expect(component.stateService.inputTxt()).toBe('first line second third');
+      expect(inputEl.value).toBe('first line second third');
+    });
+  });
+
+  // cdkTextareaAutosize measures a present placeholder by temporarily swapping
+  // it into textarea.value, and each swap resets the caret to the end — so the
+  // placeholder must be detached whenever the field has text (the only time a
+  // caret position exists worth preserving).
+  describe('caret preservation via detached placeholder', () => {
+    let inputEl: HTMLTextAreaElement;
+
+    const typeText = (text: string): void => {
+      inputEl.value = text;
+      inputEl.dispatchEvent(new Event('input'));
+      fixture.detectChanges();
+    };
+
+    beforeEach(() => {
+      fixture.detectChanges();
+      inputEl = fixture.debugElement.nativeElement.querySelector('.main-input');
+    });
+
+    it('shows the placeholder only while the field is empty', () => {
+      expect(inputEl.getAttribute('placeholder')).toBeTruthy();
+
+      typeText('water the plants');
+      expect(inputEl.hasAttribute('placeholder')).toBe(false);
+
+      typeText('');
+      expect(inputEl.getAttribute('placeholder')).toBeTruthy();
+    });
+
+    it('keeps a stable accessible name while the placeholder is detached', () => {
+      const emptyLabel = inputEl.getAttribute('aria-label');
+      expect(emptyLabel).toBeTruthy();
+
+      typeText('water the plants');
+      expect(inputEl.getAttribute('aria-label')).toBe(emptyLabel);
+    });
+
+    it('keeps a mid-text caret when the placeholder-affecting search mode toggles', () => {
+      typeText('water the plants');
+      inputEl.focus();
+      inputEl.setSelectionRange(9, 9);
+
+      component.toggleSearchMode();
+      fixture.detectChanges();
+
+      expect(inputEl.value).toBe('water the plants');
+      expect(inputEl.selectionStart).toBe(9);
+      expect(inputEl.selectionEnd).toBe(9);
+    });
+
+    it('detaches the note placeholder while the note has text', () => {
+      component.stateService.isNoteExpanded.set(true);
+      fixture.detectChanges();
+      const noteEl: HTMLTextAreaElement =
+        fixture.debugElement.nativeElement.querySelector('.note-input');
+      expect(noteEl.getAttribute('placeholder')).toBeTruthy();
+      const emptyLabel = noteEl.getAttribute('aria-label');
+      expect(emptyLabel).toBeTruthy();
+
+      noteEl.value = 'a note';
+      noteEl.dispatchEvent(new Event('input'));
+      fixture.detectChanges();
+
+      expect(noteEl.hasAttribute('placeholder')).toBe(false);
+      expect(noteEl.getAttribute('aria-label')).toBe(emptyLabel);
+    });
+  });
+
+  // Only ever spied on elsewhere in this file, so the two paths below — one of
+  // them the blur → focus cycle the Android IME depends on — had no coverage.
+  describe('focusInput()', () => {
+    const getInput = (f: ComponentFixture<AddTaskBarComponent>): HTMLTextAreaElement =>
+      f.debugElement.nativeElement.querySelector('.main-input') as HTMLTextAreaElement;
+
+    it('focuses the field synchronously', () => {
+      fixture.detectChanges();
+      const input = getInput(fixture);
+      input.blur();
+
+      component.focusInput();
+
+      expect(document.activeElement).toBe(input);
+    });
+
+    it('selects the existing text when asked', () => {
+      fixture.detectChanges();
+      const input = getInput(fixture);
+      input.value = 'water the plants';
+      input.dispatchEvent(new Event('input'));
+
+      component.focusInput(true);
+
+      expect(input.selectionStart).toBe(0);
+      expect(input.selectionEnd).toBe('water the plants'.length);
+    });
+
+    // #9779: a second focus() on an already-focused field re-fires focusin, and
+    // the global handler scrolls it into view again mid keyboard animation.
+    it('does not re-focus a field that already took focus', fakeAsync(() => {
+      fixture.detectChanges();
+      const focusSpy = spyOn(getInput(fixture), 'focus').and.callThrough();
+
+      component.focusInput();
+      const callsBeforeRetry = focusSpy.calls.count();
+      tick(50);
+
+      expect(focusSpy.calls.count()).toBe(callsBeforeRetry);
+      flush();
+    }));
+
+    it('retries once when the web view dropped the focus', fakeAsync(() => {
+      fixture.detectChanges();
+      const input = getInput(fixture);
+
+      component.focusInput();
+      input.blur();
+      tick(50);
+
+      expect(document.activeElement).toBe(input);
+      flush();
+    }));
+
+    describe('on the Android web view', () => {
+      let androidFixture: ComponentFixture<AddTaskBarComponent>;
+
+      beforeEach(async () => {
+        TestBed.resetTestingModule();
+        await TestBed.configureTestingModule({
+          imports: [AddTaskBarComponent, NoopAnimationsModule, TranslateModule.forRoot()],
+          providers: [
+            { provide: TaskService, useValue: mockTaskService },
+            { provide: WorkContextService, useValue: mockWorkContextService },
+            { provide: ProjectService, useValue: mockProjectService },
+            { provide: TagService, useValue: mockTagService },
+            { provide: GlobalConfigService, useValue: mockGlobalConfigService },
+            { provide: DateTimeFormatService, useValue: mockDateTimeFormatService },
+            { provide: DateService, useValue: mockDateService },
+            { provide: Store, useValue: mockStore },
+            { provide: MatDialog, useValue: mockMatDialog },
+            { provide: SnackService, useValue: mockSnackService },
+            {
+              provide: AddTaskBarIssueSearchService,
+              useValue: mockAddTaskBarIssueSearchService,
+            },
+            { provide: IS_ANDROID_WEB_VIEW_TOKEN, useValue: true },
+          ],
+        }).compileComponents();
+        androidFixture = TestBed.createComponent(AddTaskBarComponent);
+        androidFixture.detectChanges();
+      });
+
+      // The IME only comes up reliably after this repeated cycle, so it stays
+      // exactly as it was while the other platforms moved to a guarded retry.
+      it('keeps the repeated blur to focus cycle that raises the IME', fakeAsync(() => {
+        const input = getInput(androidFixture);
+        const focusSpy = spyOn(input, 'focus').and.callThrough();
+
+        androidFixture.componentInstance.focusInput();
+        expect(focusSpy).toHaveBeenCalledTimes(1);
+
+        tick(0);
+        expect(focusSpy).toHaveBeenCalledTimes(2);
+
+        tick(200);
+        expect(focusSpy).toHaveBeenCalledTimes(3);
+        expect(document.activeElement).toBe(input);
+        flush();
+      }));
+    });
+  });
+});

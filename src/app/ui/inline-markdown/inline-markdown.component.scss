@@ -1,0 +1,88 @@
+@use '../../../styles/_globals.scss' as *;
+
+:host {
+  display: block;
+  position: relative;
+
+  [hidden] {
+    display: none !important;
+  }
+}
+
+.markdown-wrapper {
+  display: block;
+  box-sizing: border-box;
+  border: none;
+  overflow: auto;
+  position: relative;
+  transition: height var(--transition-fast);
+  transform-origin: top;
+  @include scrollY;
+
+  .resize-to-fit {
+    position: absolute;
+    right: var(--s2);
+    top: 0;
+    cursor: pointer;
+  }
+
+  &.isHideOverflow {
+    overflow: hidden;
+  }
+}
+
+.markdown-unparsed {
+  // The textarea sat at 14px via .mat-body-2, so it triggered the iOS zoom. The
+  // live editor raises its own font size to match (see live-markdown-theme), so
+  // the description does not change size when markdown formatting is turned off
+  // (#9556).
+  @include noIosFocusZoomOnTouch();
+  //transition: height 1.3s;
+  border: 0;
+  padding: var(--s) var(--s2);
+  margin: 0;
+  width: 100%;
+  box-sizing: border-box;
+  overflow-wrap: break-word;
+  overflow-wrap: anywhere;
+  display: block;
+  resize: none;
+  min-height: inherit;
+  overflow: hidden;
+  cursor: text;
+}
+
+.markdown-unparsed {
+  white-space: pre-wrap;
+}
+
+:host:has(.controls) {
+  // Reserve space below the note so the hover controls (checklist, fullscreen)
+  // sit under the text instead of over its last line — otherwise they hide the
+  // text and, being buttons, swallow the clicks meant to select it (#10544).
+  // The live editor (#10068) needs the same reservation the textarea has; it
+  // only ever covered `.markdown-unparsed`, so the live path had none.
+  .markdown-unparsed,
+  live-markdown-editor {
+    padding-bottom: var(--s5);
+  }
+}
+
+textarea {
+  outline: none;
+}
+
+.controls {
+  position: absolute;
+  bottom: 0;
+  right: 0;
+  opacity: 0;
+  transition: var(--transition-standard);
+
+  :host:hover & {
+    opacity: 1;
+  }
+  @include touchPrimaryDevice {
+    opacity: 0.5;
+  }
+}

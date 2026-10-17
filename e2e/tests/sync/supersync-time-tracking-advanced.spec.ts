@@ -1,0 +1,522 @@
+import { test, expect } from '../../fixtures/supersync.fixture';
+import {
+  createTestUser,
+  getSuperSyncConfig,
+  createSimulatedClient,
+  closeClient,
+  waitForTask,
+  startTimeTracking,
+  stopTimeTracking,
+  waitForTaskTimeSpent,
+  markTaskDone,
+  recordTaskTimeDelta,
+  expectExactTaskTime,
+  renameTask,
+  getTaskTitleFromState,
+  type SimulatedE2EClient,
+} from '../../utils/supersync-helpers';
+import { waitForAppReady } from '../../utils/waits';
+
+const EIGHT_HOURS_MS = 8 * 60 * 60 * 1000;
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null;
+
+const getTaskTimeEstimateFromState = async (
+  client: SimulatedE2EClient,
+  taskName: string,
+): Promise<number | null> =>
+  client.page.evaluate((name) => {
+    type TaskLike = { title?: string; timeEstimate?: number | null };
+    type StoreState = {
+      tasks?: { entities?: Record<string, TaskLike | undefined> };
+    };
+    type StoreSubscription = { unsubscribe: () => void };
+    type StoreLike = {
+      subscribe: (next: (state: StoreState) => void) => StoreSubscription;
+    };
+
+    const store = (
+      window as unknown as {
+        __e2eTestHelpers?: { store?: StoreLike };
+      }
+    ).__e2eTestHelpers?.store;
+    if (!store) {
+      return null;
+    }
+
+    let latestState: StoreState | undefined;
+    const subscription = store.subscribe((state) => {
+      latestState = state;
+    });
+    subscription.unsubscribe();
+
+    const task = Object.values(latestState?.tasks?.entities ?? {}).find((candidate) =>
+      candidate?.title?.includes(name),
+    );
+    return typeof task?.timeEstimate === 'number' ? task.timeEstimate : null;
+  }, taskName);
+
+const expectExactTaskEstimate = async (
+  client: SimulatedE2EClient,
+  taskName: string,
+  expectedTimeEstimate: number,
+): Promise<void> => {
+  await expect
+    .poll(() => getTaskTimeEstimateFromState(client, taskName), {
+      timeout: 30000,
+      intervals: [250, 500, 1000],
+    })
+    .toBe(expectedTimeEstimate);
+};
+
+const getArchivedTaskTimeSpent = async (
+  client: SimulatedE2EClient,
+  taskName: string,
+): Promise<number | null> =>
+  client.page.evaluate(async (name) => {
+    const isRecordInPage = (value: unknown): value is Record<string, unknown> =>
+      typeof value === 'object' && value !== null;
+
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open('SUP_OPS');
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+
+    try {
+      for (const storeName of ['archive_young', 'archive_old']) {
+        if (!db.objectStoreNames.contains(storeName)) {
+          continue;
+        }
+
+        const entry = await new Promise<unknown>((resolve, reject) => {
+          const request = db
+            .transaction(storeName, 'readonly')
+            .objectStore(storeName)
+            .get('current');
+          request.onsuccess = () => resolve(request.result as unknown);
+          request.onerror = () => reject(request.error);
+        });
+        if (!isRecordInPage(entry) || !isRecordInPage(entry.data)) {
+          continue;
+        }
+
+        const taskState = entry.data.task;
+        if (!isRecordInPage(taskState) || !isRecordInPage(taskState.entities)) {
+          continue;
+        }
+
+        for (const task of Object.values(taskState.entities)) {
+          if (
+            isRecordInPage(task) &&
+            typeof task.title === 'string' &&
+            task.title.includes(name)
+          ) {
+            return typeof task.timeSpent === 'number' ? task.timeSpent : 0;
+          }
+        }
+      }
+
+      return null;
+    } finally {
+      db.close();
+    }
+  }, taskName);
+
+const expectExactArchivedTaskTime = async (
+  client: SimulatedE2EClient,
+  taskName: string,
+  expectedTimeSpent: number,
+): Promise<void> => {
+  await expect
+    .poll(() => getArchivedTaskTimeSpent(client, taskName), {
+      timeout: 30000,
+      intervals: [250, 500, 1000],
+    })
+    .toBe(expectedTimeSpent);
+};
+
+/**
+ * SuperSync Time Tracking Advanced E2E Tests
+ *
+ * Tests time tracking edge cases:
+ * - Concurrent time tracking on same task
+ * - Archive task with time tracking data
+ * - Large time values precision
+ */
+
+test.describe('@supersync Time Tracking Advanced Sync', () => {
+  /**
+   * Test: Time tracking data persists after archive
+   *
+   * Actions:
+   * 1. Client A creates task and tracks time (5 seconds)
+   * 2. Client A marks task done and syncs
+   * 3. Client B syncs and receives task
+   * 4. Client B archives via "Finish Day"
+   * 5. Client B syncs archive
+   * 6. Client A syncs
+   * 7. Both verify exact archived time; Client A also verifies the worklog entry
+   */
+  test('Time tracking data persists after archive', async ({
+    browser,
+    baseURL,
+    testRunId,
+  }) => {
+    const uniqueId = Date.now();
+    let clientA: SimulatedE2EClient | null = null;
+    let clientB: SimulatedE2EClient | null = null;
+
+    try {
+      const user = await createTestUser(testRunId);
+      const syncConfig = getSuperSyncConfig(user);
+
+      // ============ PHASE 1: Client A Creates and Tracks Task ============
+      clientA = await createSimulatedClient(browser, baseURL!, 'A', testRunId);
+      await clientA.sync.setupSuperSync(syncConfig);
+
+      const taskName = `ArchiveTime-${uniqueId}`;
+      await clientA.workView.addTask(taskName);
+      console.log('[Archive Time Test] Client A created task');
+
+      // Start time tracking
+      await startTimeTracking(clientA, taskName);
+      console.log('[Archive Time Test] Started time tracking');
+
+      // Wait for the first global tracking tick before stopping. A fixed sleep can
+      // race the app timer under CI load and leave the task with 0 recorded time.
+      await waitForTaskTimeSpent(clientA, taskName, 10000);
+
+      // Stop tracking
+      await stopTimeTracking(clientA, taskName);
+      console.log('[Archive Time Test] Stopped time tracking');
+
+      // Capture tracked time from persisted state. The row can hide the visual
+      // time while hover controls are mounted, and sub-minute values render as
+      // "-" in the UI.
+      const trackedTimeMs = await waitForTaskTimeSpent(clientA, taskName, 5000);
+      console.log(`[Archive Time Test] Tracked time: ${trackedTimeMs}ms`);
+
+      // Mark as done
+      await markTaskDone(clientA, taskName);
+      console.log('[Archive Time Test] Marked task done');
+
+      // ============ PHASE 2: Sync to Server ============
+      await clientA.sync.syncAndWait();
+      console.log('[Archive Time Test] Client A synced');
+
+      // ============ PHASE 3: Client B Archives ============
+      clientB = await createSimulatedClient(browser, baseURL!, 'B', testRunId);
+      await clientB.sync.setupSuperSync(syncConfig);
+      await clientB.sync.syncAndWait();
+      console.log('[Archive Time Test] Client B synced');
+
+      // Verify task exists on B
+      await waitForTask(clientB.page, taskName);
+      await expectExactTaskTime(clientB, taskName, trackedTimeMs);
+
+      // Archive via Finish Day
+      const finishDayBtn = clientB.page.locator('.e2e-finish-day');
+      await finishDayBtn.waitFor({ state: 'visible', timeout: 10000 });
+      await finishDayBtn.click();
+      console.log('[Archive Time Test] Client B clicked Finish Day');
+
+      await clientB.page.waitForURL(/daily-summary/, { timeout: 10000 });
+      await clientB.page.waitForLoadState('networkidle');
+
+      // Click save to archive
+      const saveBtn = clientB.page.locator(
+        'daily-summary button[mat-flat-button]:has(mat-icon:has-text("wb_sunny"))',
+      );
+      await saveBtn.waitFor({ state: 'visible', timeout: 10000 });
+      await saveBtn.click();
+      console.log('[Archive Time Test] Client B archived');
+
+      await clientB.page.waitForURL(/tag\/TODAY/, { timeout: 10000 });
+
+      // ============ PHASE 4: Sync Archive ============
+      await clientB.sync.syncAndWait();
+      await expectExactArchivedTaskTime(clientB, taskName, trackedTimeMs);
+      await clientA.sync.syncAndWait();
+      await expectExactArchivedTaskTime(clientA, taskName, trackedTimeMs);
+      console.log('[Archive Time Test] Both synced archive');
+
+      // ============ PHASE 5: Verify Time in Worklog ============
+      // Navigate to worklog on Client A
+      await clientA.page.goto('/#/tag/TODAY/history');
+      await clientA.page.waitForLoadState('networkidle');
+      await clientA.page.waitForSelector('history', { timeout: 10000 });
+
+      // Expand week to see tasks
+      const weekRow = clientA.page.locator('.week-row').first();
+      if (await weekRow.isVisible()) {
+        await weekRow.click();
+      }
+
+      // Verify task with time appears in worklog
+      const taskInWorklog = clientA.page.locator(
+        `.task-summary-table .task-title:has-text("${taskName}")`,
+      );
+      await expect(taskInWorklog).toBeVisible({ timeout: 10000 });
+      console.log('[Archive Time Test] Task visible in worklog with time data');
+    } finally {
+      if (clientA) await closeClient(clientA);
+      if (clientB) await closeClient(clientB);
+    }
+  });
+
+  /**
+   * Test: Large time values sync with precision
+   *
+   * Actions:
+   * 1. Client A creates task with large time estimate (8h)
+   * 2. Client A syncs
+   * 3. Client B syncs
+   * 4. Verify time estimate is exactly 8h on Client B
+   */
+  test('Task with large time estimate syncs correctly', async ({
+    browser,
+    baseURL,
+    testRunId,
+  }) => {
+    const uniqueId = Date.now();
+    let clientA: SimulatedE2EClient | null = null;
+    let clientB: SimulatedE2EClient | null = null;
+
+    try {
+      const user = await createTestUser(testRunId);
+      const syncConfig = getSuperSyncConfig(user);
+
+      // ============ PHASE 1: Client A Creates Task with Large Estimate ============
+      clientA = await createSimulatedClient(browser, baseURL!, 'A', testRunId);
+      await clientA.sync.setupSuperSync(syncConfig);
+
+      const taskName = `LargeTime-${uniqueId}`;
+      await clientA.workView.addTask(`${taskName} 8h`, false, taskName);
+      console.log('[Large Time Test] Client A created task with 8h estimate');
+
+      await waitForTask(clientA.page, taskName);
+      await expectExactTaskEstimate(clientA, taskName, EIGHT_HOURS_MS);
+
+      // ============ PHASE 2: Sync ============
+      await clientA.sync.syncAndWait();
+
+      clientB = await createSimulatedClient(browser, baseURL!, 'B', testRunId);
+      await clientB.sync.setupSuperSync(syncConfig);
+      await clientB.sync.syncAndWait();
+
+      // ============ PHASE 3: Verify on Client B ============
+      await waitForTask(clientB.page, taskName);
+      await expectExactTaskEstimate(clientB, taskName, EIGHT_HOURS_MS);
+    } finally {
+      if (clientA) await closeClient(clientA);
+      if (clientB) await closeClient(clientB);
+    }
+  });
+
+  test('Concurrent task-time deltas survive snapshot hydration and restart', async ({
+    browser,
+    baseURL,
+    testRunId,
+  }) => {
+    test.setTimeout(240000);
+
+    const initialTime = 10000;
+    const clientADelta = 3000;
+    const clientBDelta = 5000;
+    const expectedTime = initialTime + clientADelta + clientBDelta;
+    const snapshotPassword = 'e2e-time-snapshot-pw';
+    const taskDate = '2026-07-13';
+    const uniqueId = Date.now();
+    let clientA: SimulatedE2EClient | null = null;
+    let clientB: SimulatedE2EClient | null = null;
+    let clientC: SimulatedE2EClient | null = null;
+
+    try {
+      const user = await createTestUser(testRunId);
+      const syncConfig = getSuperSyncConfig(user);
+
+      clientA = await createSimulatedClient(browser, baseURL!, 'A', testRunId);
+      await clientA.sync.setupSuperSync(syncConfig);
+
+      const taskName = `ConcurrentTime-${uniqueId}`;
+      await clientA.workView.addTask(taskName);
+      await waitForTask(clientA.page, taskName);
+      await recordTaskTimeDelta(clientA, taskName, taskDate, initialTime);
+      await expectExactTaskTime(clientA, taskName, initialTime);
+
+      // Password change uses the production clean-slate path: it replaces the
+      // server with a full-state snapshot. The initial time is therefore in the
+      // snapshot, while the two concurrent contributions below remain tail ops.
+      await clientA.sync.changeEncryptionPassword(snapshotPassword);
+      await expectExactTaskTime(clientA, taskName, initialTime);
+      const snapshotSyncConfig = { ...syncConfig, password: snapshotPassword };
+
+      clientB = await createSimulatedClient(browser, baseURL!, 'B', testRunId);
+      await clientB.sync.setupSuperSync(snapshotSyncConfig);
+      await clientB.sync.syncAndWait();
+
+      await waitForTask(clientB.page, taskName);
+      await expectExactTaskTime(clientB, taskName, initialTime);
+
+      // Both clients record against the same base before either sees the other delta.
+      await recordTaskTimeDelta(clientA, taskName, taskDate, clientADelta);
+      await recordTaskTimeDelta(clientB, taskName, taskDate, clientBDelta);
+      await expectExactTaskTime(clientA, taskName, initialTime + clientADelta);
+      await expectExactTaskTime(clientB, taskName, initialTime + clientBDelta);
+
+      await clientA.sync.syncAndWait();
+      await clientB.sync.syncAndWait();
+      await clientA.sync.syncAndWait();
+      await clientB.sync.syncAndWait();
+      await expectExactTaskTime(clientA, taskName, expectedTime);
+      await expectExactTaskTime(clientB, taskName, expectedTime);
+
+      // C is a fresh database. Requiring the snapshot vector clock proves its
+      // first hydration used the server's latest snapshot boundary plus tail ops.
+      clientC = await createSimulatedClient(browser, baseURL!, 'C', testRunId);
+      const snapshotHydrationResponse = clientC.page.waitForResponse(
+        async (response) => {
+          if (
+            response.request().method() !== 'GET' ||
+            !response.url().includes('/api/sync/ops')
+          ) {
+            return false;
+          }
+
+          try {
+            const responseBody: unknown = await response.json();
+            return isRecord(responseBody) && isRecord(responseBody.snapshotVectorClock);
+          } catch {
+            return false;
+          }
+        },
+        { timeout: 60000 },
+      );
+      await clientC.sync.setupSuperSync(snapshotSyncConfig);
+      await clientC.sync.syncAndWait();
+      await snapshotHydrationResponse;
+      await waitForTask(clientC.page, taskName);
+      await expectExactTaskTime(clientC, taskName, expectedTime);
+
+      const clients = [clientA, clientB, clientC];
+      for (const client of clients) {
+        await client.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+        await waitForAppReady(client.page);
+        await waitForTask(client.page, taskName);
+        await expectExactTaskTime(client, taskName, expectedTime);
+      }
+
+      for (const client of clients) {
+        await client.sync.syncAndWait();
+        await expectExactTaskTime(client, taskName, expectedTime);
+      }
+    } finally {
+      if (clientA) await closeClient(clientA);
+      if (clientB) await closeClient(clientB);
+      if (clientC) await closeClient(clientC);
+    }
+  });
+
+  // #10214: a remote delta crossing a pending local [delta, rename] must keep
+  // both deltas and the rename, whichever side reaches the real server first.
+  for (const firstUploader of ['delta', 'delta+rename'] as const) {
+    test(`Crossing timer delta keeps both deltas and a rename (${firstUploader} uploads first, #10214)`, async ({
+      browser,
+      baseURL,
+      testRunId,
+    }) => {
+      test.setTimeout(240000);
+
+      const initialTime = 10000;
+      const renamingDelta = 3000;
+      const plainDelta = 5000;
+      const expectedTime = initialTime + renamingDelta + plainDelta;
+      const taskDate = '2026-07-13';
+      const taskName = `CrossingDelta-${Date.now()}`;
+      const renamedTitle = `${taskName}-Renamed`;
+      let renamingClient: SimulatedE2EClient | null = null;
+      let deltaClient: SimulatedE2EClient | null = null;
+
+      try {
+        const syncConfig = getSuperSyncConfig(await createTestUser(testRunId));
+        renamingClient = await createSimulatedClient(browser, baseURL!, 'A', testRunId);
+        await renamingClient.sync.setupSuperSync(syncConfig);
+        await renamingClient.workView.addTask(taskName);
+        await waitForTask(renamingClient.page, taskName);
+        await recordTaskTimeDelta(renamingClient, taskName, taskDate, initialTime);
+        await renamingClient.sync.syncAndWait();
+
+        deltaClient = await createSimulatedClient(browser, baseURL!, 'B', testRunId);
+        await deltaClient.sync.setupSuperSync(syncConfig);
+        await deltaClient.sync.syncAndWait();
+        await waitForTask(deltaClient.page, taskName);
+        await expectExactTaskTime(deltaClient, taskName, initialTime);
+
+        // Rejections show whether the server or the downloading client resolved
+        // the crossing; either path must converge, so they are reported, not asserted.
+        const rejections: string[] = [];
+        for (const client of [renamingClient, deltaClient]) {
+          client.page.on('response', async (response) => {
+            if (
+              response.request().method() !== 'POST' ||
+              !response.url().includes('/api/sync/ops')
+            ) {
+              return;
+            }
+            const body: unknown = await response.json().catch(() => null);
+            const results =
+              isRecord(body) && Array.isArray(body.results) ? body.results : [];
+            for (const result of results) {
+              if (isRecord(result) && result.accepted === false) {
+                rejections.push(`${client.clientName}:${String(result.errorCode)}`);
+              }
+            }
+          });
+        }
+
+        // Both sides edit against the same base before seeing each other.
+        await recordTaskTimeDelta(renamingClient, taskName, taskDate, renamingDelta);
+        await renameTask(renamingClient, taskName, renamedTitle);
+        await recordTaskTimeDelta(deltaClient, taskName, taskDate, plainDelta);
+
+        const [first, second] =
+          firstUploader === 'delta'
+            ? [deltaClient, renamingClient]
+            : [renamingClient, deltaClient];
+        await first.sync.syncAndWait();
+        await second.sync.syncAndWait();
+        await first.sync.syncAndWait();
+        await second.sync.syncAndWait();
+
+        const clients = [renamingClient, deltaClient];
+        const expectConverged = async (): Promise<void> => {
+          for (const client of clients) {
+            await expectExactTaskTime(client, taskName, expectedTime);
+            await expect
+              .poll(() => getTaskTitleFromState(client, taskName), { timeout: 30000 })
+              .toBe(renamedTitle);
+          }
+        };
+        await expectConverged();
+
+        // Replay from the persisted op log must reach the same state.
+        for (const client of clients) {
+          await client.page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 });
+          await waitForAppReady(client.page);
+          await waitForTask(client.page, taskName);
+        }
+        await expectConverged();
+
+        test.info().annotations.push({
+          type: 'server rejections',
+          description: rejections.join(', ') || 'none',
+        });
+      } finally {
+        if (renamingClient) await closeClient(renamingClient);
+        if (deltaClient) await closeClient(deltaClient);
+      }
+    });
+  }
+});

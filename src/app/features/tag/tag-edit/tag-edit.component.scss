@@ -1,0 +1,73 @@
+@use '../../../../styles/globals' as *;
+
+:host {
+  width: 100%;
+
+  tag {
+    padding-right: 0;
+  }
+
+  ::ng-deep
+    .mat-mdc-standard-chip.mdc-evolution-chip--with-trailing-action
+    .mdc-evolution-chip__action--primary {
+    padding-left: var(--s);
+  }
+
+  input {
+    appearance: none;
+    display: block;
+    width: 100%;
+    box-shadow: none;
+    border: none;
+    color: var(--text-color);
+    // matChipInput only inherits Material's form-field typography when it sits
+    // inside a mat-form-field; in the task detail panel it does not, so this
+    // input fell back to the UA default for form controls (~13px).
+    @include noIosFocusZoom();
+    // The UA `font` shorthand also forces its own family here; follow the app stack.
+    font-family: inherit;
+    border-top: 1px solid transparent;
+    border-bottom: 1px solid transparent;
+    height: 40px;
+    padding: var(--s-quarter);
+    background: transparent;
+
+    &:hover,
+    &:focus {
+      outline: none;
+      border-bottom-color: var(--extra-border-color);
+    }
+
+    // Material forces `.mdc-text-field__input::placeholder { opacity: 0 }` globally and
+    // only restores it inside a .mat-mdc-form-field ancestor. matChipInput puts that
+    // class on this input, which is deliberately not wrapped in a form field, so without
+    // this the placeholder is fully invisible. The color is set explicitly because the
+    // browser default is a fixed grey that ignores the theme (unreadable on dark).
+    &::placeholder {
+      color: var(--text-color-muted);
+      opacity: 1;
+    }
+  }
+}
+
+:host-context(.isMousePrimary task-detail-item) {
+  ::ng-deep * {
+    //--mat-chip-outline-color: transparent !important;
+  }
+  ::ng-deep .mdc-evolution-chip__cell--trailing {
+    opacity: 0.05;
+    margin-left: -4px;
+    transition: opacity 0.2s;
+  }
+}
+
+:host-context(.isMousePrimary task-detail-item:hover) {
+  ::ng-deep * {
+    --mat-chip-outline-color: rgba(125, 125, 125, 0.4) !important;
+  }
+
+  ::ng-deep .mdc-evolution-chip__cell--trailing {
+    opacity: 1;
+    width: auto;
+  }
+}

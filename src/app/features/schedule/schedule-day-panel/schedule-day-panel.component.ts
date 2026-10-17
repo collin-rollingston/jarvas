@@ -1,0 +1,855 @@
+import {
+  AfterViewInit,
+  ChangeDetectionStrategy,
+  ChangeDetectorRef,
+  Component,
+  computed,
+  effect,
+  ElementRef,
+  inject,
+  NgZone,
+  OnDestroy,
+  Signal,
+  signal,
+  untracked,
+  ViewChild,
+  viewChildren,
+} from '@angular/core';
+import { Store } from '@ngrx/store';
+import { ScheduleWeekComponent } from '../schedule-week/schedule-week.component';
+import { DateService } from '../../../core/date/date.service';
+import { getPointerPosition } from '../../../util/get-pointer-position';
+import { toSignal } from '@angular/core/rxjs-interop';
+import { selectTimelineWorkStartEndHours } from '../../config/store/global-config.reducer';
+import { GlobalTrackingIntervalService } from '../../../core/global-tracking-interval/global-tracking-interval.service';
+import { FH, SVEType } from '../schedule.const';
+import { calculateTimeFromYPosition } from '../schedule-utils';
+import { DragDropRegistry } from '@angular/cdk/drag-drop';
+import { PlannerActions } from '../../planner/store/planner.actions';
+import { TaskReminderOptionId, TaskWithSubTasks } from '../../tasks/task.model';
+import { TaskSharedActions } from '../../../root-store/meta/task-shared.actions';
+import { Log } from '../../../core/log';
+import { Subscription } from 'rxjs';
+import { ScheduleExternalDragService } from '../schedule-week/schedule-external-drag.service';
+import { ScheduleService } from '../schedule.service';
+import { ScheduleEvent } from '../schedule.model';
+import { GlobalConfigService } from '../../config/global-config.service';
+import { DEFAULT_GLOBAL_CONFIG } from '../../config/default-global-config.const';
+import { remindOptionToMilliseconds } from '../../tasks/util/remind-option-to-milliseconds';
+import { TranslatePipe } from '@ngx-translate/core';
+import { T } from '../../../t.const';
+import { MatBottomSheetRef } from '@angular/material/bottom-sheet';
+import { MatIconButton } from '@angular/material/button';
+import { MatIcon } from '@angular/material/icon';
+import { MatTooltip } from '@angular/material/tooltip';
+import {
+  SwipePagerComponent,
+  SwipePagerPageDirective,
+} from '../../../ui/swipe-pager/swipe-pager.component';
+import {
+  ScheduleDayPage,
+  scheduleDayPageKey,
+  shiftDayStr,
+  toScheduleDayPage,
+} from '../schedule-day-page';
+
+const DEFAULT_MIN_DURATION = 15 * 60 * 1000;
+const SCROLL_DELAY_MS = 100;
+const SCROLL_TOP_OFFSET_PX = 50;
+const MIN_PREVIEW_WIDTH_PX = 40;
+const PREVIEW_WIDTH_PADDING_PX = 10;
+const OPACITY_HIDDEN = '0';
+const OPACITY_VISIBLE = '1';
+
+type DropTimeSource =
+  | 'preview-top-adjusted'
+  | 'pointer-top-adjusted'
+  | 'top-cache'
+  | 'cached';
+
+interface DropTimeCalculation {
+  timestamp: number | null;
+  source: DropTimeSource;
+}
+
+@Component({
+  selector: 'schedule-day-panel',
+  standalone: true,
+  imports: [
+    ScheduleWeekComponent,
+    TranslatePipe,
+    MatIconButton,
+    MatIcon,
+    MatTooltip,
+    SwipePagerComponent,
+    SwipePagerPageDirective,
+  ],
+  styleUrl: './schedule-day-panel.component.scss',
+  templateUrl: './schedule-day-panel.component.html',
+  changeDetection: ChangeDetectionStrategy.OnPush,
+})
+export class ScheduleDayPanelComponent implements AfterViewInit, OnDestroy {
+  T: typeof T = T;
+
+  @ViewChild('dropZone', { read: ElementRef }) dropZoneRef!: ElementRef<HTMLElement>;
+
+  // The pager also renders the neighbouring days while swiping; drops, the
+  // drag preview and scrolling all target the day that is shown.
+  private _scheduleWeekEls = viewChildren(ScheduleWeekComponent, { read: ElementRef });
+  private _scheduleWeeks = viewChildren(ScheduleWeekComponent);
+
+  get scheduleWeekRef(): ElementRef<HTMLElement> | undefined {
+    const i = this._currentScheduleWeekIndex();
+    return i === -1 ? undefined : this._scheduleWeekEls()[i];
+  }
+
+  get scheduleWeekComponent(): ScheduleWeekComponent | undefined {
+    const i = this._currentScheduleWeekIndex();
+    return i === -1 ? undefined : this._scheduleWeeks()[i];
+  }
+
+  private _store = inject(Store);
+  private _dateService = inject(DateService);
+  private _globalTrackingIntervalService = inject(GlobalTrackingIntervalService);
+  private _dragDropRegistry = inject(DragDropRegistry);
+  private _externalDragService = inject(ScheduleExternalDragService);
+  private _cdr = inject(ChangeDetectorRef);
+  private _ngZone = inject(NgZone);
+  private _scheduleService = inject(ScheduleService);
+  private _globalConfigService = inject(GlobalConfigService);
+  // Only the mobile bottom sheet pages by swiping: in the right panel a right
+  // swipe already closes the panel (see RightPanelComponent).
+  readonly isInBottomSheet = !!inject(MatBottomSheetRef, { optional: true });
+  private _pointerUpSubscription: Subscription | null = null;
+  private _activeExternalTask: TaskWithSubTasks | null = null;
+  private readonly _globalPointerEvents = ['mousemove', 'touchmove'] as const;
+  private _isTrackingExternalDrag = false;
+  // Capture phase: a task's swipe gesture (PanDirective) stops the propagation
+  // of the touchmoves it claims, which hid a quick touch drag from the panel.
+  private readonly _globalPointerListenerOptions = { passive: true, capture: true };
+
+  // Drag preview properties
+  dragPreviewTime = signal<string | null>(null);
+  isDragging = signal(false);
+  private lastCalculatedTimestamp: number | null = null;
+  private _dragPointerOffsetY: number | null = null;
+  private _lastKnownTopY: number | null = null;
+
+  todayDateStr = toSignal(this._globalTrackingIntervalService.todayDateStr$, {
+    initialValue: this._dateService.todayStr(Date.now()),
+  });
+
+  // null = follow (logical) today. A picked day that today has caught up with
+  // (midnight rollover while the panel stays open) falls back to today, so the
+  // panel never shows a past day.
+  private _selectedDay = signal<string | null>(null);
+
+  selectedDay = computed<string | undefined>(() => {
+    const today = this.todayDateStr();
+    const selected = this._selectedDay();
+    return selected && today && selected > today ? selected : today;
+  });
+
+  isViewingToday = computed(() => this.selectedDay() === this.todayDateStr());
+
+  daysToShow = computed(() => {
+    const d = this.selectedDay();
+    return d ? [d] : [];
+  });
+
+  // Set by the pager when idle on a touch device, on first touch or on button
+  // use: neighbouring days are only computed from then on, so mouse users who
+  // never page pay for the shown day alone.
+  isPagerWarm = signal(false);
+  readonly pageKey = scheduleDayPageKey;
+
+  currentPage = this._createPage(this.selectedDay);
+  // Like the schedule view, never page into the past.
+  prevPage = this._createPage(
+    computed(() => {
+      const day = this.selectedDay();
+      return day && this.isPagerWarm() && !this.isViewingToday()
+        ? shiftDayStr(day, -1)
+        : undefined;
+    }),
+  );
+  nextPage = this._createPage(
+    computed(() => {
+      const day = this.selectedDay();
+      return day && this.isPagerWarm() ? shiftDayStr(day, 1) : undefined;
+    }),
+  );
+
+  private _workStartEndHours = toSignal(
+    this._store.select(selectTimelineWorkStartEndHours),
+  );
+
+  workStartEnd = computed(() => {
+    const v = this._workStartEndHours();
+    return (
+      v && {
+        workStartRow: Math.round(FH * v.workStart) + 1,
+        workEndRow: Math.round(FH * v.workEnd) + 1,
+      }
+    );
+  });
+
+  currentTimeRow = computed(() => {
+    // Trigger re-computation every 2 minutes
+    this._scheduleService.scheduleRefreshTick();
+    const now = new Date();
+    const hours = now.getHours();
+    const minutes = now.getMinutes();
+    // eslint-disable-next-line no-mixed-operators
+    const hoursToday = hours + minutes / 60;
+    return Math.round(hoursToday * FH);
+  });
+
+  constructor() {
+    // Follow the pointer on the whole document for as long as a task is dragged
+    // from a list, and hit-test the panel geometrically. Boundary events on the
+    // panel cannot be relied on: touch input is implicitly captured by the
+    // element the finger went down on, so the panel never sees its moves, and
+    // the one pointerenter Chrome sends once CDK re-parents the dragged element
+    // can come after the last move, leaving the preview at its initial row.
+    effect(() => {
+      const isExternalDragActive = !!this._externalDragService.activeTask();
+      untracked(() => this._toggleExternalDragTracking(isExternalDragActive));
+    });
+  }
+
+  ngAfterViewInit(): void {
+    // Listen for global pointer releases while a drag is active so we can finalize drops.
+    this._pointerUpSubscription = this._dragDropRegistry.pointerUp.subscribe((event) => {
+      this._ngZone.run(() => this._handlePointerUp(event));
+    });
+
+    // Deliberately scroll to the current time only once when the panel opens.
+    // Do not tie this to scheduleRefreshTick; doing so reintroduces the snap-back from #9906.
+    this._scheduleScrollToCurrentTime();
+  }
+
+  ngOnDestroy(): void {
+    if (this._pointerUpSubscription) {
+      this._pointerUpSubscription.unsubscribe();
+      this._pointerUpSubscription = null;
+    }
+    this._toggleExternalDragTracking(false);
+    // Ensure preview styling is cleaned up
+    this._applySchedulePreviewStyling(false);
+    this._activeExternalTask = null;
+  }
+
+  onPagerNavigate(page: ScheduleDayPage): void {
+    const today = this.todayDateStr();
+    this._selectedDay.set(today && page.day > today ? page.day : null);
+  }
+
+  private _createPage(
+    day: Signal<string | undefined>,
+  ): Signal<ScheduleDayPage | undefined> {
+    const days = computed(() => {
+      const d = day();
+      return d ? [d] : [];
+    });
+    const scheduleDays = this._scheduleService.createScheduleDaysComputed(days);
+    return computed(() => {
+      const d = day();
+      return d ? toScheduleDayPage(d, scheduleDays()) : undefined;
+    });
+  }
+
+  private _currentScheduleWeekIndex(): number {
+    const day = this.selectedDay();
+    return this._scheduleWeeks().findIndex((cmp) => cmp.daysToShow()[0] === day);
+  }
+
+  private _targetDay(): string | undefined {
+    const [day] = this.daysToShow();
+    return day;
+  }
+
+  private _calculateTimeFromYPosition(clientY: number): number | null {
+    const containerElement = this.scheduleWeekRef?.nativeElement;
+    const scheduleWeek = containerElement?.querySelector('.grid-container');
+
+    if (!scheduleWeek) {
+      return null;
+    }
+
+    const gridRect = scheduleWeek.getBoundingClientRect();
+    const targetDay = this._targetDay();
+
+    if (!targetDay) {
+      return null;
+    }
+
+    return calculateTimeFromYPosition(clientY, gridRect, targetDay);
+  }
+
+  private _calculateDropTime(
+    previewRect: DOMRect | null,
+    pointerY: number | null,
+  ): DropTimeCalculation {
+    const topY = this._resolveTopY(previewRect?.top ?? null, pointerY);
+    const timestampFromPosition =
+      topY != null ? this._calculateTimeFromYPosition(topY) : null;
+    const timestamp = timestampFromPosition ?? this.lastCalculatedTimestamp;
+    const source: DropTimeSource =
+      timestampFromPosition != null
+        ? previewRect
+          ? 'preview-top-adjusted'
+          : pointerY != null
+            ? 'pointer-top-adjusted'
+            : 'top-cache'
+        : 'cached';
+
+    return { timestamp, source };
+  }
+
+  private _handlePointerUp(event: MouseEvent | TouchEvent): void {
+    if (!this.isDragging()) {
+      return;
+    }
+
+    // Treat any pointer release while the preview is active as a potential drop on the panel.
+    const task = this._activeExternalTask ?? this._externalDragService.activeTask();
+    const previewRect = this._getDragPreviewRect();
+    const pointer = getPointerPosition(event);
+    const isInside = this._isEffectiveTopWithinDropZone(previewRect, pointer);
+    const dropCalculation = isInside
+      ? this._calculateDropTime(previewRect, pointer?.y ?? null)
+      : null;
+    const dropTime = dropCalculation?.timestamp ?? null;
+    const targetDay = this._targetDay();
+
+    this._stopScheduleMode();
+    this._externalDragService.setActiveTask(null);
+
+    if (!task || !targetDay) {
+      return;
+    }
+
+    let wasDroppedSuccessfully = false;
+
+    if (dropTime !== null) {
+      this.lastCalculatedTimestamp = dropTime;
+      const targetDate = new Date(dropTime);
+      Log.log('[ScheduleDayPanel] Drop calculation:', {
+        source: dropCalculation?.source ?? 'cached',
+        storedTimestamp: dropTime,
+        targetTime: targetDate,
+        formattedTime: this._formatTime(targetDate.getHours(), targetDate.getMinutes()),
+      });
+      const hasExistingSchedule = !!task.dueWithTime;
+      const hasReminder = !!(task.remindAt ?? task.reminderId);
+      let remindAt: number | undefined;
+      if (!hasExistingSchedule && !hasReminder) {
+        remindAt = remindOptionToMilliseconds(dropTime, this._getDefaultReminderOption());
+      } else if (hasReminder) {
+        remindAt = dropTime;
+      }
+
+      const payload = {
+        task,
+        dueWithTime: dropTime,
+        ...(typeof remindAt === 'number' ? { remindAt } : {}),
+        isMoveToBacklog: false,
+      };
+
+      this._store.dispatch(
+        hasExistingSchedule
+          ? TaskSharedActions.reScheduleTaskWithTime(payload)
+          : TaskSharedActions.scheduleTaskWithTime(payload),
+      );
+      if (!task.timeEstimate || task.timeEstimate <= 0) {
+        this._store.dispatch(
+          TaskSharedActions.updateTask({
+            task: { id: task.id, changes: { timeEstimate: DEFAULT_MIN_DURATION } },
+          }),
+        );
+      }
+      wasDroppedSuccessfully = true;
+    } else if (isInside) {
+      this._store.dispatch(
+        PlannerActions.planTaskForDay({
+          task,
+          day: targetDay,
+          isAddToTop: true,
+        }),
+      );
+      wasDroppedSuccessfully = true;
+    }
+
+    // Disable snap-back animation when successfully dropped on panel
+    if (wasDroppedSuccessfully) {
+      this._disableSnapBackAnimation();
+    }
+  }
+
+  private _getDragPreviewRect(): DOMRect | null {
+    return this._withDragPreview((preview) => preview.getBoundingClientRect());
+  }
+
+  private _isPointerWithinDropZone(pointer: { x: number; y: number }): boolean {
+    const dropZoneRect = this._getVisibleDropZoneRect();
+    if (!dropZoneRect) {
+      return false;
+    }
+
+    return (
+      pointer.x >= dropZoneRect.left &&
+      pointer.x <= dropZoneRect.right &&
+      pointer.y >= dropZoneRect.top &&
+      pointer.y <= dropZoneRect.bottom
+    );
+  }
+
+  private _isEffectiveTopWithinDropZone(
+    rect: DOMRect | null,
+    pointer: { x: number; y: number } | null,
+  ): boolean {
+    const dropZoneRect = this._getVisibleDropZoneRect();
+    if (!dropZoneRect) {
+      return false;
+    }
+
+    const topY = this._resolveTopY(rect?.top ?? null, pointer?.y ?? null);
+    if (topY == null) {
+      return false;
+    }
+
+    const horizontalOverlap = rect
+      ? this._isPreviewHorizontallyAligned(rect, dropZoneRect)
+      : pointer
+        ? this._isPointerHorizontallyAligned(pointer, dropZoneRect)
+        : false;
+
+    return horizontalOverlap && topY >= dropZoneRect.top && topY <= dropZoneRect.bottom;
+  }
+
+  // The part of the drop zone that is on screen. The drop zone spans the whole
+  // scrollable schedule (or, in the bottom sheet, one viewport height that
+  // scrolls away), so its own rect also covers what is scrolled out of view.
+  private _getVisibleDropZoneRect(): DOMRect | null {
+    const dropZoneEl = this.dropZoneRef?.nativeElement;
+    if (!dropZoneEl) {
+      return null;
+    }
+    const dz = dropZoneEl.getBoundingClientRect();
+    const sc = this._findScrollContainer()?.getBoundingClientRect();
+    if (!sc) {
+      return dz;
+    }
+    const left = Math.max(dz.left, sc.left);
+    const top = Math.max(dz.top, sc.top);
+    const right = Math.min(dz.right, sc.right);
+    const bottom = Math.min(dz.bottom, sc.bottom);
+    return new DOMRect(left, top, Math.max(0, right - left), Math.max(0, bottom - top));
+  }
+
+  private _withDragPreview<T>(handler: (preview: HTMLElement) => T): T | null {
+    const previewEl = this._getDragPreview();
+    if (!previewEl) {
+      return null;
+    }
+    return handler(previewEl);
+  }
+
+  private _getDragPreview(): HTMLElement | null {
+    return document.querySelector('.cdk-drag-preview') as HTMLElement | null;
+  }
+
+  private _formatTime(hours: number, minutes: number): string {
+    return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+  }
+
+  private _formatPreviewTime(timestamp: number): string {
+    const date = new Date(timestamp);
+    return this._formatTime(date.getHours(), date.getMinutes());
+  }
+
+  private _resolveTopY(
+    previewTop: number | null,
+    pointerY: number | null,
+  ): number | null {
+    if (pointerY != null && previewTop != null && this._dragPointerOffsetY == null) {
+      this._dragPointerOffsetY = pointerY - previewTop;
+    }
+
+    if (pointerY != null && this._dragPointerOffsetY != null) {
+      const adjustedTop = pointerY - this._dragPointerOffsetY;
+      this._lastKnownTopY = adjustedTop;
+      return adjustedTop;
+    }
+
+    if (previewTop != null) {
+      this._lastKnownTopY = previewTop;
+      return previewTop;
+    }
+
+    if (pointerY != null) {
+      return pointerY;
+    }
+
+    return this._lastKnownTopY;
+  }
+
+  private _isPreviewHorizontallyAligned(rect: DOMRect, dropZoneRect: DOMRect): boolean {
+    return rect.right >= dropZoneRect.left && rect.left <= dropZoneRect.right;
+  }
+
+  private _isPointerHorizontallyAligned(
+    pointer: { x: number; y: number },
+    dropZoneRect: DOMRect,
+  ): boolean {
+    return pointer.x >= dropZoneRect.left && pointer.x <= dropZoneRect.right;
+  }
+
+  private _scheduleScrollToCurrentTime(): void {
+    setTimeout(() => {
+      this._scrollToCurrentTime();
+    }, SCROLL_DELAY_MS);
+  }
+
+  private _findScrollContainer(): Element | null {
+    // In the mobile bottom sheet the scroll container is the sheet's direct
+    // content child, i.e. this component's host element.
+    const selectors = [
+      '.side-inner',
+      '.right-panel',
+      '.bottom-panel-content > *',
+      '[class*="panel"]',
+    ];
+    const el = this.scheduleWeekRef?.nativeElement;
+    if (!el) {
+      return null;
+    }
+
+    for (const selector of selectors) {
+      const container = el.closest(selector);
+      if (container) {
+        return container;
+      }
+    }
+    return null;
+  }
+
+  // TODO replace with the schedule view's approach (scrollIntoView plus
+  // scroll-padding on the scroll container, see ScheduleComponent) so there is
+  // one implementation of "scroll to now" instead of two that can drift. This
+  // one is rect-based like the old schedule code was, but its enter animation
+  // (slideInFromRightAni) is translateX only, so it does not hit the transform
+  // overshoot that fix had.
+  private _scrollToCurrentTime(): void {
+    const scheduleWeekEl = this.scheduleWeekRef?.nativeElement;
+    if (!scheduleWeekEl) {
+      Log.warn('[ScheduleDayPanel] No scheduleWeekRef available');
+      return;
+    }
+
+    const currentTimeElement = scheduleWeekEl.querySelector('.current-time');
+    if (!currentTimeElement) {
+      Log.warn('[ScheduleDayPanel] Current time element not found');
+      return;
+    }
+
+    const scrollContainer = this._findScrollContainer();
+    if (!scrollContainer) {
+      Log.warn('[ScheduleDayPanel] No scrollable container found');
+      return;
+    }
+
+    Log.log('[ScheduleDayPanel] Found scroll container:', scrollContainer.className);
+
+    const containerRect = scrollContainer.getBoundingClientRect();
+    const elementRect = currentTimeElement.getBoundingClientRect();
+    const relativePosition = elementRect.top - containerRect.top;
+    const targetScrollTop =
+      scrollContainer.scrollTop + relativePosition - SCROLL_TOP_OFFSET_PX;
+
+    Log.log('[ScheduleDayPanel] Scrolling to position:', Math.max(0, targetScrollTop));
+
+    scrollContainer.scrollTo({
+      top: Math.max(0, targetScrollTop),
+    });
+  }
+
+  private _updateDragPreviewTime(previewEl: HTMLElement, timestamp: number | null): void {
+    if (timestamp == null) {
+      this.dragPreviewTime.set(null);
+      this._clearTimeBadgeText(previewEl);
+      return;
+    }
+    const timeStr = this._formatPreviewTime(timestamp);
+    this.dragPreviewTime.set(timeStr);
+    this._ensureTimeBadge(previewEl).textContent = timeStr;
+  }
+
+  private _startScheduleMode(): void {
+    if (this.isDragging()) return;
+    this.isDragging.set(true);
+    this._dragPointerOffsetY = null;
+    this._lastKnownTopY = null;
+    this._applySchedulePreviewStyling(true);
+    this._cdr.markForCheck();
+
+    // Show custom drag preview in schedule-week component. The caller moves it
+    // to the pointer's time right away.
+    const task = this._activeExternalTask;
+    if (task && this.scheduleWeekComponent) {
+      const scheduleEvent = this._createScheduleEventFromTask(task);
+      const style = this._calculateInitialPreviewStyle();
+      const timestamp = this.lastCalculatedTimestamp || Date.now();
+      this.scheduleWeekComponent.showExternalPreview(scheduleEvent, style, timestamp);
+    }
+  }
+
+  private _stopScheduleMode(): void {
+    if (!this.isDragging()) return;
+    this.isDragging.set(false);
+    this.dragPreviewTime.set(null);
+    this.lastCalculatedTimestamp = null;
+    this._dragPointerOffsetY = null;
+    this._lastKnownTopY = null;
+    this._activeExternalTask = null;
+    this._applySchedulePreviewStyling(false);
+    this._cdr.markForCheck();
+
+    // Hide custom drag preview in schedule-week component
+    if (this.scheduleWeekComponent) {
+      this.scheduleWeekComponent.hideExternalPreview();
+    }
+  }
+
+  private _toggleExternalDragTracking(isEnable: boolean): void {
+    if (isEnable === this._isTrackingExternalDrag) {
+      return;
+    }
+    this._isTrackingExternalDrag = isEnable;
+    for (const eventName of this._globalPointerEvents) {
+      if (isEnable) {
+        document.addEventListener(
+          eventName,
+          this._onExternalDragMove,
+          this._globalPointerListenerOptions,
+        );
+      } else {
+        document.removeEventListener(eventName, this._onExternalDragMove, {
+          capture: true,
+        });
+      }
+    }
+    if (!isEnable && this.isDragging()) {
+      // The drag ended or was cancelled without a release over the panel.
+      this._ngZone.run(() => this._stopScheduleMode());
+    }
+  }
+
+  private _onExternalDragMove = (ev: MouseEvent | TouchEvent): void => {
+    const activeTask = this._externalDragService.activeTask();
+    const pointer = getPointerPosition(ev);
+    if (!activeTask || !pointer) {
+      return;
+    }
+
+    if (!this._isPointerWithinDropZone(pointer)) {
+      // If pointer is not over the side panel/drop zone anymore, leave schedule mode
+      if (this.isDragging()) {
+        this._ngZone.run(() => this._stopScheduleMode());
+      }
+      return;
+    }
+
+    if (!this.isDragging()) {
+      this._activeExternalTask = activeTask;
+      this._ngZone.run(() => this._startScheduleMode());
+    }
+    const previewRect = this._getDragPreviewRect();
+
+    // Update time calculation continuously while dragging over the drop zone
+    // This is especially important for touch devices
+    this._ngZone.run(() => {
+      const topY = this._resolveTopY(previewRect?.top ?? null, pointer.y);
+      const timestamp = topY != null ? this._calculateTimeFromYPosition(topY) : null;
+      this.lastCalculatedTimestamp = timestamp;
+
+      if (timestamp != null) {
+        this.dragPreviewTime.set(this._formatPreviewTime(timestamp));
+        // Update badge on preview element if it exists (desktop)
+        const previewEl = this._getDragPreview();
+        if (previewEl) {
+          const timeBadge = this._ensureTimeBadge(previewEl);
+          timeBadge.textContent = this._formatPreviewTime(timestamp);
+        }
+
+        // Update custom preview position in schedule-week component
+        if (this.scheduleWeekComponent) {
+          const style = this._calculatePreviewStyleFromTime(timestamp);
+          if (style) {
+            this.scheduleWeekComponent.updateExternalPreview(style, timestamp);
+          }
+        }
+      } else {
+        this.dragPreviewTime.set(null);
+      }
+      this._cdr.markForCheck();
+    });
+  };
+
+  // we're mutating the dom directly here to add some styling to the drag preview, since it is the most efficient way to do it
+  private _applySchedulePreviewStyling(isEnable: boolean): void {
+    this._withDragPreview((previewEl) => {
+      const tagName = previewEl.tagName.toLowerCase();
+      if (tagName === 'task') {
+        this._applyTaskPreviewStyling(previewEl, isEnable);
+      } else if (tagName === 'schedule-event') {
+        this._applyScheduleEventPreviewStyling(previewEl, isEnable);
+      }
+    });
+  }
+
+  private _applyTaskPreviewStyling(previewEl: HTMLElement, isEnable: boolean): void {
+    if (isEnable) {
+      previewEl.classList.add('as-schedule-event-preview');
+      previewEl.style.opacity = OPACITY_HIDDEN;
+      this._setPreviewWidth(previewEl);
+      const timeBadge = this._ensureTimeBadge(previewEl);
+      timeBadge.textContent = this.dragPreviewTime() ?? '';
+    } else {
+      previewEl.classList.remove('as-schedule-event-preview');
+      previewEl.style.opacity = OPACITY_VISIBLE;
+      previewEl.style.removeProperty('width');
+      this._removeTimeBadge(previewEl);
+    }
+  }
+
+  private _setPreviewWidth(previewEl: HTMLElement): void {
+    const containerElement = this.scheduleWeekRef?.nativeElement as
+      | HTMLElement
+      | undefined;
+    const day = this._targetDay();
+
+    if (!containerElement || !day) {
+      return;
+    }
+
+    const colEl = containerElement.querySelector(
+      `.grid-container .col[data-day="${day}"]`,
+    ) as HTMLElement | null;
+
+    if (!colEl) {
+      return;
+    }
+
+    const colRect = colEl.getBoundingClientRect();
+    previewEl.style.width = `${Math.max(MIN_PREVIEW_WIDTH_PX, colRect.width - PREVIEW_WIDTH_PADDING_PX)}px`;
+  }
+
+  private _ensureTimeBadge(previewEl: HTMLElement): HTMLElement {
+    let timeBadge = previewEl.querySelector(
+      '.drag-preview-time-badge',
+    ) as HTMLElement | null;
+
+    if (!timeBadge) {
+      timeBadge = document.createElement('div');
+      timeBadge.className = 'drag-preview-time-badge';
+      previewEl.appendChild(timeBadge);
+    }
+
+    return timeBadge;
+  }
+
+  private _clearTimeBadgeText(previewEl: HTMLElement): void {
+    const timeBadge = previewEl.querySelector(
+      '.drag-preview-time-badge',
+    ) as HTMLElement | null;
+    if (timeBadge) {
+      timeBadge.textContent = '';
+    }
+  }
+
+  private _removeTimeBadge(previewEl: HTMLElement): void {
+    const timeBadge = previewEl.querySelector('.drag-preview-time-badge');
+    if (timeBadge) {
+      timeBadge.remove();
+    }
+  }
+
+  private _applyScheduleEventPreviewStyling(
+    previewEl: HTMLElement,
+    isEnable: boolean,
+  ): void {
+    previewEl.style.opacity = isEnable ? OPACITY_HIDDEN : OPACITY_VISIBLE;
+  }
+
+  private _createScheduleEventFromTask(task: TaskWithSubTasks): ScheduleEvent {
+    const timeEstimate = task.timeEstimate || DEFAULT_MIN_DURATION;
+    const timeInHours = timeEstimate / (60 * 60 * 1000);
+
+    return {
+      id: task.id,
+      type: SVEType.Task,
+      style: '',
+      startHours: 0,
+      timeLeftInHours: timeInHours,
+      data: task,
+    };
+  }
+
+  private _calculateInitialPreviewStyle(): string {
+    // Start with a default position (e.g., row 1, column 2)
+    const row = 1;
+    const col = 2;
+    const rowSpan = this._calculateRowSpanFromTask(this._activeExternalTask);
+    return `grid-row: ${row} / span ${rowSpan}; grid-column: ${col} / span 1`;
+  }
+
+  private _calculatePreviewStyleFromTime(timestamp: number): string | null {
+    const gridContainer = this.scheduleWeekRef?.nativeElement?.querySelector(
+      '.grid-container',
+    ) as HTMLElement | null;
+
+    if (!gridContainer) {
+      return null;
+    }
+
+    const date = new Date(timestamp);
+    const hours = date.getHours();
+    const minutes = date.getMinutes();
+    // eslint-disable-next-line no-mixed-operators
+    const hoursDecimal = hours + minutes / 60;
+
+    // Calculate row based on time (FH rows per hour)
+    const row = Math.round(hoursDecimal * FH) + 1;
+    const col = 2; // First day column
+    const rowSpan = this._calculateRowSpanFromTask(this._activeExternalTask);
+
+    return `grid-row: ${row} / span ${rowSpan}; grid-column: ${col} / span 1`;
+  }
+
+  private _calculateRowSpanFromTask(task: TaskWithSubTasks | null): number {
+    if (!task) {
+      return 6; // Default fallback
+    }
+    const timeEstimate = task.timeEstimate || DEFAULT_MIN_DURATION;
+    const timeInHours = timeEstimate / (60 * 60 * 1000);
+    return Math.max(Math.round(timeInHours * FH), 1);
+  }
+
+  private _getDefaultReminderOption(): TaskReminderOptionId {
+    return (
+      (this._globalConfigService.cfg()?.reminder
+        ?.defaultTaskRemindOption as TaskReminderOptionId) ??
+      DEFAULT_GLOBAL_CONFIG.reminder.defaultTaskRemindOption!
+    );
+  }
+
+  private _disableSnapBackAnimation(): void {
+    // Immediately hide the drag preview to prevent snap-back animation
+    const previewEl = this._getDragPreview();
+    if (previewEl) {
+      previewEl.remove();
+    }
+  }
+}

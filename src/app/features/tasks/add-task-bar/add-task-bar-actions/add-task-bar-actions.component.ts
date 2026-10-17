@@ -1,0 +1,529 @@
+import {
+  ChangeDetectionStrategy,
+  Component,
+  computed,
+  DestroyRef,
+  inject,
+  input,
+  output,
+  signal,
+  viewChild,
+} from '@angular/core';
+import { MatButton } from '@angular/material/button';
+import { MatIcon } from '@angular/material/icon';
+import { MatTooltip } from '@angular/material/tooltip';
+import { MatMenu, MatMenuItem, MatMenuTrigger } from '@angular/material/menu';
+import { first } from 'rxjs/operators';
+import { ProjectService } from '../../../project/project.service';
+import { TagService } from '../../../tag/tag.service';
+import { MatDialog, MatDialogRef } from '@angular/material/dialog';
+import { DialogScheduleTaskComponent } from '../../../planner/dialog-schedule-task/dialog-schedule-task.component';
+import { DialogDeadlineComponent } from '../../dialog-deadline/dialog-deadline.component';
+import { AddTaskBarStateService } from '../add-task-bar-state.service';
+import { AddTaskBarParserService } from '../add-task-bar-parser.service';
+import { ESTIMATE_OPTIONS } from '../add-task-bar.const';
+import { stringToMs } from '../../../../ui/duration/string-to-ms.pipe';
+import { msToString } from '../../../../ui/duration/ms-to-string.pipe';
+import { T } from '../../../../t.const';
+import { TranslateModule, TranslateService } from '@ngx-translate/core';
+import { dateStrToUtcDate } from '../../../../util/date-str-to-utc-date';
+import { getDateTimeFromClockString } from '../../../../util/get-date-time-from-clock-string';
+import { isValidSplitTime } from '../../../../util/is-valid-split-time';
+import { normalizeClockStr } from '../../../../util/normalize-clock-str';
+import { getDbDateStr } from '../../../../util/get-db-date-str';
+import { isSingleEmoji } from '../../../../util/extract-first-emoji';
+import { DEFAULT_PROJECT_ICON, INBOX_PROJECT } from '../../../project/project.const';
+import { Project } from '../../../project/project.model';
+import { DateTimeFormatService } from 'src/app/core/date-time-format/date-time-format.service';
+import {
+  RepeatCycleOption,
+  RepeatQuickSetting,
+} from '../../../task-repeat-cfg/task-repeat-cfg.model';
+import { buildRepeatQuickSettingOptions } from '../../../task-repeat-cfg/dialog-edit-task-repeat-cfg/build-repeat-quick-setting-options';
+import { DateService } from '../../../../core/date/date.service';
+import { MenuTreeService } from '../../../menu-tree/menu-tree.service';
+import { SelectOptionRowComponent } from '../../../../ui/select-option-row/select-option-row.component';
+
+type MenuType = 'project' | 'tags' | 'estimate' | 'repeat';
+
+// Label for an interval recurrence, which has no entry in the quick-setting
+// list. Only reached for counts >= 2 (an interval of 1 is parsed as the
+// equivalent preset), so the plural wording always fits.
+const INTERVAL_LABEL_KEYS: Record<RepeatCycleOption, string> = {
+  DAILY: T.F.TASK_REPEAT.F.Q_EVERY_X_DAYS,
+  WEEKLY: T.F.TASK_REPEAT.F.Q_EVERY_X_WEEKS,
+  MONTHLY: T.F.TASK_REPEAT.F.Q_EVERY_X_MONTHS,
+  YEARLY: T.F.TASK_REPEAT.F.Q_EVERY_X_YEARS,
+};
+
+@Component({
+  selector: 'add-task-bar-actions',
+  templateUrl: './add-task-bar-actions.component.html',
+  styleUrls: ['./add-task-bar-actions.component.scss', '../add-task-bar.component.scss'],
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  standalone: true,
+  imports: [
+    MatButton,
+    MatIcon,
+    MatTooltip,
+    MatMenu,
+    MatMenuTrigger,
+    MatMenuItem,
+    TranslateModule,
+    SelectOptionRowComponent,
+  ],
+})
+export class AddTaskBarActionsComponent {
+  private _destroyRef = inject(DestroyRef);
+  private _projectService = inject(ProjectService);
+  private _tagService = inject(TagService);
+  private _matDialog = inject(MatDialog);
+  private _parserService = inject(AddTaskBarParserService);
+  private _dateTimeFormatService = inject(DateTimeFormatService);
+  private _translateService = inject(TranslateService);
+  private _dateService = inject(DateService);
+  private _menuTreeService = inject(MenuTreeService);
+  stateService = inject(AddTaskBarStateService);
+
+  T = T;
+
+  // Inputs
+  isHideDueBtn = input<boolean>(false);
+  isHideTagBtn = input<boolean>(false);
+
+  // Outputs
+  estimateChanged = output<string>();
+  refocus = output<void>();
+  scheduleDialogOpenChange = output<boolean>();
+
+  // Menu state
+  isProjectMenuOpen = signal<boolean>(false);
+  isTagsMenuOpen = signal<boolean>(false);
+  isEstimateMenuOpen = signal<boolean>(false);
+  isRepeatMenuOpen = signal<boolean>(false);
+
+  // State from service
+  state = computed(() => this.stateService.state());
+  hasNewTags = computed(() => this.state().newTagTitles.length > 0);
+  isAutoDetected = computed(() => this.stateService.isAutoDetected());
+
+  // Signals for projects and tags
+  allProjects = this._projectService.listInTreeOrderForUI;
+  projectFolderMap = computed(() => this._menuTreeService.projectFolderMap());
+  selectedProject = computed(() =>
+    this.allProjects().find((p) => p.id === this.state().projectId),
+  );
+  allTags = this._tagService.tagsNoMyDayAndNoListInTreeOrder;
+  tagFolderMap = computed(() => this._menuTreeService.tagFolderMap());
+  selectedTags = computed(() =>
+    this.allTags().filter(
+      (t) =>
+        this.state().tagIds.includes(t.id) || this.state().tagIdsFromTxt.includes(t.id),
+    ),
+  );
+  hasTagsSelected = computed(
+    () => this.state().tagIds.length > 0 || this.state().tagIdsFromTxt.length > 0,
+  );
+
+  // Constants
+  readonly ESTIMATE_OPTIONS = ESTIMATE_OPTIONS;
+
+  // View children
+  projectMenuTrigger = viewChild('projectMenuTrigger', { read: MatMenuTrigger });
+  tagsMenuTrigger = viewChild('tagsMenuTrigger', { read: MatMenuTrigger });
+  estimateMenuTrigger = viewChild('estimateMenuTrigger', { read: MatMenuTrigger });
+  repeatMenuTrigger = viewChild('repeatMenuTrigger', { read: MatMenuTrigger });
+
+  // Computed values
+  dateDisplay = computed(() => {
+    const state = this.state();
+    if (!state.date) return null;
+    const today = this._dateService.getLogicalTodayDate();
+    const date = dateStrToUtcDate(state.date);
+    const timeStr = state.time ? this._formatTimeForDisplay(state.time) : null;
+    if (this.isSameDate(date, today)) {
+      return timeStr || this._translateService.instant(T.F.TASK.ADD_TASK_BAR.TODAY);
+    }
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    if (!state.time && this.isSameDate(date, tomorrow)) {
+      return this._translateService.instant(T.F.TASK.ADD_TASK_BAR.TOMORROW);
+    }
+    // Spelled-out `month: 'short'` name follows the UI language under the ISO
+    // option, so it isn't shown in Swedish (the `sv` sentinel); #8987 follow-up.
+    const dateStr = date.toLocaleDateString(this._dateTimeFormatService.textLocale(), {
+      month: 'short',
+      day: 'numeric',
+    });
+    return timeStr ? `${dateStr} ${timeStr}` : dateStr;
+  });
+
+  deadlineDateDisplay = computed(() => {
+    const state = this.state();
+    if (!state.deadlineDate) return null;
+    const today = this._dateService.getLogicalTodayDate();
+    const date = dateStrToUtcDate(state.deadlineDate);
+    const timeStr = state.deadlineTime
+      ? this._formatTimeForDisplay(state.deadlineTime)
+      : null;
+    if (this.isSameDate(date, today)) {
+      return timeStr || this._translateService.instant(T.F.TASK.ADD_TASK_BAR.TODAY);
+    }
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    if (!state.deadlineTime && this.isSameDate(date, tomorrow)) {
+      return this._translateService.instant(T.F.TASK.ADD_TASK_BAR.TOMORROW);
+    }
+    // Spelled-out `month: 'short'` name follows the UI language under the ISO
+    // option, so it isn't shown in Swedish (the `sv` sentinel); #8987 follow-up.
+    const dateStr = date.toLocaleDateString(this._dateTimeFormatService.textLocale(), {
+      month: 'short',
+      day: 'numeric',
+    });
+    return timeStr ? `${dateStr} ${timeStr}` : dateStr;
+  });
+
+  private _formatTimeForDisplay(timeStr: string): string {
+    // Never let a malformed time crash change detection via the "Invalid clock
+    // string" guard (#7802). Recover a stray seconds component, then fall back
+    // to the raw string for genuinely invalid values rather than throwing.
+    const normalized = normalizeClockStr(timeStr);
+    if (!isValidSplitTime(normalized)) {
+      return timeStr;
+    }
+    return this._dateTimeFormatService.formatTime(
+      getDateTimeFromClockString(normalized, new Date()),
+    );
+  }
+
+  estimateDisplay = computed(() => {
+    const estimate = this.state().estimate;
+    return estimate ? msToString(estimate) : null;
+  });
+
+  // The day the user chose, which is what every option here re-derives from —
+  // so a label can never name a different weekday than the config it saves
+  // recurs on. Not always the config's `startDate`: submitting a workday
+  // recurrence rolls a weekend day forward to the Monday. That does not break
+  // the guarantee, because the only preset that is rolled is the one whose
+  // label names no weekday ("Workdays"); a preset whose label does name one
+  // derives its own anchor from this date and is never rolled.
+  //
+  // The no-date fallback is the *logical* today, matching the `todayStr()` the
+  // submit path falls back to. A wall-clock `new Date()` would name yesterday's
+  // weekday between midnight and the configured start of the next day, so the
+  // label and the saved config would disagree in exactly that window.
+  private _repeatRefDate = computed(() => {
+    const dateStr = this.state().date;
+    return dateStr ? dateStrToUtcDate(dateStr) : this._dateService.getLogicalTodayDate();
+  });
+
+  repeatQuickOptions = computed(() => {
+    const refDate = this._repeatRefDate();
+    return buildRepeatQuickSettingOptions(
+      refDate,
+      this._dateTimeFormatService.currentLocale(),
+      this._translateService,
+      // Spelled-out weekday follows the UI language under the ISO option, so it
+      // isn't shown in Swedish (the `sv` sentinel); #8987 follow-up.
+      this._dateTimeFormatService.textLocale(),
+    );
+  });
+
+  repeatDisplay = computed(() => {
+    const repeat = this.state().repeat;
+    if (!repeat) return null;
+    if (repeat.type === 'INTERVAL') {
+      return this._translateService.instant(INTERVAL_LABEL_KEYS[repeat.repeatCycle], {
+        count: repeat.repeatEvery,
+        // Only read by the weekly label; a weekly cycle always recurs on the
+        // first occurrence's weekday, whether the phrase named it ("@every 2
+        // fridays") or took today's ("@every 2 weeks")
+        weekdayStr: this._repeatRefDate().toLocaleDateString(
+          this._dateTimeFormatService.textLocale(),
+          { weekday: 'long' },
+        ),
+      });
+    }
+    const value = repeat.type === 'DIALOG' ? 'CUSTOM' : repeat.quickSetting;
+    return this.repeatQuickOptions().find((o) => o.value === value)?.label ?? null;
+  });
+
+  // Emoji detection for project icons
+  isProjectEmojiIcon = computed(() => {
+    const project = this.selectedProject();
+    const icon = project?.icon || 'folder';
+    return isSingleEmoji(icon);
+  });
+
+  isDefaultInboxProject(project: Project | null | undefined): boolean {
+    return project?.id === INBOX_PROJECT.id && project.title === INBOX_PROJECT.title;
+  }
+
+  openScheduleDialog(): void {
+    const state = this.state();
+    this.scheduleDialogOpenChange.emit(true);
+    let dialogRef!: MatDialogRef<DialogScheduleTaskComponent>;
+    try {
+      dialogRef = this._matDialog.open(DialogScheduleTaskComponent, {
+        data: {
+          targetDay: state.date || undefined,
+          targetTime: state.time || undefined,
+          isSelectDueOnly: true,
+        },
+      });
+    } catch (err) {
+      this.scheduleDialogOpenChange.emit(false);
+      throw err;
+    }
+
+    dialogRef.afterClosed().subscribe((result) => {
+      if (result && typeof result === 'object' && result.date) {
+        this._parserService.applyUserDatePick(
+          getDbDateStr(result.date),
+          result.time ?? null,
+          result.remindOption ?? null,
+        );
+      }
+      this.refocus.emit();
+      window.setTimeout(() => {
+        if (!this._destroyRef.destroyed) {
+          this.scheduleDialogOpenChange.emit(false);
+        }
+      });
+    });
+  }
+
+  openDeadlineDialog(): void {
+    const state = this.state();
+    this.scheduleDialogOpenChange.emit(true);
+    let dialogRef!: MatDialogRef<DialogDeadlineComponent>;
+    try {
+      dialogRef = this._matDialog.open(DialogDeadlineComponent, {
+        data: {
+          targetDeadlineDay: state.deadlineDate || undefined,
+          targetDeadlineTime: state.deadlineTime || undefined,
+          targetDeadlineRemindOption: state.deadlineRemindOption ?? undefined,
+          isSelectDeadlineOnly: true,
+        },
+      });
+    } catch (err) {
+      this.scheduleDialogOpenChange.emit(false);
+      throw err;
+    }
+
+    dialogRef.afterClosed().subscribe((result) => {
+      if (result && typeof result === 'object') {
+        if (result.date) {
+          this._parserService.applyUserDeadlinePick(
+            getDbDateStr(result.date),
+            result.time ?? null,
+            result.remindOption ?? null,
+          );
+        } else if (result.date === null) {
+          this.stateService.clearDeadline();
+        }
+      }
+      this.refocus.emit();
+      window.setTimeout(() => {
+        if (!this._destroyRef.destroyed) {
+          this.scheduleDialogOpenChange.emit(false);
+        }
+      });
+    });
+  }
+
+  hasSelectedTag(tagId: string): boolean {
+    return this.state().tagIds.includes(tagId);
+  }
+
+  onEstimateInput(value: string): void {
+    const ms = stringToMs(value);
+    if (ms > 0) {
+      this._parserService.applyUserEstimatePick(ms);
+      this.estimateChanged.emit(value);
+    }
+  }
+
+  onProjectMenuClick(): void {
+    this._handleMenuClick('project');
+  }
+
+  onTagsMenuClick(): void {
+    this._handleMenuClick('tags');
+  }
+
+  onEstimateMenuClick(): void {
+    this._handleMenuClick('estimate');
+  }
+
+  onRepeatMenuClick(): void {
+    this._handleMenuClick('repeat');
+  }
+
+  // Public methods to open menus programmatically
+  openProjectMenu(): void {
+    this._openMenuProgrammatically('project');
+  }
+
+  openTagsMenu(): void {
+    this._openMenuProgrammatically('tags');
+  }
+
+  openEstimateMenu(): void {
+    this._openMenuProgrammatically('estimate');
+  }
+
+  openRepeatMenu(): void {
+    this._openMenuProgrammatically('repeat');
+  }
+
+  selectRepeatQuickSetting(setting: RepeatQuickSetting): void {
+    this._parserService.applyUserRepeatPick(
+      setting === 'CUSTOM'
+        ? { type: 'DIALOG' }
+        : { type: 'PRESET', quickSetting: setting },
+    );
+  }
+
+  clearRepeatSetting(): void {
+    const currentInput = this.stateService.inputTxt();
+    const cleanedInput = this._parserService.removeShortSyntaxFromInput(
+      currentInput,
+      'repeat',
+    );
+    this.stateService.clearRepeatSetting(cleanedInput);
+    this.refocus.emit();
+  }
+
+  // Private helper methods for DRY menu handling
+  private _handleMenuClick(menuType: MenuType): void {
+    if (this._destroyRef.destroyed) {
+      return;
+    }
+
+    const { menuSignal, trigger } = this._getMenuRefs(menuType);
+    menuSignal.set(true);
+
+    if (trigger) {
+      trigger.menuClosed.pipe(first()).subscribe(() => {
+        menuSignal.set(false);
+        this.refocus.emit();
+      });
+    }
+  }
+
+  private _openMenuProgrammatically(menuType: MenuType): void {
+    if (this._destroyRef.destroyed) {
+      return;
+    }
+
+    const { menuSignal, trigger } = this._getMenuRefs(menuType);
+
+    if (trigger) {
+      menuSignal.set(true);
+      trigger.openMenu();
+      trigger.menuClosed.pipe(first()).subscribe(() => {
+        menuSignal.set(false);
+        this.refocus.emit();
+      });
+    }
+  }
+
+  private _getMenuRefs(menuType: MenuType): {
+    menuSignal: ReturnType<typeof signal<boolean>>;
+    trigger: MatMenuTrigger | undefined;
+  } {
+    switch (menuType) {
+      case 'project':
+        return {
+          menuSignal: this.isProjectMenuOpen,
+          trigger: this.projectMenuTrigger(),
+        };
+      case 'tags':
+        return {
+          menuSignal: this.isTagsMenuOpen,
+          trigger: this.tagsMenuTrigger(),
+        };
+      case 'estimate':
+        return {
+          menuSignal: this.isEstimateMenuOpen,
+          trigger: this.estimateMenuTrigger(),
+        };
+      case 'repeat':
+        return {
+          menuSignal: this.isRepeatMenuOpen,
+          trigger: this.repeatMenuTrigger(),
+        };
+    }
+  }
+
+  clearDeadlineWithSyntax(): void {
+    const currentInput = this.stateService.inputTxt();
+    const cleanedInput = this._parserService.removeShortSyntaxFromInput(
+      currentInput,
+      'deadline',
+    );
+    this.stateService.clearDeadline(cleanedInput);
+    this.refocus.emit();
+  }
+
+  clearDateWithSyntax(): void {
+    const currentInput = this.stateService.inputTxt();
+    const cleanedInput = this._parserService.removeShortSyntaxFromInput(
+      currentInput,
+      'date',
+    );
+    this.stateService.clearDate(cleanedInput);
+    this.refocus.emit();
+  }
+
+  clearTagsWithSyntax(): void {
+    const currentInput = this.stateService.inputTxt();
+    const cleanedInput = this._parserService.removeShortSyntaxFromInput(
+      currentInput,
+      'tags',
+    );
+    this.stateService.clearTags(cleanedInput);
+    this.refocus.emit();
+  }
+
+  clearEstimateWithSyntax(): void {
+    const currentInput = this.stateService.inputTxt();
+    const cleanedInput = this._parserService.removeShortSyntaxFromInput(
+      currentInput,
+      'estimate',
+    );
+    this.stateService.clearEstimate(cleanedInput);
+    this.refocus.emit();
+  }
+
+  toggleTagWithSyntax(tag: any): void {
+    const currentInput = this.stateService.inputTxt();
+    const isRemoving = this.hasSelectedTag(tag.id);
+
+    if (isRemoving) {
+      // If removing the tag, clean it from the input
+      const cleanedInput = this._parserService.removeShortSyntaxFromInput(
+        currentInput,
+        'tags',
+        tag.title,
+      );
+      this.stateService.toggleTag(tag, cleanedInput);
+    } else {
+      // If adding the tag, don't modify the input (let the parser handle it)
+      this.stateService.toggleTag(tag);
+    }
+    this.refocus.emit();
+  }
+
+  private isSameDate(date1: Date, date2: Date): boolean {
+    return (
+      date1.getFullYear() === date2.getFullYear() &&
+      date1.getMonth() === date2.getMonth() &&
+      date1.getDate() === date2.getDate()
+    );
+  }
+
+  protected readonly DEFAULT_PROJECT_ICON = DEFAULT_PROJECT_ICON;
+}

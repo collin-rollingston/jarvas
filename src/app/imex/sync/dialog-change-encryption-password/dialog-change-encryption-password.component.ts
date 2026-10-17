@@ -1,0 +1,185 @@
+import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/core';
+import {
+  MAT_DIALOG_DATA,
+  MatDialogActions,
+  MatDialogContent,
+  MatDialogRef,
+  MatDialogTitle,
+} from '@angular/material/dialog';
+import { T } from '../../../t.const';
+import { MatFormField, MatLabel, MatError } from '@angular/material/form-field';
+import { MatInput } from '@angular/material/input';
+import { FormsModule } from '@angular/forms';
+import { MatButton } from '@angular/material/button';
+import { MatIcon } from '@angular/material/icon';
+import { TranslatePipe } from '@ngx-translate/core';
+import { EncryptionPasswordChangeService } from '../encryption-password-change.service';
+import { SnackService } from '../../../core/snack/snack.service';
+import { MatProgressSpinner } from '@angular/material/progress-spinner';
+import { MatDivider } from '@angular/material/divider';
+import { FileBasedEncryptionService } from '../file-based-encryption.service';
+import { SyncWrapperService } from '../sync-wrapper.service';
+import { SyncLocalStateService } from '../../../op-log/sync/sync-local-state.service';
+
+export interface ChangeEncryptionPasswordResult {
+  success: boolean;
+  encryptionRemoved?: boolean;
+}
+
+export interface ChangeEncryptionPasswordDialogData {
+  mode?: 'full' | 'disable-only';
+  /**
+   * Type of sync provider. Removing encryption is only offered for
+   * 'file-based'; SuperSync mandates encryption (GHSA-9v8x-68pf-p5x7).
+   */
+  providerType?: 'supersync' | 'file-based';
+}
+
+@Component({
+  selector: 'dialog-change-encryption-password',
+  templateUrl: './dialog-change-encryption-password.component.html',
+  styleUrls: ['./dialog-change-encryption-password.component.scss'],
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  imports: [
+    MatDialogTitle,
+    MatDialogContent,
+    MatFormField,
+    MatLabel,
+    MatError,
+    MatInput,
+    FormsModule,
+    MatDialogActions,
+    MatButton,
+    MatIcon,
+    TranslatePipe,
+    MatProgressSpinner,
+    MatDivider,
+  ],
+})
+export class DialogChangeEncryptionPasswordComponent {
+  private _encryptionPasswordChangeService = inject(EncryptionPasswordChangeService);
+  private _fileBasedEncryptionService = inject(FileBasedEncryptionService);
+  private _syncWrapperService = inject(SyncWrapperService);
+  private _syncLocalStateService = inject(SyncLocalStateService);
+  private _snackService = inject(SnackService);
+  private _matDialogRef =
+    inject<
+      MatDialogRef<
+        DialogChangeEncryptionPasswordComponent,
+        ChangeEncryptionPasswordResult
+      >
+    >(MatDialogRef);
+  private _data = inject<ChangeEncryptionPasswordDialogData | null>(MAT_DIALOG_DATA, {
+    optional: true,
+  });
+
+  T: typeof T = T;
+  newPassword = '';
+  confirmPassword = '';
+  isLoading = signal(false);
+  isRemovingEncryption = signal(false);
+  mode: 'full' | 'disable-only' = this._data?.mode || 'full';
+  providerType: 'supersync' | 'file-based' = this._data?.providerType || 'supersync';
+  textKeys: Record<string, string> =
+    this.providerType === 'file-based'
+      ? T.F.SYNC.FORM.FILE_BASED
+      : T.F.SYNC.FORM.SUPER_SYNC;
+
+  get passwordsMatch(): boolean {
+    return this.newPassword === this.confirmPassword;
+  }
+
+  get isValid(): boolean {
+    return this.newPassword.length >= 8 && this.passwordsMatch;
+  }
+
+  async confirm(): Promise<void> {
+    if (!this.isValid || this.isLoading()) {
+      return;
+    }
+
+    this.isLoading.set(true);
+
+    try {
+      // #9256: the op-log path below runs a clean slate, which makes the server
+      // DELETE its operations. A device that has never synced and holds nothing
+      // would replace the user's only copy with an empty one. File-based
+      // providers re-encrypt in place and are not affected.
+      if (
+        this.providerType !== 'file-based' &&
+        (await this._syncLocalStateService.hasNothingWorthUploading())
+      ) {
+        this._syncLocalStateService.warnNothingWorthUploading(
+          T.F.SYNC.D_NOTHING_TO_UPLOAD.MESSAGE_CHANGE_PW,
+        );
+        this.isLoading.set(false);
+        return;
+      }
+      // #9256: the same clean slate deletes remote ops this device could not
+      // decrypt; a synced device passes the check above, so warn explicitly.
+      // Never set for file-based providers.
+      if (!this._syncLocalStateService.confirmOverwriteOfUndecryptableRemoteOps()) {
+        this.isLoading.set(false);
+        return;
+      }
+
+      if (this.providerType === 'file-based') {
+        await this._syncWrapperService.runWithSyncBlocked(() =>
+          this._fileBasedEncryptionService.changePassword(this.newPassword),
+        );
+      } else {
+        // Always allow unsynced ops since password change does a clean slate + overwrite anyway
+        await this._encryptionPasswordChangeService.changePassword(this.newPassword, {
+          allowUnsyncedOps: true,
+        });
+      }
+      this.newPassword = '';
+      this.confirmPassword = '';
+      this._snackService.open({
+        type: 'SUCCESS',
+        msg: this.textKeys.CHANGE_PASSWORD_SUCCESS,
+      });
+      this._matDialogRef.close({ success: true });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      this._snackService.open({
+        type: 'ERROR',
+        msg: T.F.SYNC.S.CHANGE_PASSWORD_FAILED,
+        translateParams: { message },
+      });
+      this.isLoading.set(false);
+    }
+  }
+
+  cancel(): void {
+    this._matDialogRef.close({ success: false });
+  }
+
+  async removeEncryption(): Promise<void> {
+    if (this.isLoading() || this.isRemovingEncryption()) {
+      return;
+    }
+
+    this.isRemovingEncryption.set(true);
+
+    try {
+      // Fails closed for non-file-based providers.
+      await this._syncWrapperService.runWithSyncBlocked(() =>
+        this._fileBasedEncryptionService.disableEncryption(),
+      );
+      this._snackService.open({
+        type: 'SUCCESS',
+        msg: this.textKeys.DISABLE_ENCRYPTION_SUCCESS,
+      });
+      this._matDialogRef.close({ success: true, encryptionRemoved: true });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      this._snackService.open({
+        type: 'ERROR',
+        msg: T.F.SYNC.S.DISABLE_ENCRYPTION_FAILED,
+        translateParams: { message },
+      });
+      this.isRemovingEncryption.set(false);
+    }
+  }
+}

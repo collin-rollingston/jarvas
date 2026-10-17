@@ -1,0 +1,44 @@
+<div class="bottom-panel-container">
+  <div
+    class="bottom-panel-header"
+    #panelHeader
+  >
+    <div class="drag-handle"></div>
+  </div>
+
+  <div class="bottom-panel-content">
+    @switch (panelContent()) {
+      @case ('NOTES') {
+        <notes></notes>
+      }
+      @case ('TASK') {
+        @if (selectedTask(); as selectedTaskLocal) {
+          <div
+            class="ani-container"
+            [@taskDetailPanelTaskChange]="
+              isDisableTaskPanelAni() ? 'disabled' : selectedTaskLocal.id
+            "
+            [class.isDisableAni]="isDisableTaskPanelAni()"
+          >
+            <task-detail-panel [task]="selectedTaskLocal"></task-detail-panel>
+          </div>
+        }
+      }
+      @case ('ADD_TASK_PANEL') {
+        <issue-panel></issue-panel>
+      }
+      @case ('ISSUE_PANEL') {
+        <issue-panel></issue-panel>
+      }
+      @case ('TASK_VIEW_CUSTOMIZER_PANEL') {
+        <task-view-customizer-panel></task-view-customizer-panel>
+      }
+      @case ('PLUGIN') {
+        <plugin-panel-container></plugin-panel-container>
+      }
+      @case ('SCHEDULE_DAY_PANEL') {
+        <schedule-day-panel></schedule-day-panel>
+      }
+    }
+  </div>
+</div>

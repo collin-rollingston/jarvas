@@ -1,0 +1,134 @@
+// EXPERIMENT: vertical action strip on the right edge of the viewport
+// (desktop only). Lives at the top level (not inside main-header.scss) so
+// it bypasses Angular view-encapsulation and any containing-block
+// surprises (transform/filter/contain on ancestors).
+//
+// MainHeaderComponent teleports `nav.action-nav-right` to `<body>` when
+// `misc.isVerticalActionBar` is enabled and the breakpoint is non-XS,
+// adding the `action-nav-right--teleported` marker class. The
+// `body.isVerticalActionBar` body class is toggled by GlobalThemeService
+// off the same config flag — used here only for the tooltip override
+// (overlay panes live outside the teleported nav and need a body-level
+// anchor).
+@media screen and (min-width: 600px) {
+  // The strip sits BELOW the window-controls overlay band on Win/Linux
+  // Electron with custom title bar (the band holds the native window
+  // controls); elsewhere it starts at viewport top.
+  body > nav.action-nav-right.action-nav-right--teleported {
+    // Header spacing tokens are declared on <main-header>'s :host, but the
+    // strip is teleported to <body> and out of that scope, so re-declare them.
+    // The gap is deliberately larger here than in the horizontal row; the other
+    // two must match main-header, or the components that read them get an
+    // undefined var. --header-button-size is one of those: focus-button and
+    // simple-counter-button size themselves from it with no fallback, so
+    // without it their height and flex basis were invalid-at-computed-value in
+    // this mode and they lost their fixed box.
+    --header-nav-button-gap: var(--s);
+    --header-action-group-gap: var(--s2);
+    --header-button-size: 40px;
+    display: flex;
+    position: fixed;
+    // Default: strip starts at viewport top (web, Mac, native-frame
+    // Electron — none of these have a window-control overlay clashing
+    // with the right edge). Only Win/Linux Electron with custom title
+    // bar pushes the strip down by the band height to clear the WCO
+    // overlay band (rule below).
+    inset: 0 0 0 auto;
+    width: var(--vertical-action-bar-width);
+    margin: 0;
+    padding: var(--s-half) 0;
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-start;
+    gap: var(--header-nav-button-gap);
+    // Match the left sidenav (magic-side-nav uses --sidenav-bg).
+    background: var(--sidenav-bg);
+    border-left: 1px solid var(--separator-color);
+    z-index: var(--z-vertical-action-bar);
+    // overflow: visible so badges, the active-panel underline and the play
+    // button's elevation can paint past the 48px rail. (overflow-x can't be
+    // visible while overflow-y is auto — the two axes are coupled — so no
+    // inner scroll here; the strip holds few small buttons and is far shorter
+    // than the viewport.)
+    overflow: visible;
+    -webkit-app-region: no-drag;
+    box-sizing: border-box;
+
+    // Descendant, not child: the horizontal row keeps its actions inside
+    // `.action-nav-scroll`. That box is `display: contents` here, which removes
+    // it from the *rendered* tree but not from the *selector* tree, so a `>`
+    // combinator would silently stop matching and the rail would lose its
+    // column layout.
+    .header-action-group {
+      flex-direction: column;
+      margin-right: 0;
+      gap: var(--header-nav-button-gap);
+    }
+
+    .primary-action-group,
+    .counters-action-group {
+      margin-inline-end: 0;
+      margin-block-end: calc(
+        var(--header-action-group-gap) - var(--header-nav-button-gap)
+      );
+    }
+
+    // These wrapper custom-elements have no box of their own (height 0),
+    // so as direct flex children the strip's `gap` lands on a collapsed
+    // wrapper instead of the button(s) inside — the visible icons end up
+    // unevenly spaced next to real buttons (e.g. the add button). Make
+    // each wrapper a column flex item that stacks its button(s) with the
+    // same gap, and drop truly-empty wrappers so they don't reserve a
+    // phantom gap slot.
+    //
+    // Descendant, not child: these sit inside `.action-nav-scroll`, whose
+    // `display: contents` removes it from the *rendered* tree but not from the
+    // *selector* tree, so a `>` combinator would silently stop matching.
+    plugin-header-btns,
+    plugin-side-panel-btns,
+    desktop-panel-buttons {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: var(--header-nav-button-gap);
+
+      &:empty {
+        display: none;
+      }
+    }
+
+    // Center the mini-fab in the rail; no extra margin so the play button
+    // is spaced from the focus button by the same gap as every other pair.
+    play-button .play-btn-wrapper {
+      margin: 0;
+    }
+
+    // No current-task flyout here any more: the pill is a child of the header
+    // wrapper, which is NOT teleported, so in this mode it simply stays in the
+    // header — permanently visible rather than revealed on hover, and with no
+    // second copy of its styling to keep in step with the component's own.
+    // `.pill-slot` is still the wrapper's slack, and the pill still sits at its
+    // inline-end, so once this rail has taken the action row away the pill
+    // parks at the header's trailing edge.
+  }
+
+  // Win/Linux Electron with custom title bar: WCO renders a compact band
+  // (electron WCO_HEIGHT, which differs per platform) at top-right. Push the
+  // strip down by exactly that height so its first button sits flush
+  // below the WCO buttons and the strip reclaims the newly-freed space.
+  body.isElectron.isNoMac.isObsidianStyleHeader
+    > nav.action-nav-right.action-nav-right--teleported {
+    top: calc(env(titlebar-area-height, var(--wco-height)) + var(--s));
+  }
+
+  // Descendant, not child: the teleported nav's parent is `<body>`, and `dir`
+  // is only ever set on `<html>` and `.app-container` (app.component.html), so
+  // a `>` combinator never matched. The rail then stayed on the right in RTL,
+  // painting over the side nav while the 48px gutter the app reserves sat empty
+  // on the left.
+  [dir='rtl'] nav.action-nav-right.action-nav-right--teleported {
+    inset: 0 auto 0 0;
+    border-left: none;
+    border-right: 1px solid var(--separator-color);
+  }
+}

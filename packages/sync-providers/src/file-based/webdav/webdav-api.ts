@@ -1,0 +1,797 @@
+import type { SyncLogger } from '@sp/sync-core';
+import {
+  EmptyRemoteBodySPError,
+  HttpNotOkAPIError,
+  InvalidDataSPError,
+  MissingCredentialsSPError,
+  RemoteFileChangedUnexpectedly,
+  RemoteFileNotFoundAPIError,
+  WebDavSyncFolderUnusableSPError,
+} from '../../errors';
+import { errorMeta } from '../../log/error-meta';
+import { computeContentRev } from '../content-rev';
+import { WebDavHttpHeader, WebDavHttpMethod, WebDavHttpStatus } from './webdav.const';
+import type { WebDavHttpAdapter, WebDavHttpResponse } from './webdav-http-adapter';
+import { FileMeta, WebdavXmlParser } from './webdav-xml-parser';
+import type { WebdavPrivateCfg } from './webdav.model';
+
+/**
+ * RFC 7232 strong entity-tag: a quoted string of `etagc` chars only. The class
+ * excludes CR/LF, all control chars, the inner quote, and DEL, so a value from
+ * this pattern is safe to place verbatim in an `If-Match` header (no header
+ * splitting). Weak tags (`W/"..."`) intentionally do not match — they cannot
+ * drive a conditional write, so callers fall back to the content-hash check.
+ */
+const STRONG_ETAG_RE = /^"[\x21\x23-\x7e\x80-\xff]*"$/;
+
+/**
+ * Content-coding suffix Apache appends to the strong ETag it serves on a
+ * compressed response (`mod_deflate`'s default `DeflateAlterETag AddSuffix`,
+ * `mod_brotli` likewise). The DAV backend keeps comparing `If-Match` against
+ * the bare tag, so echoing the served tag fails with 412 on every upload
+ * (#9154, #10808). Such a tag is treated like a weak one: it never drives
+ * `If-Match`, and the rev falls back to the content hash. The bare spelling is
+ * never derived from it, so no rewritten tag can match a concurrent revision;
+ * see `_canonicalTagBehindRewrittenEtag` for the tag the server does supply.
+ */
+const CONTENT_CODING_ETAG_SUFFIX_RE = /-(?:gzip|br|deflate)"$/;
+
+export interface WebdavApiDeps {
+  logger: SyncLogger;
+  /**
+   * App-supplied factory for the current WebDAV cfg. Throws when
+   * credentials are missing — the caller catches and converts to
+   * `MissingCredentialsSPError`.
+   */
+  getCfg: () => Promise<WebdavPrivateCfg>;
+  httpAdapter: WebDavHttpAdapter;
+  /** Nextcloud's DAV layer exposes its canonical validator in `OC-ETag`. */
+  useCanonicalOcEtag?: boolean;
+  /**
+   * Injectable sleep for the post-upload verification backoff, so tests do not
+   * pay the real wait. Defaults to a plain `setTimeout`.
+   */
+  delay?: (ms: number) => Promise<void>;
+}
+
+export class WebdavApi {
+  private static readonly L = 'WebdavApi';
+
+  /**
+   * Read-back budget for `_verifyUpload`. The PUT has already been accepted by
+   * the time we verify, so re-reading is idempotent and never re-writes.
+   *
+   * #9985: some servers answer a GET that reuses the PUT's keep-alive
+   * connection with the *previous* version's body and `ETag`, or truncate it
+   * mid-stream (`net::ERR_CONTENT_LENGTH_MISMATCH`). The stored file is
+   * correct; only the read is transiently wrong, so one bad read must not be
+   * reported as a conflict. A genuine concurrent write still shows up on every
+   * attempt and is reported after the budget is spent.
+   */
+  private static readonly VERIFY_MAX_ATTEMPTS = 3;
+  private static readonly VERIFY_RETRY_DELAY_MS = 1000;
+  private readonly xmlParser: WebdavXmlParser;
+  private readonly directoryCreationQueue = new Map<string, Promise<void>>();
+
+  constructor(private readonly _deps: WebdavApiDeps) {
+    this.xmlParser = new WebdavXmlParser(_deps.logger);
+  }
+
+  private async _computeContentHash(data: string): Promise<string> {
+    return computeContentRev(data);
+  }
+
+  /**
+   * Returns an RFC-style strong entity tag from a response header. Weak or
+   * malformed values cannot safely drive `If-Match`, so callers fall back to a
+   * content hash and the legacy best-effort check instead.
+   */
+  private _readStrongEtag(
+    headers: Record<string, string>,
+    headerName: string,
+  ): string | undefined {
+    const etag = this._readHeader(headers, headerName);
+    return etag && this._isConditionalEtag(etag) ? etag : undefined;
+  }
+
+  private _readHeader(
+    headers: Record<string, string>,
+    headerName: string,
+  ): string | undefined {
+    return Object.entries(headers)
+      .find(([name]) => name.toLowerCase() === headerName)?.[1]
+      ?.trim();
+  }
+
+  /**
+   * ownCloud and Nextcloud, which the generic provider also serves, send their
+   * canonical tag as `OC-ETag` next to an `ETag` that mod_deflate rewrote
+   * (#10808; verified on ownCloud 10.15 and Nextcloud 35 in their stock
+   * images). Read from the response whose body just passed the content-hash
+   * check, it makes the following PUT conditional and narrows the GET→PUT race:
+   * these servers keep the same tag for two writes within one second, so a
+   * write in that second still slips through. For the same reason the rev
+   * stays the content hash, which catches those writes before the PUT.
+   */
+  private _canonicalTagBehindRewrittenEtag(
+    headers: Record<string, string>,
+  ): string | undefined {
+    const etag = this._readHeader(headers, 'etag') ?? '';
+    return CONTENT_CODING_ETAG_SUFFIX_RE.test(etag)
+      ? this._readStrongEtag(headers, 'oc-etag')
+      : undefined;
+  }
+
+  /**
+   * Returns a strong validator that can be echoed back exactly in `If-Match`.
+   *
+   * Nextcloud exposes its canonical validator as `OC-ETag`, specifically so it
+   * survives HTTP-server rewrites such as Apache's content-coding suffix
+   * (#9154, #9196). Only the dedicated Nextcloud provider enables that
+   * extension; generic WebDAV entity tags are opaque and must never be
+   * rewritten. If browser CORS hides `OC-ETag`, Nextcloud falls back to the
+   * existing content-hash check instead of trusting a potentially rewritten
+   * HTTP `ETag`. A generic `ETag` carrying a content-coding suffix likewise
+   * falls back to the content hash (see `CONTENT_CODING_ETAG_SUFFIX_RE`).
+   */
+  private _readStrongRevision(headers: Record<string, string>): string | undefined {
+    if (this._deps.useCanonicalOcEtag) {
+      return this._readStrongEtag(headers, 'oc-etag');
+    }
+
+    return this._readStrongEtag(headers, 'etag');
+  }
+
+  /** A strong tag the server can be expected to compare `If-Match` against. */
+  private _isConditionalEtag(value: string): boolean {
+    return STRONG_ETAG_RE.test(value) && !CONTENT_CODING_ETAG_SUFFIX_RE.test(value);
+  }
+
+  private _isHttpStatus(error: unknown, status: number): boolean {
+    return error instanceof HttpNotOkAPIError && error.response?.status === status;
+  }
+
+  private _remoteChanged(path: string): RemoteFileChangedUnexpectedly {
+    return new RemoteFileChangedUnexpectedly(
+      `File ${path} no longer matches the revision downloaded before this upload.`,
+    );
+  }
+
+  // ==============================
+  // File Operations
+  // ==============================
+
+  /**
+   * Retrieve metadata for a file or folder via PROPFIND.
+   * Only caller: the #9030 upload pre-check, which swallows failures and falls
+   * back to GET — hence errors log at `normal`, not `critical`.
+   */
+  async getFileMeta(path: string): Promise<FileMeta> {
+    const cfg = await this._deps.getCfg();
+    const fullPath = this._buildFullPath(cfg.baseUrl, path);
+
+    try {
+      const response = await this._makeRequest({
+        url: fullPath,
+        method: WebDavHttpMethod.PROPFIND,
+        body: WebdavXmlParser.PROPFIND_XML,
+        headers: {
+          [WebDavHttpHeader.CONTENT_TYPE]: 'application/xml; charset=utf-8',
+          [WebDavHttpHeader.DEPTH]: '0',
+        },
+      });
+
+      if (response.status === WebDavHttpStatus.MULTI_STATUS) {
+        const files = this.xmlParser.parseMultiplePropsFromXml(response.data, path);
+        if (files && files.length > 0) {
+          return files[0];
+        }
+      }
+    } catch (e) {
+      this._deps.logger.normal(
+        `${WebdavApi.L}.getFileMeta() error`,
+        errorMeta(e, { path }),
+      );
+      throw e;
+    }
+
+    throw new RemoteFileNotFoundAPIError(path);
+  }
+
+  async download({ path }: { path: string }): Promise<{ rev: string; dataStr: string }> {
+    const cfg = await this._deps.getCfg();
+    const fullPath = this._buildFullPath(cfg.baseUrl, path);
+
+    try {
+      const response = await this._makeRequest({
+        url: fullPath,
+        method: WebDavHttpMethod.GET,
+      });
+
+      // Guard against empty response body (e.g. CapacitorHttp on some Android providers)
+      if (!response.data || response.data.length === 0) {
+        throw new EmptyRemoteBodySPError(
+          `Download of ${path} returned empty response body (HTTP ${response.status}).`,
+        );
+      }
+
+      // Validate it's not an HTML error page
+      this.xmlParser.validateResponseContent(
+        response.data,
+        path,
+        'download',
+        'file content',
+      );
+
+      const hash = await this._computeContentHash(response.data);
+      return {
+        rev: this._readStrongRevision(response.headers) ?? hash,
+        dataStr: response.data,
+      };
+    } catch (e) {
+      this._deps.logger.critical(
+        `${WebdavApi.L}.download() error`,
+        errorMeta(e, { path }),
+      );
+      throw e;
+    }
+  }
+
+  async upload({
+    path,
+    data,
+    expectedRev,
+    isForceOverwrite = false,
+  }: {
+    path: string;
+    data: string;
+    expectedRev?: string | null;
+    isForceOverwrite?: boolean;
+  }): Promise<{ rev: string }> {
+    // Guard against empty upload data — prevents overwriting remote file with zero bytes.
+    if (!data || data.trim().length === 0) {
+      throw new InvalidDataSPError(
+        `Refusing to upload empty data to ${path}. This would overwrite the remote file with zero bytes.`,
+      );
+    }
+
+    const cfg = await this._deps.getCfg();
+    const fullPath = this._buildFullPath(cfg.baseUrl, path);
+    // Hash the local payload once. Reused as the `expectedHash` passed to
+    // `_verifyUpload` so we never compute md5(data) twice per upload (saves
+    // one WASM call on the ~MB sync file).
+    const expectedHash = await this._computeContentHash(data);
+
+    try {
+      // A `-gzip` tag stored by an earlier version is not conditional either. A
+      // normal cycle's download already replaces it with a hash rev; an upload
+      // keyed on the stored rev (e.g. the REPAIR snapshot) mismatches once instead.
+      const strongExpectedRev =
+        expectedRev && this._isConditionalEtag(expectedRev) ? expectedRev : undefined;
+
+      // Servers without a strong ETag retain the legacy content-hash check. This
+      // detects stale writers but cannot close the GET→PUT race; strong ETags do
+      // close it through the HTTP precondition attached to the PUT below.
+      let canonicalIfMatch: string | undefined;
+      if (!isForceOverwrite && expectedRev && !strongExpectedRev) {
+        try {
+          const currentResponse = await this._makeRequest({
+            url: fullPath,
+            method: WebDavHttpMethod.GET,
+          });
+          const currentHash = await this._computeContentHash(currentResponse.data);
+          if (currentHash !== expectedRev) {
+            throw this._remoteChanged(path);
+          }
+          canonicalIfMatch = this._canonicalTagBehindRewrittenEtag(
+            currentResponse.headers,
+          );
+        } catch (e) {
+          // A revision was supplied, so disappearance is itself a conflicting
+          // remote change. Proceeding would silently recreate over that change.
+          if (e instanceof RemoteFileNotFoundAPIError) throw this._remoteChanged(path);
+          throw e;
+        }
+      }
+      if (!isForceOverwrite && strongExpectedRev) {
+        await this._assertStrongRevUnchanged(path, fullPath, strongExpectedRev);
+      }
+
+      const headers: Record<string, string> = {
+        [WebDavHttpHeader.CONTENT_TYPE]: 'application/octet-stream',
+      };
+      if (!isForceOverwrite && strongExpectedRev) {
+        headers[WebDavHttpHeader.IF_MATCH] = strongExpectedRev;
+      } else if (!isForceOverwrite && canonicalIfMatch) {
+        headers[WebDavHttpHeader.IF_MATCH] = canonicalIfMatch;
+      } else if (!isForceOverwrite && expectedRev === null) {
+        headers[WebDavHttpHeader.IF_NONE_MATCH] = '*';
+      }
+
+      // Try to upload the file
+      try {
+        await this._makeRequest({
+          url: fullPath,
+          method: WebDavHttpMethod.PUT,
+          body: data,
+          headers,
+        });
+      } catch (uploadError) {
+        if (this._isHttpStatus(uploadError, WebDavHttpStatus.PRECONDITION_FAILED)) {
+          throw this._remoteChanged(path);
+        }
+        if (uploadError instanceof RemoteFileNotFoundAPIError && expectedRev !== null) {
+          throw this._remoteChanged(path);
+        }
+        if (
+          // 404 on upload indicates the directory does not exist (Nextcloud)
+          uploadError instanceof RemoteFileNotFoundAPIError ||
+          (uploadError instanceof HttpNotOkAPIError &&
+            uploadError.response &&
+            // 409 Conflict — parent directory doesn't exist
+            uploadError.response.status === WebDavHttpStatus.CONFLICT)
+        ) {
+          this._deps.logger.normal(
+            `${WebdavApi.L}.upload() got 404/409 — creating parent directory`,
+            { path },
+          );
+
+          // Try to create parent directory
+          await this._ensureParentDirectory(fullPath);
+
+          // Retry the upload
+          try {
+            await this._makeRequest({
+              url: fullPath,
+              method: WebDavHttpMethod.PUT,
+              body: data,
+              headers,
+            });
+          } catch (retryError) {
+            if (this._isHttpStatus(retryError, WebDavHttpStatus.PRECONDITION_FAILED)) {
+              throw this._remoteChanged(path);
+            }
+            if (
+              retryError instanceof HttpNotOkAPIError &&
+              retryError.response &&
+              retryError.response.status === WebDavHttpStatus.CONFLICT
+            ) {
+              // Demoted from `critical` to `normal`: this is a config-debug
+              // hint, not an exceptional / unrecoverable condition.
+              this._deps.logger.normal(
+                `${WebdavApi.L}.upload() 409 Conflict persists after creating parent. ` +
+                  `Verify syncFolderPath is relative to the WebDAV server root.`,
+                { path },
+              );
+              // Re-throw as an actionable, privacy-safe error so the user
+              // sees *why* sync fails (misconfigured Base URL / Sync Folder
+              // Path) instead of a bare "HTTP 409 Conflict". The raw 409 is
+              // already captured by the logger.normal() call above.
+              throw new WebDavSyncFolderUnusableSPError();
+            }
+            throw retryError;
+          }
+        } else {
+          throw uploadError;
+        }
+      }
+
+      const verifiedRev = await this._verifyUpload(path, fullPath, expectedHash);
+      return { rev: verifiedRev };
+    } catch (e) {
+      this._deps.logger.critical(`${WebdavApi.L}.upload() error`, errorMeta(e, { path }));
+      throw e;
+    }
+  }
+
+  /**
+   * #9030: some servers serve strong ETags but PUT unconditionally, ignoring
+   * `If-Match` (e.g. hacdias/webdav v5, our self-hosting compose), which would silently
+   * clobber a concurrent write. This best-effort pre-check narrows that to the
+   * PROPFIND→PUT window; on compliant servers `If-Match` still closes it.
+   */
+  private async _assertStrongRevUnchanged(
+    path: string,
+    fullPath: string,
+    expectedRev: string,
+  ): Promise<void> {
+    // Cheap path: PROPFIND carries no file body. Any failure falls through to
+    // the GET below, which reports a missing file as a conflict.
+    const propfindRev = await this.getFileMeta(path).then(
+      (meta) => meta.data['etag'],
+      () => undefined,
+    );
+    if (propfindRev === expectedRev) {
+      return;
+    }
+
+    // `getetag` may be formatted differently from the served `ETag` (e.g.
+    // without mod_deflate's -gzip suffix, #9154), so only the same GET that
+    // produced `expectedRev` may report a conflict — else it recurs every sync.
+    try {
+      const response = await this._makeRequest({
+        url: fullPath,
+        method: WebDavHttpMethod.GET,
+      });
+      const currentRev =
+        this._readStrongRevision(response.headers) ??
+        (await this._computeContentHash(response.data));
+      if (currentRev !== expectedRev) {
+        throw this._remoteChanged(path);
+      }
+    } catch (e) {
+      if (e instanceof RemoteFileNotFoundAPIError) throw this._remoteChanged(path);
+      throw e;
+    }
+  }
+
+  /**
+   * Re-GETs the just-uploaded file and verifies its content hash matches what
+   * we sent. Protects against silent truncation (e.g. flaky network, proxy
+   * buffering, Nextcloud accepting a partial body) since WebDAV enforces no
+   * integrity of its own. See issue #7300.
+   *
+   * A hash mismatch after a successful PUT is indistinguishable from a
+   * concurrent write by another client landing in the same window. Both cases
+   * are surfaced as RemoteFileChangedUnexpectedly so the adapter's existing
+   * self-healing path (re-download and retry) handles them uniformly.
+   *
+   * Every failure mode is re-read up to `VERIFY_MAX_ATTEMPTS` times first —
+   * see the constant for why a single bad read is not evidence of a conflict.
+   */
+  private async _verifyUpload(
+    path: string,
+    fullPath: string,
+    expectedHash: string,
+  ): Promise<string> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await this._readBackUpload(path, fullPath, expectedHash);
+      } catch (e) {
+        if (attempt >= WebdavApi.VERIFY_MAX_ATTEMPTS) {
+          throw e;
+        }
+        this._deps.logger.normal(
+          `${WebdavApi.L}._verifyUpload() re-reading after a failed attempt`,
+          errorMeta(e, { path, attempt }),
+        );
+        await this._sleep(WebdavApi.VERIFY_RETRY_DELAY_MS);
+      }
+    }
+  }
+
+  private async _sleep(ms: number): Promise<void> {
+    if (this._deps.delay) {
+      await this._deps.delay(ms);
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /**
+   * One read-back attempt. Deliberately sends no `Cache-Control`: it is not a
+   * CORS-safelisted request header, so on the web build it forces a preflight
+   * that many WebDAV servers reject. The fetch path already passes
+   * `cache: 'no-store'` and the native path adds its own no-cache headers.
+   *
+   * Known gap (#9985): only the body is checked, so a response pairing the
+   * correct body with the *previous* version's `ETag` — possible on a stale
+   * connection when both versions happen to be the same length — is accepted
+   * and its stale rev stored, costing a 412 on the next conditional PUT. Not
+   * guarded because no report shows that combination: STRATO's stale headers
+   * came with a stale or truncated body, which the hash check already catches.
+   */
+  private async _readBackUpload(
+    path: string,
+    fullPath: string,
+    expectedHash: string,
+  ): Promise<string> {
+    const remoteResponse = await this._makeRequest({
+      url: fullPath,
+      method: WebDavHttpMethod.GET,
+    });
+
+    if (!remoteResponse.data || remoteResponse.data.length === 0) {
+      throw new EmptyRemoteBodySPError(
+        `Post-upload verification of ${path} returned empty body.`,
+      );
+    }
+
+    // Reject HTML error/login pages returned with 200 by proxies or
+    // misconfigured auth — hashing them would misreport as corruption.
+    this.xmlParser.validateResponseContent(
+      remoteResponse.data,
+      path,
+      'upload-verify',
+      'file content',
+    );
+
+    const remoteHash = await this._computeContentHash(remoteResponse.data);
+    if (remoteHash !== expectedHash) {
+      throw new RemoteFileChangedUnexpectedly(
+        `Upload verification of ${path} failed: remote content hash differs ` +
+          `from uploaded data. Either the server stored a truncated copy, or ` +
+          `a concurrent write landed between PUT and verification. The next ` +
+          `sync cycle will re-download and reconcile.`,
+      );
+    }
+    return this._readStrongRevision(remoteResponse.headers) ?? remoteHash;
+  }
+
+  async remove(path: string): Promise<void> {
+    const cfg = await this._deps.getCfg();
+    const fullPath = this._buildFullPath(cfg.baseUrl, path);
+
+    try {
+      await this._makeRequest({
+        url: fullPath,
+        method: WebDavHttpMethod.DELETE,
+      });
+      this._deps.logger.normal(`${WebdavApi.L}.remove() success`, { path });
+    } catch (e) {
+      this._deps.logger.critical(`${WebdavApi.L}.remove() error`, errorMeta(e, { path }));
+      throw e;
+    }
+  }
+
+  /**
+   * Try a PROPFIND against the WebDAV base root to verify the cfg works
+   * end-to-end. The configured sync folder is intentionally NOT probed —
+   * it is created lazily on the first upload and would 404 on first-time
+   * setup (see issue #7617). Returns a normalized result that the dialog
+   * surfaces directly to the user; `fullUrl` is the configured sync
+   * folder (where data will sync), not the probed root.
+   *
+   * The privacy invariant lives in the logger call below (structured
+   * `errorMeta`, no raw error object). The returned `fullUrl` / `error`
+   * are intentionally human-readable — the user is testing their own
+   * server config and needs the original URL + a meaningful failure
+   * message in the snackbar. Callers must NOT route this return value
+   * through `OpLog` / exportable logs.
+   */
+  async testConnection(
+    cfg: WebdavPrivateCfg,
+  ): Promise<{ success: boolean; error?: string; fullUrl: string; errorCode?: number }> {
+    const fullPath = this._buildFullPath(cfg.baseUrl, cfg.syncFolderPath || '/');
+
+    try {
+      const auth = btoa(`${cfg.userName}:${cfg.password}`);
+      const headers = {
+        [WebDavHttpHeader.AUTHORIZATION]: `Basic ${auth}`,
+        [WebDavHttpHeader.CONTENT_TYPE]: 'application/xml; charset=utf-8',
+        [WebDavHttpHeader.DEPTH]: '0',
+      };
+
+      // Probe the base root (see JSDoc / issue #7617). This still fails
+      // correctly for broken configs: a wrong username / base path makes
+      // the root itself 404, and a bad password makes it 401 — both
+      // propagate out of the adapter and into the catch below.
+      const response = await this._deps.httpAdapter.request({
+        url: this._buildFullPath(cfg.baseUrl, '/'),
+        method: WebDavHttpMethod.PROPFIND,
+        headers,
+        body: WebdavXmlParser.PROPFIND_XML,
+      });
+
+      if (
+        response.status === WebDavHttpStatus.MULTI_STATUS ||
+        response.status === WebDavHttpStatus.OK
+      ) {
+        return { success: true, fullUrl: fullPath };
+      }
+
+      return {
+        success: false,
+        error: `Unexpected status ${response.status}`,
+        fullUrl: fullPath,
+        errorCode: response.status,
+      };
+    } catch (e) {
+      // testConnection is user-initiated and failure is the expected
+      // outcome of a misconfig retry loop. Log at `normal`, not
+      // `critical`, so the exportable log isn't dominated by
+      // configuration debugging.
+      this._deps.logger.normal(`${WebdavApi.L}.testConnection() failed`, errorMeta(e));
+      const { message, errorCode } = WebdavApi._describeTestError(e);
+      return { success: false, error: message, fullUrl: fullPath, errorCode };
+    }
+  }
+
+  /**
+   * Map a thrown WebDAV error to a readable, privacy-safe message for the
+   * "Test connection" UI. The only case that needs remapping is the
+   * base-root 404 (issue #7617): `RemoteFileNotFoundAPIError`'s message is
+   * the bare scrubbed host, which read as a cryptic error and led users to
+   * misdiagnose their config. It is replaced with a readable string and
+   * tagged with `errorCode: 404` — the single discriminator the dialog
+   * branches on to show the Nextcloud "Username is your user ID" hint.
+   *
+   * Every other error already has a readable, privacy-safe `.message`
+   * (e.g. `HttpNotOkAPIError.message` is `HTTP <status> <statusText>`,
+   * never the `.detail` body which can carry filenames; `AuthFailSPError`
+   * is "Authentication failed (HTTP 401)"), so they pass through unchanged.
+   * Callers must keep this UI-only and never route it to a structured logger.
+   */
+  private static _describeTestError(e: unknown): { message: string; errorCode?: number } {
+    if (e instanceof RemoteFileNotFoundAPIError) {
+      return {
+        message:
+          'Not found (HTTP 404): no folder exists at this WebDAV path. ' +
+          'Check the Base URL.',
+        errorCode: WebDavHttpStatus.NOT_FOUND,
+      };
+    }
+    if (e instanceof Error) {
+      return { message: e.message };
+    }
+    return { message: 'Unknown error occurred' };
+  }
+
+  private async _makeRequest({
+    url,
+    method,
+    body = null,
+    headers = {},
+  }: {
+    url: string;
+    method: string;
+    body?: string | null;
+    headers?: Record<string, string>;
+  }): Promise<WebDavHttpResponse> {
+    const cfg = await this._deps.getCfg();
+
+    let authHeaderVal;
+    if (cfg.accessToken) {
+      authHeaderVal = `Bearer ${cfg.accessToken}`;
+    } else {
+      const auth = btoa(`${cfg.userName}:${cfg.password}`);
+      authHeaderVal = `Basic ${auth}`;
+    }
+
+    const allHeaders = {
+      [WebDavHttpHeader.AUTHORIZATION]: authHeaderVal,
+      ...headers,
+    };
+
+    return this._deps.httpAdapter.request({
+      url,
+      method,
+      headers: allHeaders,
+      body,
+    });
+  }
+
+  private async _ensureParentDirectory(fullPath: string): Promise<void> {
+    const pathParts = fullPath.split('/');
+    pathParts.pop(); // Remove filename
+    const parentPath = pathParts.join('/');
+
+    if (!parentPath || parentPath === fullPath) {
+      return;
+    }
+
+    // Check if we're already creating this directory
+    const existingPromise = this.directoryCreationQueue.get(parentPath);
+    if (existingPromise) {
+      await existingPromise;
+      return;
+    }
+
+    // Create a new promise for this directory
+    const creationPromise = this._createDirectory(parentPath);
+    this.directoryCreationQueue.set(parentPath, creationPromise);
+
+    try {
+      await creationPromise;
+    } finally {
+      // Clean up the queue
+      this.directoryCreationQueue.delete(parentPath);
+    }
+  }
+
+  private async _createDirectory(fullPath: string): Promise<void> {
+    try {
+      await this._makeRequest({
+        url: fullPath,
+        method: WebDavHttpMethod.MKCOL,
+      });
+    } catch (e) {
+      // Check if error is due to directory already existing (405 Method Not Allowed or 409 Conflict)
+      if (
+        e instanceof HttpNotOkAPIError &&
+        e.response &&
+        (e.response.status === WebDavHttpStatus.METHOD_NOT_ALLOWED || // Method not allowed - directory exists
+          e.response.status === WebDavHttpStatus.CONFLICT || // Conflict - parent doesn't exist
+          e.response.status === WebDavHttpStatus.MOVED_PERMANENTLY || // Moved permanently - directory exists
+          e.response.status === WebDavHttpStatus.OK) // OK - directory exists
+      ) {
+        // Expected when the directory already exists. No-op.
+        return;
+      }
+      // Re-throw unexpected errors (e.g. 403 Permission Denied) so the caller
+      // sees the real cause instead of a confusing follow-up error.
+      // Demoted from `critical` to `normal`: a 403 / 5xx on MKCOL is a
+      // recoverable config-or-network condition, not an unrecoverable
+      // engine failure. The caller logs the thrown error at its catch
+      // site (which uses `errorMeta`).
+      this._deps.logger.normal(
+        `${WebdavApi.L}._createDirectory() unexpected error`,
+        errorMeta(e),
+      );
+      throw e;
+    }
+  }
+
+  private _buildFullPath(baseUrl: string | null | undefined, path: string): string {
+    // Validate baseUrl is present - this can be null/undefined if WebDAV config is incomplete
+    if (!baseUrl) {
+      throw new MissingCredentialsSPError(
+        'WebDAV base URL is not configured. Please check your sync settings.',
+      );
+    }
+
+    // Validate path to prevent directory traversal attacks. Use a generic
+    // "Invalid path" so the message does not echo a user-derived path
+    // segment into logs.
+    if (path.includes('..') || path.includes('//')) {
+      throw new InvalidDataSPError("Invalid sync path: contains '..' or '//' sequences.");
+    }
+
+    try {
+      // We need to robustly handle various combinations of encoded/unencoded baseUrls and paths,
+      // especially for providers like Mailbox.org that include spaces in the user's path.
+      // We also want to avoid double-encoding if the path is already encoded.
+      // See: https://github.com/super-productivity/super-productivity/issues/5508
+      let url: URL;
+      try {
+        url = new URL(baseUrl);
+      } catch {
+        // Try to fix the base URL if it failed (likely due to spaces)
+        // We manually replace spaces to avoid messing up existing encoded characters (like %2F)
+        // which can happen with decodeURI/encodeURI roundtrips.
+        const fixedBase = baseUrl.replace(/ /g, '%20');
+        url = new URL(fixedBase);
+      }
+
+      // Remove trailing slash from base
+      const base = url.pathname === '/' ? '' : url.pathname.replace(/\/$/, '');
+      // Remove leading slash from path
+      const append = path.startsWith('/') ? path.substring(1) : path;
+
+      // Assigning to pathname handles encoding of unencoded characters (spaces)
+      // while preserving already encoded sequences.
+      url.pathname = `${base}/${append}`;
+      return url.href;
+    } catch {
+      // Fallback for invalid Base URL (e.g. no protocol)
+      // Encode path/base segments while avoiding double-encoding
+      const cleanBase = baseUrl.replace(/\/$/, '');
+      const cleanPath = path.startsWith('/') ? path : `/${path}`;
+
+      const encodeSegment = (segment: string): string => {
+        if (!segment) {
+          return segment;
+        }
+        try {
+          return encodeURIComponent(decodeURIComponent(segment));
+        } catch {
+          return encodeURIComponent(segment);
+        }
+      };
+
+      // Separate protocol to avoid collapsing the double slashes
+      const protocolMatch = cleanBase.match(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)(.*)$/);
+      const protocol = protocolMatch ? protocolMatch[1] : '';
+      const baseWithoutProtocol = protocolMatch ? protocolMatch[2] : cleanBase;
+
+      const normalizedBase = baseWithoutProtocol
+        .split('/')
+        .filter((s, idx, arr) => !(idx === arr.length - 1 && s === ''))
+        .map(encodeSegment)
+        .join('/');
+      const normalizedPath = cleanPath.split('/').map(encodeSegment).join('/');
+
+      return `${protocol}${normalizedBase}${normalizedPath}`;
+    }
+  }
+}

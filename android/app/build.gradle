@@ -1,0 +1,216 @@
+plugins {
+
+    id "com.android.application"
+    id "org.jetbrains.kotlin.android"
+}
+
+// Apply the external configuration script
+apply from: "config.gradle"
+
+// Load the application configuration properties
+def appConfig = loadAppConfig()
+
+// Retrieve the build configuration fields for Debug and Release builds
+def debugConfigFields = getBuildConfigFields(appConfig, true)
+def releaseConfigFields = getBuildConfigFields(appConfig, false)
+
+android {
+    defaultConfig {
+        applicationId "com.superproductivity.superproductivity"
+        minSdkVersion 24
+        targetSdkVersion 36
+        compileSdk 36
+        versionCode 19_02_00_9000
+        versionName "19.2.0"
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        manifestPlaceholders = [
+                hostName       : "app.super-productivity.com",
+                defaultUrl     : "https://app.super-productivity.com",
+                launcherName   : "Super Productivity",
+                assetStatements: '[{ "relation": ["delegate_permission/common.handle_all_urls"], ' +
+                        '"target": {"namespace": "web", "site": "https://app.super-productivity.com"}}]'
+        ]
+    }
+
+    signingConfigs{
+        release{
+            storeFile file("../../keystore.jks")
+            storePassword System.getenv("RELEASE_KEYSTORE_PASSWORD")
+            keyAlias System.getenv("RELEASE_KEYSTORE_ALIAS")
+            keyPassword System.getenv("RELEASE_KEY_PASSWORD")
+        }
+    }
+
+    // Configure the build types (Debug and Release)
+    buildTypes {
+        debug {
+            // Define each field in BuildConfig for the Debug build
+            debugConfigFields.each { key, value ->
+                buildConfigField "String", key, value.toString()
+            }
+        }
+        release {
+            // Define each field in BuildConfig for the Release build
+            releaseConfigFields.each { key, value ->
+                buildConfigField "String", key, value.toString()
+            }
+
+            signingConfig signingConfigs.release
+            // Minification is deliberately OFF.
+            //
+            // Turning it on (#9766) produced a release build that crashes on
+            // start, and it reached every Play internal-track tester before
+            // anyone launched it: master auto-publishes to that track, so two
+            // minified builds shipped before the crash was reported.
+            //
+            // At the time, nothing in CI ever started a minified build. The
+            // emulator job installed the DEBUG variant, and the R8 job only
+            // checked keep rules against mapping.txt — a build that dies in
+            // onCreate passes both. That job also minified the FDROID flavor
+            // only, while the APK that ships to Play is the PLAY flavor. That
+            // gap is closed for play: android/run-android-checks.sh launches the
+            // minified playR8Test APK on every Android PR. R8 full mode is the
+            // default
+            // under AGP 8+ (android.enableR8.fullMode is unset), so obfuscation,
+            // shrinking, optimization and resource shrinking all ran against
+            // this app for the first time, simultaneously, in production.
+            //
+            // Google Play's DEX shrinking/obfuscation requirement only starts in
+            // February 2027, so there is nothing to buy by carrying that risk in
+            // the meantime.
+            //
+            // Before re-enabling, one thing is still missing: the launch smoke
+            // covers the PLAY flavor only. fdroidRelease would minify too, and
+            // build-android.yml already checks both mappings on the stated
+            // reasoning that playRelease passing says nothing about
+            // fdroidRelease — the runtime half has to honour that as well.
+            // shortcut: play-only launch, because nothing minified ships today;
+            // assemble and launch fdroidR8Test in run-android-checks.sh as part
+            // of the re-land, not after it.
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
+        }
+        r8Test {
+            // A permanently minified, release-configured target so R8 is exercised
+            // in CI. Release minification was disabled after #9784; without a build
+            // that actually runs R8, the same class of runtime-only failure returns
+            // the moment it is re-enabled.
+            //
+            // This variant is NOT the instrumentation target — it is installed and
+            // launched by android/run-android-checks.sh. Pointing `testBuildType`
+            // here was tried and reverted: AGP then minifies the androidTest APK
+            // with -applymapping from the app, while kotlin-stdlib and androidx.*
+            // live in the app APK and are shrunk to what the *app* uses. Every test
+            // died in handleBindApplication on a member the app never calls
+            // (Intrinsics.checkNotNullParameter, then androidx.tracing.Trace), and
+            // UTP's am_instrument_timeout of 31536000s turned each into a hang.
+            // The keep rules to paper over that are open-ended; launching the APK
+            // needs none of them.
+            initWith release
+            signingConfig signingConfigs.debug
+            minifyEnabled true
+            shrinkResources true
+            setProguardFiles([
+                    getDefaultProguardFile("proguard-android-optimize.txt"),
+                    "proguard-rules.pro",
+            ])
+            matchingFallbacks = ["release"]
+        }
+    }
+
+    flavorDimensions "version"
+    productFlavors {
+        play {
+            dimension "version"
+            Properties properties = new Properties()
+            file("google.properties").withInputStream {
+                properties.load(it)
+            }
+            buildConfigField "String", "CLIENT_ID_WEB", "\"" + properties.webToken + "\""
+        }
+        fdroid {
+            dimension "version"
+        }
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
+    }
+    kotlinOptions {
+        jvmTarget = "21"
+    }
+
+    buildFeatures {
+        buildConfig = true
+    }
+
+    // The background reminder op fixture (pinned to the app's real ops by
+    // background-reminder-ops.spec.ts) is shared with the instrumented tests,
+    // which read it as an asset of the test APK.
+    sourceSets {
+        androidTest {
+            assets.srcDirs += 'src/test/resources'
+        }
+    }
+
+    namespace "com.superproductivity.superproductivity"
+}
+
+dependencies {
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+    implementation "androidx.appcompat:appcompat:1.7.0"
+    implementation "com.google.androidbrowserhelper:androidbrowserhelper:2.5.0"
+    implementation "com.google.code.gson:gson:2.10.1"
+    implementation "androidx.core:core-ktx:1.16.0"
+    implementation "androidx.localbroadcastmanager:localbroadcastmanager:1.1.0"
+    implementation 'androidx.work:work-runtime-ktx:2.10.0'
+    implementation 'androidx.security:security-crypto:1.1.0-alpha06'
+    implementation 'androidx.lifecycle:lifecycle-process:2.8.7'
+    implementation 'androidx.preference:preference-ktx:1.2.1'
+    implementation "com.anggrayudi:storage:1.5.4"
+
+    playImplementation "com.google.android.gms:play-services-auth:21.3.0"
+    // Play In-App Review (native rating card). play flavor ONLY — this is a
+    // proprietary Google library and must never enter the F-Droid build.
+    playImplementation "com.google.android.play:review:2.0.2"
+
+    implementation project(':capacitor-android')
+
+    // Force androidx.webkit to 1.11.0 for better API 28 compatibility
+    // This avoids NoClassDefFoundError for WebViewRenderProcessClient on Android 9
+    // while retaining audio controls and URL utils added in 1.11.0
+    // See: https://github.com/super-productivity/super-productivity/issues/5285
+    configurations.all {
+        resolutionStrategy {
+            force "androidx.webkit:webkit:1.11.0"
+        }
+    }
+
+    testImplementation "junit:junit:4.13.2"
+    // Real org.json for JVM unit tests (android.jar only ships stubs); used by
+    // WidgetDataTest to lock the widget_data blob contract.
+    testImplementation "org.json:json:20240303"
+
+    androidTestImplementation "androidx.test:core:1.6.1"
+    androidTestImplementation "androidx.test:rules:1.6.1"
+    androidTestImplementation "com.android.support.test:runner:1.0.2"
+    androidTestImplementation "com.android.support.test.espresso:espresso-core:3.0.2"
+    androidTestImplementation "com.squareup.okhttp3:mockwebserver:4.12.0"
+    // Runs SyncReminderWorker directly (TestListenableWorkerBuilder); same
+    // version as work-runtime-ktx above.
+    androidTestImplementation "androidx.work:work-testing:2.10.0"
+}
+
+// The live crypto fixtures are generated outside Gradle
+// (tools/generate-android-crypto-fixtures.mjs), so declare them as a
+// unit-test input — otherwise a regenerated file leaves the test task
+// UP-TO-DATE/FROM-CACHE and LiveJsEncryptRoundTripTest silently reports
+// stale results (defeating its drift-detection purpose in CI).
+tasks.withType(Test).configureEach {
+    inputs.file(layout.buildDirectory.file('live-crypto-fixtures.tsv'))
+        .withPathSensitivity(PathSensitivity.RELATIVE)
+        .optional()
+}
+
+apply from: 'capacitor.build.gradle'

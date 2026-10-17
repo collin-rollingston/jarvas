@@ -1,0 +1,424 @@
+/**
+ * Central Entity Registry for Operation Log System
+ *
+ * Simple config objects - single source of truth for entity metadata.
+ *
+ * ## Adding a New Entity Type:
+ * 1. Add the type to EntityType union in operation.types.ts
+ * 2. Add config here
+ * 3. Run `npm run checkFile src/app/op-log/core/entity-registry.ts`
+ */
+
+import { InjectionToken } from '@angular/core';
+import { createSelector } from '@ngrx/store';
+import {
+  getAllPayloadKeys as getAllPayloadKeysFromRegistry,
+  getEntityConfig as getEntityConfigFromRegistry,
+  getPayloadKey as getPayloadKeyFromRegistry,
+  isAdapterEntity as isAdapterEntityFromCore,
+  isArrayEntity as isArrayEntityFromCore,
+  isMapEntity as isMapEntityFromCore,
+  isSingletonEntity as isSingletonEntityFromCore,
+} from '@sp/sync-core';
+import type { EntityRegistry as CoreEntityRegistry } from '@sp/sync-core';
+import type {
+  HostEntityConfig,
+  HostEntityExtensions,
+} from './entity-registry-host.types';
+import { EntityType } from './operation.types';
+
+// The app-wide EntityConfig type carries the NgRx-shaped host extensions.
+// Sync-core only sees the engine-essential subset.
+export type EntityConfig = HostEntityConfig;
+export type EntityRegistry<TEntityType extends string = string> = CoreEntityRegistry<
+  TEntityType,
+  HostEntityExtensions
+>;
+
+export type { BaseEntity, EntityDictionary, EntityStoragePattern } from '@sp/sync-core';
+export type {
+  EntityAdapterLike,
+  EntityUpdateLike,
+  PropsStateSelector,
+  SelectById,
+  SelectByIdFactory,
+  StateSelector,
+} from './entity-registry-host.types';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IMPORTS - Adapters & Feature Names
+// ─────────────────────────────────────────────────────────────────────────────
+import { TASK_FEATURE_NAME, taskAdapter } from '../../features/tasks/store/task.reducer';
+import {
+  PROJECT_FEATURE_NAME,
+  projectAdapter,
+} from '../../features/project/store/project.reducer';
+import { TAG_FEATURE_NAME, tagAdapter } from '../../features/tag/store/tag.reducer';
+import {
+  adapter as noteAdapter,
+  NOTE_FEATURE_NAME,
+} from '../../features/note/store/note.reducer';
+import {
+  adapter as simpleCounterAdapter,
+  SIMPLE_COUNTER_FEATURE_NAME,
+} from '../../features/simple-counter/store/simple-counter.reducer';
+import {
+  adapter as taskRepeatCfgAdapter,
+  TASK_REPEAT_CFG_FEATURE_NAME,
+} from '../../features/task-repeat-cfg/store/task-repeat-cfg.selectors';
+import {
+  metricAdapter,
+  METRIC_FEATURE_NAME,
+} from '../../features/metric/store/metric.reducer';
+import {
+  adapter as issueProviderAdapter,
+  ISSUE_PROVIDER_FEATURE_KEY,
+} from '../../features/issue/store/issue-provider.reducer';
+import { CONFIG_FEATURE_NAME } from '../../features/config/store/global-config.reducer';
+import { TIME_TRACKING_FEATURE_KEY } from '../../features/time-tracking/store/time-tracking.reducer';
+import { plannerFeatureKey } from '../../features/planner/store/planner.reducer';
+import { BOARDS_FEATURE_NAME } from '../../features/boards/store/boards.reducer';
+import { menuTreeFeatureKey } from '../../features/menu-tree/store/menu-tree.reducer';
+import { REMINDER_FEATURE_NAME } from '../../features/reminder/store/reminder.reducer';
+import {
+  PLUGIN_USER_DATA_FEATURE_NAME,
+  selectPluginUserDataFeatureState,
+} from '../../plugins/store/plugin-user-data.reducer';
+import {
+  PLUGIN_METADATA_FEATURE_NAME,
+  selectPluginMetadataFeatureState,
+} from '../../plugins/store/plugin-metadata.reducer';
+import {
+  SECTION_FEATURE_NAME,
+  adapter as sectionAdapter,
+  selectEntities as selectSectionEntitiesFromAdapter,
+} from '../../features/section/store/section.reducer';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// IMPORTS - Selectors
+// ─────────────────────────────────────────────────────────────────────────────
+import {
+  selectTaskEntities,
+  selectTaskById,
+} from '../../features/tasks/store/task.selectors';
+import {
+  selectProjectFeatureState,
+  selectEntities as selectProjectEntitiesFromAdapter,
+} from '../../features/project/store/project.reducer';
+import { selectProjectById } from '../../features/project/store/project.selectors';
+import {
+  selectTagFeatureState,
+  selectEntities as selectTagEntitiesFromAdapter,
+  selectTagById,
+} from '../../features/tag/store/tag.reducer';
+import {
+  selectNoteFeatureState,
+  selectEntities as selectNoteEntitiesFromAdapter,
+  selectNoteById,
+} from '../../features/note/store/note.reducer';
+import {
+  selectSimpleCounterFeatureState,
+  selectEntities as selectSimpleCounterEntitiesFromAdapter,
+  selectSimpleCounterById,
+} from '../../features/simple-counter/store/simple-counter.reducer';
+import {
+  selectTaskRepeatCfgFeatureState,
+  selectTaskRepeatCfgById,
+} from '../../features/task-repeat-cfg/store/task-repeat-cfg.selectors';
+import {
+  selectMetricFeatureState,
+  selectEntities as selectMetricEntitiesFromAdapter,
+  selectMetricById,
+} from '../../features/metric/store/metric.selectors';
+import {
+  selectIssueProviderState,
+  selectEntities as selectIssueProviderEntitiesFromAdapter,
+  selectIssueProviderById,
+} from '../../features/issue/store/issue-provider.selectors';
+import { selectConfigFeatureState } from '../../features/config/store/global-config.reducer';
+import { selectTimeTrackingState } from '../../features/time-tracking/store/time-tracking.selectors';
+import { selectPlannerState } from '../../features/planner/store/planner.selectors';
+import { selectBoardsState } from '../../features/boards/store/boards.selectors';
+import { selectMenuTreeState } from '../../features/menu-tree/store/menu-tree.selectors';
+import { selectReminderFeatureState } from '../../features/reminder/store/reminder.reducer';
+import {
+  selectContextFeatureState,
+  WORK_CONTEXT_FEATURE_NAME,
+} from '../../features/work-context/store/work-context.selectors';
+import {
+  selectSectionFeatureState,
+  selectSectionById,
+} from '../../features/section/store/section.selectors';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ENTITY CONFIGS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Central registry of all entity configurations.
+ *
+ * Type assertion is used because NgRx's complex generic types (MemoizedSelector,
+ * MemoizedSelectorWithProps, EntityAdapter) have variance that makes them
+ * incompatible with a common interface without explicit casts at each usage.
+ * Runtime safety is maintained via storagePattern checks at usage sites.
+ */
+export const buildEntityRegistry = (): EntityRegistry<EntityType> =>
+  ({
+    // ── ADAPTER ENTITIES ───────────────────────────────────────────────────────
+    TASK: {
+      storagePattern: 'adapter',
+      featureName: TASK_FEATURE_NAME,
+      payloadKey: 'task',
+      adapter: taskAdapter,
+      selectEntities: selectTaskEntities,
+      selectById: selectTaskById,
+    },
+
+    PROJECT: {
+      storagePattern: 'adapter',
+      featureName: PROJECT_FEATURE_NAME,
+      payloadKey: 'project',
+      adapter: projectAdapter,
+      selectEntities: createSelector(
+        selectProjectFeatureState,
+        selectProjectEntitiesFromAdapter,
+      ),
+      selectById: selectProjectById,
+    },
+
+    TAG: {
+      storagePattern: 'adapter',
+      featureName: TAG_FEATURE_NAME,
+      payloadKey: 'tag',
+      adapter: tagAdapter,
+      selectEntities: createSelector(selectTagFeatureState, selectTagEntitiesFromAdapter),
+      selectById: selectTagById,
+    },
+
+    NOTE: {
+      storagePattern: 'adapter',
+      featureName: NOTE_FEATURE_NAME,
+      payloadKey: 'note',
+      adapter: noteAdapter,
+      selectEntities: createSelector(
+        selectNoteFeatureState,
+        selectNoteEntitiesFromAdapter,
+      ),
+      selectById: selectNoteById,
+    },
+
+    SIMPLE_COUNTER: {
+      storagePattern: 'adapter',
+      featureName: SIMPLE_COUNTER_FEATURE_NAME,
+      payloadKey: 'simpleCounter',
+      adapter: simpleCounterAdapter,
+      selectEntities: createSelector(
+        selectSimpleCounterFeatureState,
+        selectSimpleCounterEntitiesFromAdapter,
+      ),
+      selectById: selectSimpleCounterById,
+    },
+
+    TASK_REPEAT_CFG: {
+      storagePattern: 'adapter',
+      featureName: TASK_REPEAT_CFG_FEATURE_NAME,
+      payloadKey: 'taskRepeatCfg',
+      adapter: taskRepeatCfgAdapter,
+      selectEntities: createSelector(
+        selectTaskRepeatCfgFeatureState,
+        (s: { entities: Record<string, unknown> }) => s.entities,
+      ),
+      selectById: selectTaskRepeatCfgById,
+    },
+
+    METRIC: {
+      storagePattern: 'adapter',
+      featureName: METRIC_FEATURE_NAME,
+      payloadKey: 'metric',
+      adapter: metricAdapter,
+      selectEntities: createSelector(
+        selectMetricFeatureState,
+        selectMetricEntitiesFromAdapter,
+      ),
+      selectById: selectMetricById,
+    },
+
+    ISSUE_PROVIDER: {
+      storagePattern: 'adapter',
+      featureName: ISSUE_PROVIDER_FEATURE_KEY,
+      payloadKey: 'issueProvider',
+      adapter: issueProviderAdapter,
+      selectEntities: createSelector(
+        selectIssueProviderState,
+        selectIssueProviderEntitiesFromAdapter,
+      ),
+      selectById: selectIssueProviderById,
+    },
+
+    SECTION: {
+      storagePattern: 'adapter',
+      featureName: SECTION_FEATURE_NAME,
+      payloadKey: 'section',
+      adapter: sectionAdapter,
+      selectEntities: createSelector(
+        selectSectionFeatureState,
+        selectSectionEntitiesFromAdapter,
+      ),
+      selectById: selectSectionById,
+    },
+
+    // ── SINGLETON ENTITIES ─────────────────────────────────────────────────────
+    GLOBAL_CONFIG: {
+      storagePattern: 'singleton',
+      featureName: CONFIG_FEATURE_NAME,
+      payloadKey: 'globalConfig',
+      selectState: selectConfigFeatureState,
+    },
+
+    TIME_TRACKING: {
+      storagePattern: 'singleton',
+      featureName: TIME_TRACKING_FEATURE_KEY,
+      payloadKey: 'timeTracking',
+      selectState: selectTimeTrackingState,
+    },
+
+    MENU_TREE: {
+      storagePattern: 'singleton',
+      featureName: menuTreeFeatureKey,
+      payloadKey: 'menuTree',
+      selectState: selectMenuTreeState,
+    },
+
+    WORK_CONTEXT: {
+      storagePattern: 'singleton',
+      featureName: WORK_CONTEXT_FEATURE_NAME,
+      payloadKey: 'workContext',
+      selectState: selectContextFeatureState,
+    },
+
+    // ── MAP ENTITIES ───────────────────────────────────────────────────────────
+    PLANNER: {
+      storagePattern: 'map',
+      featureName: plannerFeatureKey,
+      payloadKey: 'planner',
+      selectState: selectPlannerState,
+      mapKey: 'days',
+    },
+
+    // ── ARRAY ENTITIES ─────────────────────────────────────────────────────────
+    BOARD: {
+      storagePattern: 'array',
+      featureName: BOARDS_FEATURE_NAME,
+      payloadKey: 'board',
+      selectState: selectBoardsState,
+      arrayKey: 'boardCfgs',
+    },
+
+    REMINDER: {
+      storagePattern: 'array',
+      featureName: REMINDER_FEATURE_NAME,
+      payloadKey: 'reminder',
+      selectState: selectReminderFeatureState,
+      arrayKey: null, // State IS the array
+    },
+
+    // PLUGIN_USER_DATA / PLUGIN_METADATA were registered as `'virtual'` before
+    // ConflictResolutionService grew a virtual branch. Their state shape is
+    // already Array<{ id, ... }> — identical to REMINDER's arrayKey:null —
+    // so the existing array branch in getCurrentEntityState (and elsewhere)
+    // resolves them correctly. Keeping them virtual silently disabled LWW
+    // conflict resolution for all plugin data.
+    PLUGIN_USER_DATA: {
+      storagePattern: 'array',
+      featureName: PLUGIN_USER_DATA_FEATURE_NAME,
+      payloadKey: 'pluginUserData',
+      selectState: selectPluginUserDataFeatureState,
+      arrayKey: null,
+    },
+
+    PLUGIN_METADATA: {
+      storagePattern: 'array',
+      featureName: PLUGIN_METADATA_FEATURE_NAME,
+      payloadKey: 'pluginMetadata',
+      selectState: selectPluginMetadataFeatureState,
+      arrayKey: null,
+    },
+
+    // Note: ALL, RECOVERY, MIGRATION are not configured - they're special operation types
+  }) satisfies EntityRegistry<EntityType>;
+
+export const ENTITY_CONFIGS = buildEntityRegistry();
+
+export const ENTITY_REGISTRY = new InjectionToken<EntityRegistry<EntityType>>(
+  'ENTITY_REGISTRY',
+  {
+    providedIn: 'root',
+    factory: () => ENTITY_CONFIGS,
+  },
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const getEntityConfig = (entityType: EntityType): EntityConfig | undefined =>
+  getEntityConfigFromRegistry(ENTITY_CONFIGS, entityType);
+
+export const getPayloadKey = (entityType: EntityType): string | undefined =>
+  getPayloadKeyFromRegistry(ENTITY_CONFIGS, entityType);
+
+/**
+ * Whether an LWW action payload's top-level `id` selects the state that the
+ * LWW meta-reducer applies. Adapter- and array-backed entities are addressed
+ * by that field (arrays since #9526: items are found by `id` in the feature
+ * array); singleton actions target their registered feature state as a whole.
+ *
+ * Lockstep contract: `assertDecryptedOpMetadataIntegrity` uses this to decide
+ * which encrypted LWW ops must carry an authenticated `payload.id` matching
+ * `op.entityId` (GHSA-8pxh-mgc7-gp3g) — widening the reducer's id-addressed
+ * patterns without widening this helper would reopen the retarget hole.
+ */
+export const isLwwPayloadIdCanonical = (entityType: string | undefined): boolean => {
+  const pattern =
+    entityType !== undefined
+      ? ENTITY_CONFIGS[entityType as EntityType]?.storagePattern
+      : undefined;
+  return pattern === 'adapter' || pattern === 'array';
+};
+
+/**
+ * Sentinel `entityId` value denoting "the one and only" instance of an entity
+ * that has no per-entity primary key.
+ *
+ * This is an operation-address sentinel, NOT a storage-pattern check — and in
+ * practice no shipped singleton producer emits it: GLOBAL_CONFIG addresses ops
+ * by section key (`'misc'`, `'sync'`, …), MENU_TREE by `'projectTree'` /
+ * `'tagTree'` / folderId, TIME_TRACKING by a composite `TYPE:id:date` conflict
+ * key. All of them still target their feature state as a whole in the LWW
+ * reducer. Use `isLwwPayloadIdCanonical` to ask "does payload.id address the
+ * state?"; use this only to recognize the whole-state address form.
+ */
+export const SINGLETON_ENTITY_ID = '*' as const;
+
+export const isSingletonEntityId = (entityId: string | null | undefined): boolean =>
+  entityId === SINGLETON_ENTITY_ID;
+
+export const isAdapterEntity = isAdapterEntityFromCore;
+
+export const isSingletonEntity = isSingletonEntityFromCore;
+
+export const isMapEntity = isMapEntityFromCore;
+
+export const isArrayEntity = isArrayEntityFromCore;
+
+// `isVirtualEntity` removed: no entity in this registry uses the `'virtual'`
+// storagePattern after PLUGIN_USER_DATA / PLUGIN_METADATA migrated to
+// `'array'`. The pattern still exists in `@sp/sync-core` for external
+// consumers; re-export it here once we have a real user again.
+
+/**
+ * Returns all payload keys from configured entities.
+ * Useful for finding entities in payloads when the exact type is unknown.
+ */
+export const getAllPayloadKeys = (): string[] =>
+  getAllPayloadKeysFromRegistry(ENTITY_CONFIGS);

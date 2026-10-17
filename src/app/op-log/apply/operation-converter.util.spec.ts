@@ -1,0 +1,1171 @@
+import { convertOpToAction, ACTION_TYPE_ALIASES } from './operation-converter.util';
+import { ActionType, Operation, OpType } from '../core/operation.types';
+import { SyncLog } from '../../core/log';
+
+describe('operation-converter utility', () => {
+  const createMockOperation = (overrides: Partial<Operation> = {}): Operation => ({
+    id: 'op-123',
+    actionType: '[Task] Update Task' as ActionType,
+    opType: OpType.Update,
+    entityType: 'TASK',
+    entityId: 'task-456',
+    payload: { title: 'Test Task', done: false },
+    clientId: 'testClient',
+    vectorClock: { testClient: 5 },
+    timestamp: Date.now(),
+    schemaVersion: 1,
+    ...overrides,
+  });
+
+  describe('convertOpToAction', () => {
+    it('should convert operation to action with correct type', () => {
+      const op = createMockOperation({ actionType: '[Task] Add Task' as ActionType });
+      const action = convertOpToAction(op);
+
+      expect(action.type).toBe('[Task] Add Task');
+    });
+
+    it('should spread payload properties into action', () => {
+      const op = createMockOperation({
+        payload: { title: 'My Task', timeSpent: 3600, done: true },
+      });
+      const action = convertOpToAction(op);
+
+      expect((action as any).title).toBe('My Task');
+      expect((action as any).timeSpent).toBe(3600);
+      expect((action as any).done).toBe(true);
+    });
+
+    it('should include meta with isPersistent true', () => {
+      const op = createMockOperation();
+      const action = convertOpToAction(op);
+
+      expect(action.meta.isPersistent).toBe(true);
+    });
+
+    it('should include meta with isRemote true', () => {
+      const op = createMockOperation();
+      const action = convertOpToAction(op);
+
+      expect(action.meta.isRemote).toBe(true);
+    });
+
+    it('should include entityType in meta', () => {
+      const op = createMockOperation({ entityType: 'PROJECT' });
+      const action = convertOpToAction(op);
+
+      expect(action.meta.entityType).toBe('PROJECT');
+    });
+
+    it('should include entityId in meta', () => {
+      const op = createMockOperation({ entityId: 'entity-789' });
+      const action = convertOpToAction(op);
+
+      expect(action.meta.entityId).toBe('entity-789');
+    });
+
+    it('should include entityIds in meta for batch operations', () => {
+      const op = createMockOperation({
+        opType: OpType.Batch,
+        entityIds: ['task-1', 'task-2', 'task-3'],
+      });
+      const action = convertOpToAction(op);
+
+      expect(action.meta.entityIds).toEqual(['task-1', 'task-2', 'task-3']);
+    });
+
+    it('should include opType in meta', () => {
+      const op = createMockOperation({ opType: OpType.Create });
+      const action = convertOpToAction(op);
+
+      expect(action.meta.opType).toBe(OpType.Create);
+    });
+
+    it('should surface the authenticated projectMoveFootprint onto meta.projectMoveFootprint', () => {
+      // The footprint rides inside the (encrypted) payload; convertOpToAction
+      // exposes it to reducers so they never trust the plaintext op.entityIds
+      // envelope. GHSA-8pxh-mgc7-gp3g.
+      const op = createMockOperation({
+        actionType: '[TASK] LWW Update' as ActionType,
+        payload: {
+          actionPayload: { id: 'task-456', title: 'Moved' },
+          entityChanges: [],
+          lwwUpdateMode: 'replace',
+          projectMoveFootprint: ['task-456', 'subtask-1'],
+        } as any,
+      });
+      const action = convertOpToAction(op);
+
+      expect((action.meta as any).projectMoveFootprint).toEqual([
+        'task-456',
+        'subtask-1',
+      ]);
+    });
+
+    it('should not set meta.projectMoveFootprint when the LWW payload carries no footprint', () => {
+      const op = createMockOperation({
+        actionType: '[TASK] LWW Update' as ActionType,
+        payload: {
+          actionPayload: { id: 'task-456' },
+          entityChanges: [],
+          lwwUpdateMode: 'replace',
+        } as any,
+      });
+      const action = convertOpToAction(op);
+
+      expect((action.meta as any).projectMoveFootprint).toBeUndefined();
+    });
+
+    describe('task-time sync payload validation', () => {
+      const createTaskTimeOp = (
+        payload: Record<string, unknown>,
+        entityId = 'task-1',
+      ): Operation =>
+        createMockOperation({
+          actionType: ActionType.TIME_TRACKING_SYNC_TIME_SPENT,
+          entityId,
+          payload,
+        });
+
+      it('should accept a valid task-time delta', () => {
+        const action = convertOpToAction(
+          createTaskTimeOp({
+            taskId: 'task-1',
+            date: '2024-02-29',
+            duration: 5000,
+          }),
+        );
+
+        expect((action as any).duration).toBe(5000);
+      });
+
+      it('should reject a taskId that differs from the canonical entityId', () => {
+        expect(() =>
+          convertOpToAction(
+            createTaskTimeOp({
+              taskId: 'task-2',
+              date: '2024-01-15',
+              duration: 5000,
+            }),
+          ),
+        ).toThrowError(/Invalid task-time sync payload/);
+      });
+
+      it('should reject impossible dates and negative durations', () => {
+        expect(() =>
+          convertOpToAction(
+            createTaskTimeOp({
+              taskId: 'task-1',
+              date: '2024-02-30',
+              duration: 5000,
+            }),
+          ),
+        ).toThrowError(/Invalid task-time sync payload/);
+        expect(() =>
+          convertOpToAction(
+            createTaskTimeOp({
+              taskId: 'task-1',
+              date: '2024-01-15',
+              duration: -1,
+            }),
+          ),
+        ).toThrowError(/Invalid task-time sync payload/);
+      });
+    });
+
+    it('should handle Create operation', () => {
+      const op = createMockOperation({
+        opType: OpType.Create,
+        actionType: '[Task] Add Task' as ActionType,
+        payload: { id: 'new-task', title: 'New Task' },
+      });
+      const action = convertOpToAction(op);
+
+      expect(action.type).toBe('[Task] Add Task');
+      expect(action.meta.opType).toBe(OpType.Create);
+      expect((action as any).id).toBe('new-task');
+    });
+
+    it('should handle Update operation', () => {
+      const op = createMockOperation({
+        opType: OpType.Update,
+        actionType: '[Task] Update Task' as ActionType,
+        payload: { id: 'task-1', changes: { title: 'Updated' } },
+      });
+      const action = convertOpToAction(op);
+
+      expect(action.type).toBe('[Task] Update Task');
+      expect(action.meta.opType).toBe(OpType.Update);
+      expect((action as any).changes.title).toBe('Updated');
+    });
+
+    it('should handle Delete operation', () => {
+      const op = createMockOperation({
+        opType: OpType.Delete,
+        actionType: '[Task] Delete Task' as ActionType,
+        entityId: 'task-to-delete',
+        payload: { id: 'task-to-delete' },
+      });
+      const action = convertOpToAction(op);
+
+      expect(action.type).toBe('[Task] Delete Task');
+      expect(action.meta.opType).toBe(OpType.Delete);
+    });
+
+    it('should handle Move operation', () => {
+      const op = createMockOperation({
+        opType: OpType.Move,
+        actionType: '[Task] Move Task' as ActionType,
+        payload: { taskId: 'task-1', newProjectId: 'project-2' },
+      });
+      const action = convertOpToAction(op);
+
+      expect(action.type).toBe('[Task] Move Task');
+      expect(action.meta.opType).toBe(OpType.Move);
+    });
+
+    it('should handle Batch operation', () => {
+      const op = createMockOperation({
+        opType: OpType.Batch,
+        actionType: '[Task] Batch Update' as ActionType,
+        entityIds: ['t1', 't2', 't3'],
+        payload: { ids: ['t1', 't2', 't3'], changes: { done: true } },
+      });
+      const action = convertOpToAction(op);
+
+      expect(action.type).toBe('[Task] Batch Update');
+      expect(action.meta.opType).toBe(OpType.Batch);
+    });
+
+    describe('full-state operations (SYNC_IMPORT, BACKUP_IMPORT, Repair)', () => {
+      it('should wrap SYNC_IMPORT payload in appDataComplete when not already wrapped', () => {
+        const fullState = {
+          task: { ids: ['t1'], entities: { t1: { id: 't1', title: 'Task' } } },
+          project: { ids: ['p1'], entities: { p1: { id: 'p1', title: 'Project' } } },
+          tag: { ids: ['tag1'], entities: { tag1: { id: 'tag1', name: 'Tag' } } },
+        };
+        const op = createMockOperation({
+          opType: OpType.SyncImport,
+          entityType: 'ALL',
+          actionType: '[SP_ALL] Load(import) all data' as ActionType,
+          payload: fullState, // NOT wrapped in appDataComplete
+        });
+        const action = convertOpToAction(op);
+
+        // Should be wrapped in appDataComplete
+        expect((action as any).appDataComplete).toBeDefined();
+        expect((action as any).appDataComplete.task).toEqual(fullState.task);
+        expect((action as any).appDataComplete.project).toEqual(fullState.project);
+        expect((action as any).appDataComplete.tag).toEqual(fullState.tag);
+
+        // Should NOT spread the raw properties at top level
+        expect((action as any).task).toBeUndefined();
+        expect((action as any).project).toBeUndefined();
+        expect((action as any).tag).toBeUndefined();
+      });
+
+      it('should preserve appDataComplete wrapper for SYNC_IMPORT if already present', () => {
+        const fullState = {
+          task: { ids: ['t1'], entities: {} },
+        };
+        const op = createMockOperation({
+          opType: OpType.SyncImport,
+          entityType: 'ALL',
+          actionType: '[SP_ALL] Load(import) all data' as ActionType,
+          payload: { appDataComplete: fullState }, // Already wrapped
+        });
+        const action = convertOpToAction(op);
+
+        expect((action as any).appDataComplete).toEqual(fullState);
+        // Should NOT double-wrap
+        expect((action as any).appDataComplete.appDataComplete).toBeUndefined();
+      });
+
+      it('should wrap BACKUP_IMPORT payload in appDataComplete when not already wrapped', () => {
+        const fullState = {
+          task: { ids: [], entities: {} },
+          globalConfig: { someConfig: true },
+        };
+        const op = createMockOperation({
+          opType: OpType.BackupImport,
+          entityType: 'ALL',
+          actionType: '[SP_ALL] Load(import) backup file' as ActionType,
+          payload: fullState,
+        });
+        const action = convertOpToAction(op);
+
+        expect(action.type).toBe(ActionType.LOAD_ALL_DATA);
+        expect((action as any).appDataComplete).toEqual(fullState);
+        expect((action as any).task).toBeUndefined();
+      });
+
+      it('should wrap Repair payload in appDataComplete when not already wrapped', () => {
+        const fullState = {
+          task: { ids: ['t1'], entities: { t1: { id: 't1' } } },
+        };
+        const op = createMockOperation({
+          opType: OpType.Repair,
+          entityType: 'ALL',
+          actionType: '[Repair] Apply Repair' as ActionType,
+          payload: fullState,
+        });
+        const action = convertOpToAction(op);
+
+        expect(action.type).toBe(ActionType.LOAD_ALL_DATA);
+        expect((action as any).appDataComplete).toEqual(fullState);
+      });
+
+      it('should preserve meta properties for full-state operations', () => {
+        const op = createMockOperation({
+          opType: OpType.SyncImport,
+          entityType: 'ALL',
+          actionType: '[SP_ALL] Load(import) all data' as ActionType,
+          payload: { task: {} },
+        });
+        const action = convertOpToAction(op);
+
+        expect(action.meta.opType).toBe(OpType.SyncImport);
+        expect(action.meta.entityType).toBe('ALL');
+        expect(action.meta.isPersistent).toBe(true);
+        expect(action.meta.isRemote).toBe(true);
+      });
+
+      it('should handle SYNC_IMPORT with complex nested state', () => {
+        const fullState = {
+          task: {
+            ids: ['t1', 't2'],
+            entities: {
+              t1: { id: 't1', title: 'Task 1', projectId: 'p1', tagIds: ['tag1'] },
+              t2: { id: 't2', title: 'Task 2', parentId: 't1' },
+            },
+          },
+          project: {
+            ids: ['p1'],
+            entities: { p1: { id: 'p1', title: 'Project', taskIds: ['t1', 't2'] } },
+          },
+        };
+        const op = createMockOperation({
+          opType: OpType.SyncImport,
+          entityType: 'ALL',
+          actionType: '[SP_ALL] Load(import) all data' as ActionType,
+          payload: fullState,
+        });
+        const action = convertOpToAction(op);
+
+        expect((action as any).appDataComplete.task.entities.t1.projectId).toBe('p1');
+        expect((action as any).appDataComplete.project.entities.p1.taskIds).toEqual([
+          't1',
+          't2',
+        ]);
+      });
+    });
+
+    it('should handle empty payload', () => {
+      const op = createMockOperation({ payload: {} });
+      const action = convertOpToAction(op);
+
+      expect(action.type).toBeDefined();
+      expect(action.meta).toBeDefined();
+    });
+
+    it('should handle complex nested payload', () => {
+      const op = createMockOperation({
+        payload: {
+          task: {
+            id: 't1',
+            subTasks: [{ id: 'st1', title: 'Subtask' }],
+            timeTracking: { totalTime: 3600, entries: [] },
+          },
+        },
+      });
+      const action = convertOpToAction(op);
+
+      expect((action as any).task.id).toBe('t1');
+      expect((action as any).task.subTasks[0].title).toBe('Subtask');
+    });
+
+    it('should handle undefined entityId', () => {
+      const op = createMockOperation({ entityId: undefined });
+      const action = convertOpToAction(op);
+
+      expect(action.meta.entityId).toBeUndefined();
+    });
+
+    it('should handle undefined entityIds', () => {
+      const op = createMockOperation({ entityIds: undefined });
+      const action = convertOpToAction(op);
+
+      expect(action.meta.entityIds).toBeUndefined();
+    });
+
+    it('should preserve all entity types', () => {
+      const entityTypes = [
+        'TASK',
+        'PROJECT',
+        'TAG',
+        'NOTE',
+        'GLOBAL_CONFIG',
+        'SIMPLE_COUNTER',
+        'WORK_CONTEXT',
+        'TASK_REPEAT_CFG',
+        'ISSUE_PROVIDER',
+        'PLANNER',
+        'MENU_TREE',
+        'METRIC',
+        'MIGRATION',
+        'RECOVERY',
+        'ALL',
+      ] as const;
+
+      for (const entityType of entityTypes) {
+        const op = createMockOperation({ entityType });
+        const action = convertOpToAction(op);
+
+        expect(action.meta.entityType).toBe(entityType);
+      }
+    });
+
+    it('should use current action type when no alias exists', () => {
+      const op = createMockOperation({ actionType: '[Task] Some Action' as ActionType });
+      const action = convertOpToAction(op);
+
+      expect(action.type).toBe('[Task] Some Action');
+    });
+
+    it('should resolve aliased action types to current names', () => {
+      // Temporarily add an alias for testing
+      const originalAliases = { ...ACTION_TYPE_ALIASES };
+      (ACTION_TYPE_ALIASES as Record<string, string>)['[Old] Legacy Action'] =
+        '[New] Current Action';
+
+      try {
+        const op = createMockOperation({
+          actionType: '[Old] Legacy Action' as ActionType,
+        });
+        const action = convertOpToAction(op);
+
+        expect(action.type).toBe('[New] Current Action');
+      } finally {
+        // Restore original aliases
+        Object.keys(ACTION_TYPE_ALIASES).forEach((key) => {
+          if (!(key in originalAliases)) {
+            delete (ACTION_TYPE_ALIASES as Record<string, string>)[key];
+          }
+        });
+      }
+    });
+
+    describe('legacy planTasksForToday date backfill', () => {
+      it('injects today from the originating operation timestamp when missing', () => {
+        const op = createMockOperation({
+          actionType: ActionType.TASK_SHARED_PLAN_FOR_TODAY,
+          timestamp: new Date(2024, 5, 14, 12, 0, 0, 0).getTime(),
+          payload: { taskIds: ['task-1'] },
+        });
+        const action = convertOpToAction(op);
+
+        expect((action as any).today).toBe('2024-06-14');
+      });
+
+      it('injects today for MultiEntityPayload operations created before the field existed', () => {
+        const op = createMockOperation({
+          actionType: ActionType.TASK_SHARED_PLAN_FOR_TODAY,
+          timestamp: new Date(2024, 5, 14, 12, 0, 0, 0).getTime(),
+          payload: {
+            actionPayload: { taskIds: ['task-1'] },
+            entityChanges: [],
+          },
+        });
+        const action = convertOpToAction(op);
+
+        expect((action as any).today).toBe('2024-06-14');
+      });
+
+      it('preserves today when the operation payload already contains it', () => {
+        const op = createMockOperation({
+          actionType: ActionType.TASK_SHARED_PLAN_FOR_TODAY,
+          timestamp: new Date(2024, 5, 15, 12, 0, 0, 0).getTime(),
+          payload: { taskIds: ['task-1'], today: '2024-06-14' },
+        });
+        const action = convertOpToAction(op);
+
+        expect((action as any).today).toBe('2024-06-14');
+      });
+
+      it('uses a timezone-independent UTC day near midnight', () => {
+        const op = createMockOperation({
+          actionType: ActionType.TASK_SHARED_PLAN_FOR_TODAY,
+          timestamp: Date.UTC(2024, 5, 14, 23, 30),
+          payload: { taskIds: ['task-1'] },
+        });
+
+        expect((convertOpToAction(op) as any).today).toBe('2024-06-14');
+      });
+
+      it('replaces an invalid captured day with the deterministic fallback', () => {
+        const op = createMockOperation({
+          actionType: ActionType.TASK_SHARED_PLAN_FOR_TODAY,
+          timestamp: Date.UTC(2024, 5, 14, 12),
+          payload: { taskIds: ['task-1'], today: '' },
+        });
+
+        expect((convertOpToAction(op) as any).today).toBe('2024-06-14');
+      });
+
+      it('replaces an impossible captured calendar day', () => {
+        const op = createMockOperation({
+          actionType: ActionType.TASK_SHARED_PLAN_FOR_TODAY,
+          timestamp: Date.UTC(2024, 5, 14, 12),
+          payload: { taskIds: ['task-1'], today: '2024-99-99' },
+        });
+
+        expect((convertOpToAction(op) as any).today).toBe('2024-06-14');
+      });
+
+      it('uses a stable epoch fallback for a malformed legacy timestamp', () => {
+        const op = createMockOperation({
+          actionType: ActionType.TASK_SHARED_PLAN_FOR_TODAY,
+          timestamp: Number.NaN,
+          payload: { taskIds: ['task-1'] },
+        });
+
+        expect(() => convertOpToAction(op)).not.toThrow();
+        expect((convertOpToAction(op) as any).today).toBe('1970-01-01');
+      });
+    });
+
+    describe('legacy convertToMainTask date backfill', () => {
+      it('injects replay-safe dates from the originating operation timestamp', () => {
+        const timestamp = new Date(2024, 5, 14, 12, 0, 0, 0).getTime();
+        const op = createMockOperation({
+          actionType: ActionType.TASK_SHARED_CONVERT_TO_MAIN,
+          timestamp,
+          payload: {
+            task: { id: 'task-1', parentId: 'parent-1' },
+            isPlanForToday: true,
+            isDone: true,
+          },
+        });
+
+        const action = convertOpToAction(op) as any;
+
+        expect(action.today).toBe('2024-06-14');
+        expect(action.doneOn).toBe(timestamp);
+        expect(action.modified).toBe(timestamp);
+      });
+
+      it('preserves dates already captured by the originating action', () => {
+        const op = createMockOperation({
+          actionType: ActionType.TASK_SHARED_CONVERT_TO_MAIN,
+          timestamp: new Date(2024, 5, 15, 12, 0, 0, 0).getTime(),
+          payload: {
+            task: { id: 'task-1', parentId: 'parent-1' },
+            isDone: true,
+            today: '2024-06-14',
+            doneOn: 1718352000000,
+            modified: 1718352000000,
+          },
+        });
+
+        const action = convertOpToAction(op) as any;
+
+        expect(action.today).toBe('2024-06-14');
+        expect(action.doneOn).toBe(1718352000000);
+        expect(action.modified).toBe(1718352000000);
+      });
+
+      it('replaces invalid captured dates and timestamps', () => {
+        const timestamp = Date.UTC(2024, 5, 14, 12);
+        const op = createMockOperation({
+          actionType: ActionType.TASK_SHARED_CONVERT_TO_MAIN,
+          timestamp,
+          payload: {
+            task: { id: 'task-1', parentId: 'parent-1' },
+            isDone: true,
+            today: 'invalid',
+            doneOn: Number.POSITIVE_INFINITY,
+            modified: Number.NaN,
+          },
+        });
+
+        const action = convertOpToAction(op) as any;
+
+        expect(action.today).toBe('2024-06-14');
+        expect(action.doneOn).toBe(timestamp);
+        expect(action.modified).toBe(timestamp);
+      });
+    });
+
+    describe('legacy unscheduleTask date backfill', () => {
+      it('injects today when leaving the task in Today', () => {
+        const timestamp = new Date(2024, 5, 14, 12, 0, 0, 0).getTime();
+        const op = createMockOperation({
+          actionType: ActionType.TASK_SHARED_UNSCHEDULE,
+          timestamp,
+          payload: { id: 'task-1', isLeaveInToday: true },
+        });
+
+        const action = convertOpToAction(op) as any;
+
+        expect(action.today).toBe('2024-06-14');
+      });
+
+      it('does not inject today for a plain unschedule', () => {
+        const op = createMockOperation({
+          actionType: ActionType.TASK_SHARED_UNSCHEDULE,
+          payload: { id: 'task-1' },
+        });
+
+        const action = convertOpToAction(op) as any;
+
+        expect(action.today).toBeUndefined();
+      });
+
+      it('replaces an invalid captured day when leaving the task in Today', () => {
+        const op = createMockOperation({
+          actionType: ActionType.TASK_SHARED_UNSCHEDULE,
+          timestamp: Date.UTC(2024, 5, 14, 12),
+          payload: { id: 'task-1', isLeaveInToday: true, today: '' },
+        });
+
+        expect((convertOpToAction(op) as any).today).toBe('2024-06-14');
+      });
+    });
+
+    describe('updateTask done replay date backfill', () => {
+      it('injects only doneOn (never a dueDay) from the operation timestamp when missing', () => {
+        const timestamp = new Date(2024, 5, 14, 12, 0, 0, 0).getTime();
+        const op = createMockOperation({
+          actionType: ActionType.TASK_SHARED_UPDATE,
+          timestamp,
+          payload: {
+            actionPayload: {
+              task: { id: 'task-1', changes: { isDone: true } },
+            },
+            entityChanges: [],
+          },
+        });
+        const action = convertOpToAction(op) as any;
+
+        expect(action.task.changes.doneOn).toBe(timestamp);
+        // Completion records only doneOn; it must not synthesize a dueDay on replay.
+        expect(action.task.changes.dueDay).toBeUndefined();
+      });
+
+      it('does not inject dueDay when doneOn exists and dueDay is intentionally absent', () => {
+        const timestamp = new Date(2024, 5, 14, 12, 0, 0, 0).getTime();
+        const op = createMockOperation({
+          actionType: ActionType.TASK_SHARED_UPDATE,
+          timestamp,
+          payload: {
+            actionPayload: {
+              task: { id: 'task-1', changes: { isDone: true, doneOn: timestamp } },
+            },
+            entityChanges: [],
+          },
+        });
+        const action = convertOpToAction(op) as any;
+
+        expect(action.task.changes.doneOn).toBe(timestamp);
+        expect(action.task.changes.dueDay).toBeUndefined();
+      });
+
+      it('preserves existing doneOn and dueDay when present', () => {
+        const op = createMockOperation({
+          actionType: ActionType.TASK_SHARED_UPDATE,
+          timestamp: new Date(2024, 5, 15, 12, 0, 0, 0).getTime(),
+          payload: {
+            actionPayload: {
+              task: {
+                id: 'task-1',
+                changes: {
+                  isDone: true,
+                  doneOn: 1718352000000,
+                  dueDay: '2024-06-14',
+                },
+              },
+            },
+            entityChanges: [],
+          },
+        });
+        const action = convertOpToAction(op) as any;
+
+        expect(action.task.changes.doneOn).toBe(1718352000000);
+        expect(action.task.changes.dueDay).toBe('2024-06-14');
+      });
+
+      it('replaces a non-finite doneOn timestamp', () => {
+        const timestamp = Date.UTC(2024, 5, 14, 12);
+        const op = createMockOperation({
+          actionType: ActionType.TASK_SHARED_UPDATE,
+          timestamp,
+          payload: {
+            actionPayload: {
+              task: {
+                id: 'task-1',
+                changes: { isDone: true, doneOn: Number.NaN },
+              },
+            },
+            entityChanges: [],
+          },
+        });
+
+        expect((convertOpToAction(op) as any).task.changes.doneOn).toBe(timestamp);
+      });
+
+      it('does not inject done fields for undone updates', () => {
+        const op = createMockOperation({
+          actionType: ActionType.TASK_SHARED_UPDATE,
+          timestamp: new Date(2024, 5, 14, 12, 0, 0, 0).getTime(),
+          payload: {
+            actionPayload: {
+              task: { id: 'task-1', changes: { isDone: false } },
+            },
+            entityChanges: [],
+          },
+        });
+        const action = convertOpToAction(op) as any;
+
+        expect(action.task.changes.doneOn).toBeUndefined();
+        expect(action.task.changes.dueDay).toBeUndefined();
+      });
+    });
+
+    describe('multi-entity payload handling', () => {
+      it('should extract actionPayload from MultiEntityPayload', () => {
+        const op = createMockOperation({
+          payload: {
+            actionPayload: { taskId: 'task-1', title: 'Test Task' },
+            entityChanges: [
+              {
+                entityType: 'TASK',
+                entityId: 'task-1',
+                opType: OpType.Update,
+                changes: { title: 'Test Task' },
+              },
+              {
+                entityType: 'TAG',
+                entityId: 'tag-1',
+                opType: OpType.Update,
+                changes: { taskIds: ['task-1'] },
+              },
+            ],
+          },
+        });
+        const action = convertOpToAction(op);
+
+        expect((action as any).taskId).toBe('task-1');
+        expect((action as any).title).toBe('Test Task');
+        // entityChanges should NOT be spread into the action
+        expect((action as any).entityChanges).toBeUndefined();
+      });
+
+      it('should handle MultiEntityPayload with empty entityChanges', () => {
+        const op = createMockOperation({
+          payload: {
+            actionPayload: { id: 'task-1' },
+            entityChanges: [],
+          },
+        });
+        const action = convertOpToAction(op);
+
+        expect((action as any).id).toBe('task-1');
+      });
+
+      it('should expose the LWW payload mode in action metadata (#8956)', () => {
+        const op = createMockOperation({
+          actionType: '[TASK] LWW Update' as ActionType,
+          payload: {
+            actionPayload: { id: 'task-1', title: 'Winning state' },
+            entityChanges: [],
+            lwwUpdateMode: 'replace',
+          },
+        });
+
+        const action = convertOpToAction(op);
+
+        expect(
+          (action.meta as typeof action.meta & { lwwUpdateMode?: string }).lwwUpdateMode,
+        ).toBe('replace');
+      });
+
+      it('restores wire-dropped cleared fields for patch-mode LWW deltas (#9776)', () => {
+        // Exactly as a merged op arrives over the wire: JSON dropped the
+        // undefined-valued key from actionPayload; clearedFields survives.
+        const op: Operation = JSON.parse(
+          JSON.stringify(
+            createMockOperation({
+              actionType: '[TASK] LWW Update' as ActionType,
+              entityId: 'task-1',
+              payload: {
+                actionPayload: {
+                  id: 'task-1',
+                  title: 'Kept title',
+                  _hideSubTasksMode: undefined,
+                },
+                entityChanges: [],
+                lwwUpdateMode: 'patch',
+                clearedFields: ['_hideSubTasksMode'],
+              },
+            }),
+          ),
+        );
+
+        const action = convertOpToAction(op) as unknown as Record<string, unknown>;
+
+        expect(action['title']).toBe('Kept title');
+        // The clear must be an OWN property again so updateOne clears the field.
+        expect(Object.keys(action)).toContain('_hideSubTasksMode');
+        expect(action['_hideSubTasksMode']).toBeUndefined();
+      });
+
+      it('never restores a cleared id and ignores clears on replace snapshots', () => {
+        const patchOp = createMockOperation({
+          actionType: '[TASK] LWW Update' as ActionType,
+          entityId: 'task-1',
+          payload: {
+            actionPayload: { id: 'task-1', title: 'T' },
+            entityChanges: [],
+            lwwUpdateMode: 'patch',
+            clearedFields: ['id'],
+          },
+        });
+        expect((convertOpToAction(patchOp) as any).id).toBe('task-1');
+
+        const replaceOp = createMockOperation({
+          actionType: '[TASK] LWW Update' as ActionType,
+          entityId: 'task-1',
+          payload: {
+            actionPayload: { id: 'task-1', title: 'T' },
+            entityChanges: [],
+            lwwUpdateMode: 'replace',
+            clearedFields: ['title'],
+          },
+        });
+        const replaceAction = convertOpToAction(replaceOp) as any;
+        expect(replaceAction.title).toBe('T');
+      });
+
+      it('should expose recreate-after-delete metadata (#8997)', () => {
+        const op = createMockOperation({
+          actionType: '[TASK] LWW Update' as ActionType,
+          payload: {
+            actionPayload: { id: 'task-1', projectId: 'project-1' },
+            entityChanges: [],
+            lwwUpdateMode: 'replace',
+            recreatesEntityAfterDelete: true,
+          },
+        });
+
+        const action = convertOpToAction(op);
+
+        expect(action.meta.recreatesEntityAfterDelete).toBeTrue();
+      });
+
+      it('carries LWW entity fields that the action envelope shadows in meta', () => {
+        const op = createMockOperation({
+          actionType: '[SIMPLE_COUNTER] LWW Update' as ActionType,
+          entityType: 'SIMPLE_COUNTER',
+          entityId: 'cnt-1',
+          payload: {
+            actionPayload: { id: 'cnt-1', title: 'Habit', type: 'StopWatch' },
+            entityChanges: [],
+            lwwUpdateMode: 'patch',
+          },
+        });
+
+        const action = convertOpToAction(op);
+
+        expect(action.type).toBe('[SIMPLE_COUNTER] LWW Update');
+        expect(action.meta.lwwShadowedFields).toEqual({ type: 'StopWatch' });
+      });
+
+      it('carries no shadowed fields for non-LWW actions or payloads without them', () => {
+        const regular = createMockOperation({
+          payload: { actionPayload: { type: 'x', title: 'T' }, entityChanges: [] },
+        });
+        const lwwWithoutType = createMockOperation({
+          actionType: '[SIMPLE_COUNTER] LWW Update' as ActionType,
+          entityType: 'SIMPLE_COUNTER',
+          entityId: 'cnt-1',
+          payload: {
+            actionPayload: { id: 'cnt-1', title: 'Habit' },
+            entityChanges: [],
+            lwwUpdateMode: 'patch',
+          },
+        });
+
+        expect(convertOpToAction(regular).meta.lwwShadowedFields).toBeUndefined();
+        expect(convertOpToAction(lwwWithoutType).meta.lwwShadowedFields).toBeUndefined();
+      });
+
+      it('should fall back to legacy payload format when not MultiEntityPayload', () => {
+        const op = createMockOperation({
+          payload: { directProperty: 'value', nested: { prop: 123 } },
+        });
+        const action = convertOpToAction(op);
+
+        expect((action as any).directProperty).toBe('value');
+        expect((action as any).nested.prop).toBe(123);
+      });
+
+      it('should handle complex MultiEntityPayload with nested actionPayload', () => {
+        const op = createMockOperation({
+          payload: {
+            actionPayload: {
+              task: { id: 't1', title: 'Parent', subTaskIds: ['st1'] },
+              subTasks: [{ id: 'st1', title: 'Child' }],
+            },
+            entityChanges: [
+              {
+                entityType: 'TASK',
+                entityId: 't1',
+                opType: OpType.Create,
+                changes: { id: 't1' },
+              },
+              {
+                entityType: 'TASK',
+                entityId: 'st1',
+                opType: OpType.Create,
+                changes: { id: 'st1' },
+              },
+              {
+                entityType: 'PROJECT',
+                entityId: 'p1',
+                opType: OpType.Update,
+                changes: { taskIds: ['t1'] },
+              },
+            ],
+          },
+        });
+        const action = convertOpToAction(op);
+
+        expect((action as any).task.id).toBe('t1');
+        expect((action as any).subTasks[0].id).toBe('st1');
+      });
+    });
+
+    // Issue #7330: adapter-backed LWW Update apply requires payload.id so the
+    // meta-reducer can address an entity. Producers force this on the on-disk
+    // shape, while the converter remains the apply-boundary safety net.
+    describe('LWW Update id backfill (#7330)', () => {
+      it('injects id from op.entityId into adapter LWW Update payloads when missing', () => {
+        const op = createMockOperation({
+          actionType: '[TASK] LWW Update' as ActionType,
+          entityId: 'task-789',
+          // payload lacks `id` (e.g. an op produced before the producer fixes,
+          // or via a path that didn't backfill).
+          payload: { title: 'Recovered' },
+        });
+        const action = convertOpToAction(op);
+
+        expect((action as any).id).toBe('task-789');
+        expect((action as any).title).toBe('Recovered');
+      });
+
+      it('does not throw for a wrapped adapter LWW payload without actionPayload', () => {
+        const op = createMockOperation({
+          actionType: '[TASK] LWW Update' as ActionType,
+          entityId: 'task-789',
+          payload: {
+            entityChanges: [],
+            lwwUpdateMode: 'replace',
+          },
+        });
+
+        expect(() => convertOpToAction(op)).not.toThrow();
+      });
+
+      it('preserves payload id when it already matches op.entityId', () => {
+        const op = createMockOperation({
+          actionType: '[TASK] LWW Update' as ActionType,
+          entityId: 'task-canonical',
+          payload: { id: 'task-canonical', title: 'Match' },
+        });
+        const action = convertOpToAction(op);
+
+        expect((action as any).id).toBe('task-canonical');
+      });
+
+      // Regression net (#7330 / codex review): a malformed or older remote
+      // LWW op whose payload.id disagrees with op.entityId would otherwise
+      // update the WRONG entity in lwwUpdateMetaReducer (which trusts
+      // entityData.id). The converter must enforce op.entityId as canonical.
+      it('overrides a payload id that disagrees with op.entityId', () => {
+        const op = createMockOperation({
+          actionType: '[TASK] LWW Update' as ActionType,
+          entityId: 'task-canonical',
+          payload: { id: 'task-malicious-or-stale', title: 'Drift' },
+        });
+        const action = convertOpToAction(op);
+
+        // op.entityId is the canonical identifier — payload.id is overridden.
+        expect((action as any).id).toBe('task-canonical');
+      });
+
+      // The override is correct in direction but silently fixes a wire/producer
+      // bug. The converter logs a warning so that if the assumption ever breaks
+      // in production we have a head start before users report a corrupt entity.
+      // Telemetry-by-log: never log payload content, only ids.
+      it('warns when overriding a mismatched payload.id (visibility for stale producer)', () => {
+        const warnSpy = spyOn(SyncLog, 'warn');
+        const op = createMockOperation({
+          actionType: '[TASK] LWW Update' as ActionType,
+          entityId: 'task-canonical',
+          payload: { id: 'task-stale', title: 'should not leak to log' },
+        });
+
+        convertOpToAction(op);
+
+        expect(warnSpy).toHaveBeenCalledWith(
+          jasmine.stringMatching(/payload\.id mismatch/),
+          jasmine.objectContaining({
+            entityId: 'task-canonical',
+            payloadId: 'task-stale',
+          }),
+        );
+        // Sanity: payload content (title) must NOT appear in the log args.
+        const logCall = warnSpy.calls.mostRecent();
+        expect(JSON.stringify(logCall.args)).not.toContain('should not leak');
+      });
+
+      it('does not serialize a malformed non-string payload.id into the warning', () => {
+        const warnSpy = spyOn(SyncLog, 'warn');
+        const privatePayloadContent = 'private task title';
+        const op = createMockOperation({
+          actionType: '[TASK] LWW Update' as ActionType,
+          entityId: 'task-canonical',
+          payload: { id: [{ title: privatePayloadContent }] },
+        });
+
+        const action = convertOpToAction(op);
+
+        expect((action as { id?: unknown }).id).toBe('task-canonical');
+        expect(warnSpy).toHaveBeenCalledWith(
+          jasmine.stringMatching(/payload\.id mismatch/),
+          jasmine.objectContaining({
+            entityId: 'task-canonical',
+            payloadId: '<array>',
+          }),
+        );
+        expect(JSON.stringify(warnSpy.calls.mostRecent().args)).not.toContain(
+          privatePayloadContent,
+        );
+      });
+
+      it('does not warn when payload.id already matches op.entityId', () => {
+        const warnSpy = spyOn(SyncLog, 'warn');
+        const op = createMockOperation({
+          actionType: '[TASK] LWW Update' as ActionType,
+          entityId: 'task-canonical',
+          payload: { id: 'task-canonical', title: 'fine' },
+        });
+
+        convertOpToAction(op);
+
+        expect(warnSpy).not.toHaveBeenCalled();
+      });
+
+      it('does NOT inject id for singleton LWW Update (entityId === "*")', () => {
+        const op = createMockOperation({
+          actionType: '[GLOBAL_CONFIG] LWW Update' as ActionType,
+          entityId: '*',
+          payload: { theme: 'dark' },
+        });
+        const action = convertOpToAction(op);
+
+        expect((action as any).id).toBeUndefined();
+        expect((action as any).theme).toBe('dark');
+      });
+
+      it('does NOT inject id for a TIME_TRACKING singleton with a composite conflict id (#9256)', () => {
+        const project = { project1: { day1: 120000 } };
+        const tag = { tag1: { day1: 30000 } };
+        const op = createMockOperation({
+          actionType: '[TIME_TRACKING] LWW Update' as ActionType,
+          entityType: 'TIME_TRACKING',
+          entityId: 'PROJECT:eP8tBLmm0tBgJThAZOxcT:2026-03-24',
+          payload: { project, tag },
+          timestamp: 1774332392933,
+        });
+        const action = convertOpToAction(op);
+
+        expect((action as { id?: unknown }).id).toBeUndefined();
+        expect((action as { project?: unknown }).project).toEqual(project);
+        expect((action as { tag?: unknown }).tag).toEqual(tag);
+      });
+
+      it('strips an id injected by affected clients from TIME_TRACKING singleton state (#9256)', () => {
+        const op = createMockOperation({
+          actionType: '[TIME_TRACKING] LWW Update' as ActionType,
+          entityType: 'TIME_TRACKING',
+          entityId: 'PROJECT:new-context:2026-03-24',
+          payload: {
+            id: 'PROJECT:stale-or-retagged-context:2026-03-24',
+            project: {},
+            tag: {},
+          },
+        });
+        const action = convertOpToAction(op);
+
+        expect((action as { id?: unknown }).id).toBeUndefined();
+      });
+
+      it('does not throw for a malformed null singleton payload', () => {
+        const op = createMockOperation({
+          actionType: '[TIME_TRACKING] LWW Update' as ActionType,
+          entityType: 'TIME_TRACKING',
+          entityId: 'PROJECT:project-1:2026-03-24',
+          payload: null,
+        });
+
+        expect(() => convertOpToAction(op)).not.toThrow();
+      });
+
+      it('still enforces the TASK id when only the plaintext entityType says TIME_TRACKING', () => {
+        const op = createMockOperation({
+          actionType: '[TASK] LWW Update' as ActionType,
+          entityType: 'TIME_TRACKING',
+          entityId: 'task-B',
+          payload: { id: 'task-A', title: 'Authenticated task' },
+        });
+        const action = convertOpToAction(op);
+
+        expect((action as { id?: unknown }).id).toBe('task-B');
+      });
+
+      // Lockstep residual (#9256): the converter derives the LWW target from the
+      // action type — the SAME plaintext field the integrity gate skips on and
+      // the meta-reducer branches on. A compromised server that swaps a TASK op's
+      // actionType to a singleton type to skip the gate therefore lands it as a
+      // whole-slice singleton replace (id stripped), NOT an adapter retarget: the
+      // authenticated task id can never address a TASK entity here. This pins the
+      // documented, pre-existing actionType-swap residual so a future edit that
+      // decoupled the gate/reducer targets could not silently turn it into a
+      // TASK retarget. See verify-decrypted-op-integrity.ts (OPEN residual note).
+      it('treats an actionType swapped to a singleton as a singleton replace, never a TASK retarget (#9256)', () => {
+        const op = createMockOperation({
+          actionType: '[TIME_TRACKING] LWW Update' as ActionType,
+          entityType: 'TASK',
+          entityId: 'task-A',
+          payload: { id: 'task-A', title: 'Authenticated task' },
+        });
+        const action = convertOpToAction(op);
+
+        expect(action.type).toBe('[TIME_TRACKING] LWW Update');
+        expect((action as { id?: unknown }).id).toBeUndefined();
+      });
+
+      it('does NOT inject id for non-LWW action types', () => {
+        const op = createMockOperation({
+          actionType: '[Task] Update Task' as ActionType,
+          entityId: 'task-789',
+          payload: { title: 'No id here' },
+        });
+        const action = convertOpToAction(op);
+
+        expect((action as any).id).toBeUndefined();
+      });
+    });
+  });
+});

@@ -1,0 +1,398 @@
+import { computed, inject, Injectable } from '@angular/core';
+import { OverlayContainer } from '@angular/cdk/overlay';
+import { IS_ELECTRON } from '../../app.constants';
+import { checkKeyCombo } from '../../util/check-key-combo';
+import { isInputElement } from '../../util/dom-element';
+import { GlobalConfigService } from '../../features/config/global-config.service';
+import { ActivatedRoute, Router } from '@angular/router';
+import { LayoutService } from '../layout/layout.service';
+import { TaskService } from '../../features/tasks/task.service';
+import { MatDialog, MatDialogRef, MatDialogState } from '@angular/material/dialog';
+import { DialogAddNoteComponent } from '../../features/note/dialog-add-note/dialog-add-note.component';
+import { DialogFullscreenMarkdownComponent } from '../../ui/dialog-fullscreen-markdown/dialog-fullscreen-markdown.component';
+import { IPC } from '../../../../electron/shared-with-frontend/ipc-events.const';
+import { UiHelperService } from '../../features/ui-helper/ui-helper.service';
+import { WorkContextService } from '../../features/work-context/work-context.service';
+import { WorkContextType } from '../../features/work-context/work-context.model';
+import { T } from '../../t.const';
+import { Store } from '@ngrx/store';
+import { showFocusOverlay } from '../../features/focus-mode/store/focus-mode.actions';
+import { SyncWrapperService } from '../../imex/sync/sync-wrapper.service';
+import { first, mapTo, switchMap } from 'rxjs/operators';
+import { firstValueFrom, fromEvent, merge, Observable, of } from 'rxjs';
+import { PluginBridgeService } from '../../plugins/plugin-bridge.service';
+import { TaskShortcutService } from '../../features/tasks/task-shortcut.service';
+import { TODAY_TAG } from '../../features/tag/tag.const';
+import { DialogConfirmComponent } from '../../ui/dialog-confirm/dialog-confirm.component';
+
+// NOTE: Relying on Angular CDK overlay CSS class names keeps shortcut suppression simple.
+// If CDK changes these class names we only need to adjust the helpers below.
+const CDK_OVERLAY_CONTAINER_CLASS = 'cdk-overlay-container';
+const CDK_OVERLAY_PANE_CLASS = 'cdk-overlay-pane';
+const MAT_TOOLTIP_PANEL_CLASS = 'mat-mdc-tooltip-panel';
+
+// The default binding '?' cannot go through checkKeyCombo, since that compares
+// ev.code and can never produce '?'. So the literal '?' is matched on ev.key (the
+// character the layout actually emitted, which also covers non-QWERTY layouts and
+// AltGr), while any other/custom binding is delegated to checkKeyCombo as usual.
+export const isHelpKeyCombo = (
+  ev: KeyboardEvent,
+  showHelp: string | null | undefined,
+): boolean => {
+  if (!showHelp) {
+    return false;
+  }
+  if (showHelp !== '?') {
+    return checkKeyCombo(ev, showHelp);
+  }
+  if (ev.key !== '?') {
+    return false;
+  }
+  // Layouts that produce '?' via AltGr report it as AltGraph (or Ctrl+Alt on Windows).
+  const isAltGraph = ev.getModifierState('AltGraph') || (ev.ctrlKey && ev.altKey);
+  return isAltGraph || (!ev.ctrlKey && !ev.metaKey && !ev.altKey);
+};
+
+@Injectable({
+  providedIn: 'root',
+})
+export class ShortcutService {
+  private _configService = inject(GlobalConfigService);
+  private _router = inject(Router);
+  private _layoutService = inject(LayoutService);
+  private _matDialog = inject(MatDialog);
+  private _taskService = inject(TaskService);
+  private _workContextService = inject(WorkContextService);
+  private _activatedRoute = inject(ActivatedRoute);
+  private _uiHelperService = inject(UiHelperService);
+  private _syncWrapperService = inject(SyncWrapperService);
+  private _store = inject(Store);
+  private _pluginBridgeService = inject(PluginBridgeService);
+  private _taskShortcutService = inject(TaskShortcutService);
+  private _overlayContainer = inject(OverlayContainer);
+  private _isNoteTaskHandoffPending = false;
+
+  isCtrlPressed$: Observable<boolean> = fromEvent(document, 'keydown').pipe(
+    switchMap((ev: Event) => {
+      const e = ev as KeyboardEvent;
+      if (e.ctrlKey) {
+        return merge(of(true), fromEvent(document, 'keyup').pipe(mapTo(false)));
+      }
+      return of(false);
+    }),
+  );
+  backlogPos?: number;
+  readonly isFocusModeEnabled = computed(
+    () => this._configService.appFeatures().isFocusModeEnabled,
+  );
+
+  constructor() {
+    this._activatedRoute.queryParams.subscribe((params) => {
+      if (params && params.backlogPos) {
+        this.backlogPos = +params.backlogPos;
+      } else {
+        this.backlogPos = undefined;
+      }
+    });
+
+    // GLOBAL SHORTCUTS
+    if (IS_ELECTRON) {
+      window.ea.on(IPC.TASK_TOGGLE_START, () => {
+        this._taskService.toggleStartTask();
+      });
+      window.ea.on(IPC.SHOW_ADD_TASK_BAR, () => {
+        void this._showAddTaskBarFromDesktopCommand();
+      });
+      window.ea.on(IPC.ADD_NOTE, () => {
+        if (this._matDialog.openDialogs.length === 0) {
+          this._matDialog.open(DialogAddNoteComponent, {
+            minWidth: '100vw',
+            height: '100vh',
+            restoreFocus: true,
+            autoFocus: 'textarea',
+          });
+        }
+      });
+    }
+  }
+
+  private async _showAddTaskBarFromDesktopCommand(): Promise<void> {
+    if (this._isNoteTaskHandoffPending) {
+      return;
+    }
+
+    const noteDialogRef = this._getFullscreenNoteDialogRef();
+    if (!noteDialogRef) {
+      this._layoutService.showAddTaskBar();
+      return;
+    }
+
+    const noteDialog = noteDialogRef.componentInstance;
+    if (
+      noteDialogRef.getState() !== MatDialogState.OPEN ||
+      noteDialog.isDiscardConfirmOpen
+    ) {
+      return;
+    }
+
+    this._isNoteTaskHandoffPending = true;
+    try {
+      const needsConfirmation =
+        noteDialog instanceof DialogAddNoteComponent
+          ? noteDialog.data.content.trim().length > 0
+          : noteDialog.hasUnsavedChanges;
+      let shouldSave =
+        !(noteDialog instanceof DialogAddNoteComponent) && !needsConfirmation;
+      if (needsConfirmation) {
+        // Navigation must not save the editor behind the save/discard prompt.
+        noteDialog.isDiscardConfirmOpen = true;
+        const result = await firstValueFrom(
+          this._matDialog
+            .open(DialogConfirmComponent, {
+              data: {
+                message: T.F.NOTE.D_FULLSCREEN.CONFIRM_SAVE_BEFORE_OPENING_NEW_TASK,
+                okTxt: T.G.SAVE,
+                cancelTxt: T.G.DISCARD,
+                // Discard sits in the cancel slot, which gets initial focus by
+                // default; Enter must keep the edit, not throw it away.
+                isFocusConfirm: true,
+              },
+            })
+            .afterClosed(),
+        );
+        noteDialog.isDiscardConfirmOpen = false;
+
+        if (typeof result !== 'boolean') {
+          return;
+        }
+        shouldSave = result;
+      }
+      if (noteDialogRef.getState() !== MatDialogState.OPEN) {
+        return;
+      }
+
+      const closed = firstValueFrom(noteDialogRef.afterClosed());
+      if (shouldSave) {
+        noteDialog.close();
+      } else {
+        noteDialog.closeAfterConfirmedDiscard();
+      }
+
+      await closed;
+      this._layoutService.showAddTaskBar();
+    } finally {
+      noteDialog.isDiscardConfirmOpen = false;
+      this._isNoteTaskHandoffPending = false;
+    }
+  }
+
+  private _getFullscreenNoteDialogRef(): MatDialogRef<DialogFullscreenMarkdownComponent> | null {
+    return (
+      (this._matDialog.openDialogs.find(
+        (dialogRef) =>
+          dialogRef.componentInstance instanceof DialogFullscreenMarkdownComponent,
+      ) as MatDialogRef<DialogFullscreenMarkdownComponent> | undefined) || null
+    );
+  }
+
+  async handleKeyDown(ev: KeyboardEvent): Promise<void> {
+    const cfg = this._configService.cfg();
+    if (!cfg) {
+      throw new Error();
+    }
+
+    const keys = cfg.keyboard;
+    const el = ev.target as HTMLElement;
+    const hasBlockingOverlay =
+      this._matDialog.openDialogs.length > 0 || this._hasOpenCdkOverlay();
+
+    // Skip handling if no special keys are used and inside input elements or overlays.
+    // Overlay detection intentionally keys off CDK CSS class names for now (see constants above).
+    if (
+      !ev.metaKey &&
+      (isInputElement(el) || hasBlockingOverlay || this._isEventFromOverlay(ev))
+    ) {
+      return;
+    }
+
+    // Handle task-specific shortcuts first when a task is focused
+    if (this._taskShortcutService.handleTaskShortcuts(ev)) {
+      return;
+    }
+
+    if (
+      checkKeyCombo(ev, keys.toggleBacklog) &&
+      this._workContextService.activeWorkContextType === WorkContextType.PROJECT
+    ) {
+      let backlogPos = 0;
+      switch (this.backlogPos) {
+        case 50:
+          backlogPos = 0;
+          break;
+        case 0:
+          backlogPos = 100;
+          break;
+        default:
+          backlogPos = 50;
+      }
+      this._router.navigate(['/active/tasks'], {
+        queryParams: { backlogPos },
+      });
+    } else if (checkKeyCombo(ev, keys.goToFocusMode) && this.isFocusModeEnabled()) {
+      this._store.dispatch(showFocusOverlay());
+    } else if (checkKeyCombo(ev, keys.goToWorkView)) {
+      this._router.navigate(['/active/tasks']).then(() => {
+        window.setTimeout(() => {
+          this._taskService.focusFirstTaskIfVisible();
+        });
+      });
+    } else if (checkKeyCombo(ev, keys.goToTimeline)) {
+      this._router.navigate(['/tag/' + TODAY_TAG.id + '/tasks']);
+    } else if (checkKeyCombo(ev, keys.goToSettings)) {
+      this._router.navigate(['/config']);
+    } else if (
+      checkKeyCombo(ev, keys.goToScheduledView) &&
+      this._configService.appFeatures().isSchedulerEnabled
+    ) {
+      this._router.navigate(['/schedule']);
+
+      // } else if (checkKeyCombo(ev, keys.goToDailyAgenda)) {
+      //   this._router.navigate(['/daily-agenda']);
+      //
+      // } else if (checkKeyCombo(ev, keys.goToFocusMode)) {
+      //   this._router.navigate(['/focus-view']);
+    } else if (
+      checkKeyCombo(ev, keys.showSearchBar) &&
+      this._configService.appFeatures().isSearchEnabled
+    ) {
+      this._router.navigate(['/search']);
+      ev.preventDefault();
+    } else if (checkKeyCombo(ev, keys.focusSideNav)) {
+      this._focusSideNav();
+      ev.preventDefault();
+    } else if (checkKeyCombo(ev, keys.toggleSideNavMode)) {
+      this._layoutService.toggleSideNavMode();
+      ev.preventDefault();
+    } else if (checkKeyCombo(ev, keys.addNewTask)) {
+      this._layoutService.showAddTaskBar();
+      ev.preventDefault();
+    } else if (checkKeyCombo(ev, keys.addNewProject)) {
+      if (this._matDialog.openDialogs.length === 0) {
+        ev.preventDefault();
+        const { DialogCreateProjectComponent } =
+          await import('../../features/project/dialogs/create-project/dialog-create-project.component');
+        if (this._matDialog.openDialogs.length === 0) {
+          this._matDialog
+            .open(DialogCreateProjectComponent, { restoreFocus: true })
+            .afterClosed()
+            .subscribe((newProjectId: string | undefined) => {
+              if (newProjectId) {
+                this._router.navigate([`project/${newProjectId}/tasks`]);
+              }
+            });
+        }
+      }
+    } else if (isHelpKeyCombo(ev, keys.showHelp)) {
+      if (this._matDialog.openDialogs.length === 0) {
+        ev.preventDefault();
+        const { DialogKeyboardShortcutsComponent } =
+          await import('./dialog-keyboard-shortcuts/dialog-keyboard-shortcuts.component');
+        // re-check, since further presses can arrive while the chunk is still loading
+        if (this._matDialog.openDialogs.length === 0) {
+          this._matDialog.open(DialogKeyboardShortcutsComponent, { restoreFocus: true });
+        }
+      }
+    } else if (checkKeyCombo(ev, keys.addNewNote)) {
+      if (this._matDialog.openDialogs.length === 0) {
+        this._matDialog.open(DialogAddNoteComponent, {
+          minWidth: '100vw',
+          height: '100vh',
+          restoreFocus: true,
+          autoFocus: 'textarea',
+        });
+        ev.preventDefault();
+      }
+    } else if (checkKeyCombo(ev, keys.openProjectNotes)) {
+      ev.preventDefault();
+      this._layoutService.toggleNotes();
+    } else if (checkKeyCombo(ev, keys.toggleTaskViewCustomizerPanel)) {
+      ev.preventDefault();
+      this._layoutService.toggleTaskViewCustomizerPanel();
+    } else if (checkKeyCombo(ev, keys.toggleIssuePanel)) {
+      ev.preventDefault();
+      this._layoutService.toggleAddTaskPanel();
+    } else if (checkKeyCombo(ev, keys.triggerSync)) {
+      ev.preventDefault();
+      if (await this._syncWrapperService.isEnabledAndReady$.pipe(first()).toPromise()) {
+        this._syncWrapperService.sync(true);
+      }
+    } else if (this._taskShortcutService.handleTogglePlayFallback(ev)) {
+      return;
+    } else if (
+      checkKeyCombo(ev, 'Ctrl+Shift+*') &&
+      document.activeElement &&
+      document.activeElement.getAttribute('routerlink') === '/procrastination'
+    ) {
+      throw new Error('Intentional Error Fun (dont worry)');
+    }
+
+    // special hidden dev tools combo to use them for production
+    if (IS_ELECTRON) {
+      if (checkKeyCombo(ev, 'Ctrl+Shift+J')) {
+        window.ea.openDevTools();
+      } else if (checkKeyCombo(ev, keys.zoomIn)) {
+        this._uiHelperService.zoomBy(0.05);
+      } else if (checkKeyCombo(ev, keys.zoomOut)) {
+        this._uiHelperService.zoomBy(-0.05);
+      } else if (checkKeyCombo(ev, keys.zoomDefault)) {
+        this._uiHelperService.zoomTo(1);
+      }
+    }
+
+    // Check plugin shortcuts (exec last). Auto-repeat is dropped: holding the
+    // key would otherwise run the plugin action dozens of times a second.
+    if (ev.repeat) {
+      return;
+    }
+    const pluginShortcuts = this._pluginBridgeService.shortcuts();
+    for (const shortcut of pluginShortcuts) {
+      const shortcutKey = `plugin_${shortcut.pluginId}:${shortcut.id}`;
+      const shortcutKeyCombo = (keys as any)[shortcutKey];
+      if (shortcutKeyCombo && checkKeyCombo(ev, shortcutKeyCombo)) {
+        ev.preventDefault();
+        this._pluginBridgeService.executeShortcut(`${shortcut.pluginId}:${shortcut.id}`);
+        return;
+      }
+    }
+  }
+
+  private _focusSideNav(): void {
+    this._layoutService.focusSideNav();
+  }
+
+  private _hasOpenCdkOverlay(): boolean {
+    const containerEl = this._overlayContainer.getContainerElement();
+    // NOTE: All CDK class name knowledge is encapsulated here to ease future updates.
+    return Array.from(containerEl.children).some((child) => {
+      return (
+        child.classList.contains(CDK_OVERLAY_PANE_CLASS) &&
+        child.childElementCount > 0 &&
+        !child.classList.contains(MAT_TOOLTIP_PANEL_CLASS)
+      );
+    });
+  }
+
+  private _isEventFromOverlay(ev: KeyboardEvent): boolean {
+    const path = (typeof ev.composedPath === 'function' && ev.composedPath()) || [];
+    for (const node of path) {
+      if (
+        node instanceof HTMLElement &&
+        node.classList.contains(CDK_OVERLAY_PANE_CLASS)
+      ) {
+        return true;
+      }
+    }
+    const target = ev.target as HTMLElement | null;
+    return !!target?.closest(`.${CDK_OVERLAY_CONTAINER_CLASS}`);
+  }
+}

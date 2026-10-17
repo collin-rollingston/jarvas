@@ -1,0 +1,56 @@
+@if (hintPosition(); as pos) {
+  <div
+    class="hint-container"
+    [style.top.px]="pos.top"
+    [style.left.px]="pos.left"
+  >
+    <div
+      class="hint-arrow"
+      [class.arrow-up]="pos.arrowDirection === 'up'"
+      [class.arrow-down]="pos.arrowDirection === 'down'"
+      [style.left.px]="pos.arrowOffset"
+    ></div>
+    <div
+      #hintChipEl
+      class="hint-chip"
+    >
+      <div class="hint-text">
+        @if (hintTitle(); as title) {
+          <div class="hint-title">{{ title | translate }}</div>
+        }
+        @if (hintMessage()) {
+          <div class="hint-message">
+            @if (hintIcon(); as icon) {
+              <mat-icon aria-hidden="true">{{ icon }}</mat-icon>
+            }
+            <span>{{ hintMessage() | translate }}</span>
+          </div>
+        }
+        @if (shortcutHint(); as shortcut) {
+          <span class="shortcut-hint">
+            {{ T.ONBOARDING.HINTS.OR_PRESS | translate }} <kbd>{{ shortcut }}</kbd>
+          </span>
+        }
+        @if (hintDoneLabel(); as doneLabel) {
+          <div class="hint-buttons">
+            <button
+              mat-button
+              type="button"
+              (click)="skip()"
+            >
+              {{ doneLabel | translate }}
+            </button>
+          </div>
+        }
+      </div>
+      <button
+        type="button"
+        class="close-btn"
+        [attr.aria-label]="T.ONBOARDING.HINTS.SKIP_ARIA | translate"
+        (click)="skip()"
+      >
+        <span aria-hidden="true">✕</span>
+      </button>
+    </div>
+  </div>
+}

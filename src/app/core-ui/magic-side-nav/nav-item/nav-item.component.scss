@@ -1,0 +1,424 @@
+@use '../../../../styles/_globals.scss' as *;
+
+// Folder expand/collapse icon animation
+.folder-icon {
+  transition: transform 0.3s ease-in-out;
+
+  &.expanded {
+    transform: rotate(90deg);
+  }
+
+  &.collapsed {
+    transform: rotate(0deg);
+  }
+}
+
+:host {
+  display: flex !important;
+  align-items: stretch;
+  position: relative;
+  width: 100%;
+  color: var(--sidenav-text);
+
+  button:first-of-type {
+    white-space: nowrap;
+    overflow: hidden;
+    flex: 1;
+    min-width: 0;
+    font-family: inherit;
+    font-weight: 400;
+    letter-spacing: normal;
+    color: var(--sidenav-text);
+
+    // to make space for the task-count
+    &.has-tasks {
+      padding-right: var(--s5);
+    }
+
+    .nav-label {
+      color: inherit;
+      font: inherit;
+      letter-spacing: inherit;
+      @include truncateText();
+      display: inline-block;
+      max-width: 100%;
+    }
+
+    .ico-wrapper {
+      position: relative;
+    }
+  }
+
+  .additional-btn {
+    flex-shrink: 0;
+    width: 40px !important;
+    min-width: 40px !important;
+  }
+
+  &.isHidden {
+    display: none !important;
+  }
+}
+
+:host.isActiveContext button {
+  font-weight: normal;
+}
+
+@media (hover: hover) {
+  :host:hover .task-count {
+    display: none !important;
+  }
+}
+
+.task-count {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  line-height: 1;
+  text-align: center;
+  font-size: var(--font-size-xs);
+  right: 16px;
+  display: flex;
+  align-items: center;
+  color: var(--text-color-muted);
+  // avoid affecting drag handle
+  pointer-events: none;
+  // Follows the label it sits beside (see the label choreography above): it is
+  // right-aligned, so in a collapsed rail it would otherwise reappear on top of
+  // the icon. Expanding: it stays hidden until the rail has room, then fades in.
+  transition:
+    opacity var(--transition-duration-s, 0.15s) var(--ani-standard-timing)
+      var(--transition-duration-xs, 0.09s),
+    visibility 0s linear var(--transition-duration-xs, 0.09s);
+}
+
+// On touch devices the .additional-btn is always visible, so let the counter
+// flow inline beside it instead of overlapping.
+:host-context(.isTouchPrimary) {
+  .task-count {
+    position: static;
+    transform: none;
+    padding: 0 var(--s);
+    flex-shrink: 0;
+    pointer-events: auto;
+  }
+
+  button:first-of-type.has-tasks {
+    padding-right: var(--s);
+  }
+}
+
+// Active state visuals - ensure they override Angular Material styles
+//button[mat-menu-item].nav-link[routerlinkactive="active"],
+button[mat-menu-item].nav-link.active {
+  color: var(--sidenav-active-text) !important;
+  background: var(--sidenav-item-active-bg) !important;
+
+  .nav-label {
+    color: var(--sidenav-active-text) !important;
+  }
+
+  .nav-icon {
+    color: var(--sidenav-active-text) !important;
+  }
+}
+
+// Styling when used inside magic-side-nav: rely on global .nav-link/.nav-child-link
+// Only keep adjustments for the additional button here
+:host.variant-nav {
+  .g-multi-btn-wrapper {
+    background-color: transparent;
+  }
+
+  .additional-btn {
+    color: var(--sidenav-text-secondary);
+
+    @include interactiveHighlight {
+      background-color: var(--sidenav-hover-bg);
+      color: var(--sidenav-text);
+    }
+  }
+}
+
+// Collapse/expand choreography for the labels, in two beats — `.label-hidden`
+// clips the text with `max-width`, so dimming and clipping on the same curve
+// makes the user watch the text squash into an ellipsis on the way out and
+// burst back in on the way in.
+//
+// Expanding (here): the width comes back with the panel and the text fades in
+// behind its leading edge — delayed, so it only shows up once the rail has room
+// for it. Collapsing reads its timing from the rule below. Width and margin
+// follow the panel's own timing, which the side nav publishes as
+// `--sidenav-transition-duration`.
+//
+// Deliberately not scoped to `button:first-of-type` like the rule above: anchor
+// rows (`container: 'route'` / `'href'`) need the same choreography.
+.nav-label {
+  transition:
+    opacity var(--transition-duration-s, 0.15s) var(--ani-standard-timing)
+      var(--transition-duration-xs, 0.09s),
+    max-width var(--sidenav-transition-duration, var(--transition-duration-m, 0.25s))
+      var(--sidenav-transition-timing, var(--ani-standard-timing)),
+    margin var(--sidenav-transition-duration, var(--transition-duration-m, 0.25s))
+      var(--sidenav-transition-timing, var(--ani-standard-timing));
+}
+
+.nav-label.label-hidden,
+.text.label-hidden {
+  opacity: 0;
+  max-width: 0;
+  margin-left: 0 !important;
+  pointer-events: none;
+  // Collapsing: the text is gone almost immediately and the space closes
+  // afterwards, in step with the panel. See the `.nav-label` rule above for the
+  // expanding half of the choreography.
+  transition:
+    opacity var(--transition-duration-xs, 0.09s) linear,
+    max-width var(--sidenav-transition-duration, var(--transition-duration-m, 0.25s))
+      var(--sidenav-transition-timing, var(--ani-standard-timing)),
+    margin var(--sidenav-transition-duration, var(--transition-duration-m, 0.25s))
+      var(--sidenav-transition-timing, var(--ani-standard-timing));
+}
+
+.drag-handle {
+  /* Firefox 1.5-26 */
+  position: relative;
+  @include grabCursor();
+
+  &:after {
+    content: '';
+    position: absolute;
+    top: calc(-1 * var(--s));
+    left: calc(-1 * var(--s));
+    right: calc(-1 * var(--s));
+    bottom: calc(-1 * var(--s));
+  }
+}
+
+// Standard navigation row styles (simplified to be the only style)
+.nav-link {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  padding: var(--s) var(--s2);
+  color: var(--sidenav-text);
+  text-decoration: none;
+  border-radius: 6px;
+  transition: var(--transition-standard);
+  cursor: pointer;
+  background: transparent;
+  border: none;
+  width: 100%;
+  text-align: left;
+  font-size: var(--font-size-md);
+  font-family: inherit;
+  font-weight: 400;
+  letter-spacing: normal;
+
+  // Override Angular Material mat-menu-item defaults so buttons/anchors match our palette
+  &[mat-menu-item] {
+    color: var(--sidenav-text) !important;
+
+    // Unlike its buttons, Material does not gate the menu-item hover layer on
+    // `(hover: hover)`, so on touch it would bring back the highlight that
+    // `interactiveHighlight` keeps off a tapped row.
+    @media (hover: none) {
+      --mat-menu-item-hover-state-layer-color: transparent;
+    }
+
+    .mat-mdc-menu-item-text {
+      color: inherit !important;
+    }
+  }
+
+  @include interactiveHighlight {
+    background: var(--sidenav-hover-bg);
+    color: var(--sidenav-text-hover) !important;
+
+    .nav-label {
+      color: var(--sidenav-text-hover) !important;
+    }
+
+    // Ensure mat-menu-item uses hover color for text only
+    &[mat-menu-item] {
+      .mat-mdc-menu-item-text {
+        color: inherit !important;
+      }
+    }
+  }
+
+  // Route items (a.nav-link) should change icon color on hover
+  &:not(.active):is(a) {
+    @include interactiveHighlight {
+      .nav-icon {
+        color: var(--sidenav-text-hover);
+      }
+    }
+  }
+
+  &.active {
+    background: var(--sidenav-item-active-bg);
+    color: var(--sidenav-active-text);
+
+    .nav-icon {
+      color: var(--sidenav-active-text);
+    }
+
+    .nav-label {
+      color: var(--sidenav-active-text);
+    }
+
+    // Prevent Material focus styles from reducing contrast on active items
+    &:focus,
+    &:focus-visible {
+      background: var(--sidenav-item-active-bg);
+      color: var(--sidenav-active-text) !important;
+
+      .nav-label,
+      .nav-icon,
+      .mat-mdc-menu-item-text {
+        color: var(--sidenav-active-text) !important;
+      }
+    }
+  }
+
+  .nav-icon {
+    width: 24px;
+    height: 24px;
+    font-size: var(--font-size-xl);
+  }
+
+  .nav-label {
+    font: inherit;
+    letter-spacing: inherit;
+    color: inherit;
+  }
+}
+
+// Navigation icon and chevron
+.nav-icon {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  // Don't set default color here - let it inherit or use theme colors
+  font-size: var(--font-size-xl);
+  line-height: 1;
+
+  // Emoji-specific styling
+  &.nav-icon-emoji {
+    font-family: 'Apple Color Emoji', 'Segoe UI Emoji', 'Noto Color Emoji', sans-serif;
+    font-size: var(--font-size-lg);
+    font-feature-settings: normal;
+    font-variation-settings: normal;
+    text-transform: none;
+    letter-spacing: normal;
+    overflow-wrap: normal;
+    white-space: nowrap;
+    direction: ltr;
+    // Better emoji rendering
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+}
+
+.expand-icon {
+  transition: transform 0.2s ease;
+}
+
+.expanded .expand-icon {
+  transform: rotate(180deg);
+}
+
+:host-context(.nav-sidenav.compactMode) {
+  .nav-link {
+    justify-content: flex-start;
+
+    @include interactiveHighlight {
+      background: var(--sidenav-hover-bg);
+      color: var(--sidenav-text-hover);
+    }
+
+    ::ng-deep .mat-mdc-menu-item-text {
+      display: flex;
+      justify-content: flex-start;
+      width: 100%;
+      padding: 0;
+
+      > * {
+        margin: 0 !important;
+      }
+    }
+
+    // The wrapper must not hold space open next to the icon (#8866: `mat-icon`
+    // is projected outside it, so an over-wide wrapper pushed the icons out of
+    // the rail on collapse). `overflow: hidden` is what delivers that, and it is
+    // why this is no longer `display: none`: a flex item's automatic minimum
+    // size is its content, so without a clip the wrapper refuses to shrink below
+    // the label and moves the icon instead — while `display: none` takes the
+    // label's transition with it, since a subtree that is not rendered cannot
+    // animate. See the label choreography above.
+    mat-icon.nav-icon ~ ::ng-deep .mat-mdc-menu-item-text {
+      overflow: hidden;
+    }
+
+    &.active {
+      color: var(--sidenav-active-text) !important;
+      background: var(--sidenav-item-active-bg) !important;
+
+      &::after {
+        position: absolute;
+        inset: 4px;
+      }
+
+      .nav-icon {
+        color: var(--sidenav-active-text) !important;
+      }
+
+      .nav-label {
+        color: var(--sidenav-active-text) !important;
+      }
+    }
+  }
+
+  .nav-icon {
+    margin: 0;
+  }
+
+  // Hide the overflow menu button entirely when compactMode
+  .additional-btn {
+    display: none !important;
+  }
+
+  // Deliberately no `display: none` for `.nav-label` here: the labels are bound
+  // to `.label-hidden` (`showLabels()`), which already takes them out of sight
+  // with `max-width: 0` + `aria-hidden`. Hiding them with `display` would snap
+  // the text out of existence on the first frame of a collapse and make the label
+  // transition unreachable. Icons are untouched in both cases.
+  //
+  // The badge fades instead of disappearing for the same reason — it is
+  // right-aligned and would otherwise blink out of and back into the rail.
+  // `pointer-events: none` is already set, and `visibility` drops it from the
+  // a11y tree once the fade has run.
+  .task-count {
+    opacity: 0;
+    visibility: hidden;
+    transition:
+      opacity var(--transition-duration-xs, 0.09s) linear,
+      visibility 0s linear var(--transition-duration-xs, 0.09s);
+
+    // Touch layouts flow the counter inline (see the touch block above): there
+    // `padding: 0 var(--s)` and `flex-shrink: 0` keep a *static* flex item's
+    // full width reserved in the button even while it is faded out. Inside the
+    // 56px rail that leaves the icon less room than the button's own padding
+    // plus the 24px icon needs, and the button's `overflow: hidden` then clips
+    // it — so touch keeps master's hard hide. Touch has no hover for the
+    // counter to get out of the way of either.
+    :host-context(.isTouchPrimary) & {
+      display: none;
+    }
+  }
+}

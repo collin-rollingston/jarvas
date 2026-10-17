@@ -1,0 +1,41 @@
+# Docker Compose override for E2E tests
+# Note: For supersync tests, use both files: -f docker-compose.yaml -f docker-compose.e2e.yaml
+# This file is standalone for app/webdav tests only
+#
+# FAST LOCAL ALTERNATIVE: Run `ng serve` locally + `npm run e2e:webdav` (only webdav in Docker)
+services:
+  # Production Angular build for E2E tests
+  # Uses production Dockerfile with nginx
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        UNSPLASH_KEY: ${UNSPLASH_KEY:-DUMMY_UNSPLASH_KEY}
+        UNSPLASH_CLIENT_ID: ${UNSPLASH_CLIENT_ID:-DUMMY_UNSPLASH_CLIENT_ID}
+    ports:
+      - '${APP_PORT:-4242}:${APP_PORT:-4242}'
+    environment:
+      - APP_PORT=${APP_PORT:-4242}
+      - WEBDAV_BACKEND=${WEBDAV_BACKEND:-}
+    healthcheck:
+      test: ['CMD', 'curl', '-sf', 'http://localhost:${APP_PORT:-4242}']
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # E2E-only WebDAV server. Unlike `webdav` (hacdias), it enforces If-Match and
+  # If-None-Match on PUT, so concurrent-upload tests exercise real CAS (#10590).
+  webdav-e2e:
+    build: ./e2e/webdav-server
+    image: sp-webdav-e2e
+    ports:
+      - '2345:2345'
+    healthcheck:
+      # the Debian httpd image ships neither wget nor curl
+      test: ['CMD', 'bash', '-c', 'exec 3<>/dev/tcp/127.0.0.1/2345']
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
