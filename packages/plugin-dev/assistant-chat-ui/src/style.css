@@ -615,6 +615,17 @@ button:focus-visible {
   overflow-wrap: anywhere;
 }
 
+.message-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s);
+  margin-bottom: var(--s);
+}
+
+.message-attachments:empty {
+  display: none;
+}
+
 .message-image {
   display: block;
   width: auto;

@@ -203,9 +203,17 @@ const imageAwareTitleAdapter: TitleGenerationAdapter = {
     const simpleTitle = await simpleTitleAdapter.generateTitle(messages);
     if (simpleTitle !== 'New Thread') return simpleTitle;
     const firstUserMessage = messages.find((message) => message.role === 'user');
-    const image = firstUserMessage?.content.find((part) => part.type === 'image');
+    const image =
+      firstUserMessage?.content.find((part) => part.type === 'image') ??
+      firstUserMessage?.attachments
+        .flatMap((attachment) => attachment.content)
+        .find((part) => part.type === 'image');
     if (image?.type !== 'image') return simpleTitle;
-    const filename = image.filename?.trim();
+    const filename =
+      image.filename?.trim() ||
+      firstUserMessage?.attachments.find((attachment) =>
+        attachment.content.some((part) => part.type === 'image'),
+      )?.name;
     if (!filename) return 'Image discussion';
     return filename.length > 50 ? `${filename.slice(0, 47)}...` : filename;
   },
@@ -392,6 +400,26 @@ function Conversation({
                   <MessagePrimitive.Root
                     className={`message ${message.role === 'user' ? 'user-message' : 'assistant-message'}`}
                   >
+                    <div className="message-attachments">
+                      <MessagePrimitive.Attachments>
+                        {({ attachment }) => {
+                          const image = attachment.content?.find(
+                            (part) => part.type === 'image',
+                          );
+                          if (image?.type !== 'image') return null;
+                          return (
+                            <img
+                              className="message-image"
+                              src={image.image}
+                              alt={
+                                image.filename || attachment.name || labels.attachedImage
+                              }
+                              loading="lazy"
+                            />
+                          );
+                        }}
+                      </MessagePrimitive.Attachments>
+                    </div>
                     <MessagePrimitive.Parts
                       components={{
                         Text: MarkdownMessagePart,
@@ -1161,15 +1189,34 @@ function createAgentAdapter(agentAdapter: AgentAdapter): ChatModelAdapter {
           .join('\n');
         const images =
           message.role === 'user'
-            ? message.content.flatMap((part) =>
-                part.type === 'image'
-                  ? [
-                      {
-                        dataUrl: part.image,
-                        filename: part.filename ?? 'image',
-                      },
-                    ]
-                  : [],
+            ? [
+                ...message.content.flatMap((part) =>
+                  part.type === 'image'
+                    ? [
+                        {
+                          dataUrl: part.image,
+                          filename: part.filename ?? 'image',
+                        },
+                      ]
+                    : [],
+                ),
+                ...message.attachments.flatMap((attachment) =>
+                  attachment.content.flatMap((part) =>
+                    part.type === 'image'
+                      ? [
+                          {
+                            dataUrl: part.image,
+                            filename: part.filename ?? attachment.name,
+                          },
+                        ]
+                      : [],
+                  ),
+                ),
+              ].filter(
+                (image, index, allImages) =>
+                  allImages.findIndex(
+                    (candidate) => candidate.dataUrl === image.dataUrl,
+                  ) === index,
               )
             : [];
         if (!content && !images.length) return [];
