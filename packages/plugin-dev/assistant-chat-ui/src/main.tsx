@@ -7,6 +7,7 @@ import {
   MessagePrimitive,
   ThreadPrimitive,
   unstable_useComposerInput,
+  WebSpeechDictationAdapter,
   useLocalRuntime,
   type ChatModelAdapter,
 } from '@assistant-ui/react';
@@ -45,6 +46,10 @@ type ChatLabels = {
   inputLabel: string;
   inputPlaceholder: string;
   send: string;
+  voiceInput: string;
+  stopVoiceInput: string;
+  voiceInputNotice: string;
+  voiceUnsupported: string;
 };
 
 const disconnectedAdapter: ChatModelAdapter = {
@@ -65,6 +70,7 @@ function Chat({
   locale: string;
 }) {
   const [threadKey, setThreadKey] = React.useState(0);
+  const voiceSupported = WebSpeechDictationAdapter.isSupported();
   const startNewThread = () => setThreadKey((key) => key + 1);
 
   return (
@@ -140,6 +146,8 @@ function Chat({
           connected={connected}
           adapter={adapter}
           labels={labels}
+          locale={locale}
+          voiceSupported={voiceSupported}
         />
       </section>
     </main>
@@ -150,12 +158,23 @@ function Conversation({
   connected,
   adapter,
   labels,
+  locale,
+  voiceSupported,
 }: {
   connected: boolean;
   adapter: ChatModelAdapter;
   labels: ChatLabels;
+  locale: string;
+  voiceSupported: boolean;
 }) {
-  const runtime = useLocalRuntime(adapter);
+  const dictationAdapter = React.useMemo(
+    () =>
+      voiceSupported ? new WebSpeechDictationAdapter({ language: locale }) : undefined,
+    [locale, voiceSupported],
+  );
+  const runtime = useLocalRuntime(adapter, {
+    adapters: { dictation: dictationAdapter },
+  });
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
@@ -168,6 +187,7 @@ function Conversation({
             <EmptyThread
               connected={connected}
               labels={labels}
+              voiceSupported={voiceSupported}
             />
           </AuiIf>
           <AuiIf condition={(state) => !state.thread.isEmpty}>
@@ -185,6 +205,7 @@ function Conversation({
                 <Composer
                   connected={connected}
                   labels={labels}
+                  voiceSupported={voiceSupported}
                 />
               </ThreadPrimitive.ViewportFooter>
             </>
@@ -195,7 +216,15 @@ function Conversation({
   );
 }
 
-function EmptyThread({ connected, labels }: { connected: boolean; labels: ChatLabels }) {
+function EmptyThread({
+  connected,
+  labels,
+  voiceSupported,
+}: {
+  connected: boolean;
+  labels: ChatLabels;
+  voiceSupported: boolean;
+}) {
   const composer = unstable_useComposerInput({ disabled: !connected });
 
   return (
@@ -207,6 +236,7 @@ function EmptyThread({ connected, labels }: { connected: boolean; labels: ChatLa
       <Composer
         connected={connected}
         labels={labels}
+        voiceSupported={voiceSupported}
       />
       <div
         className="prompt-list"
@@ -229,7 +259,15 @@ function EmptyThread({ connected, labels }: { connected: boolean; labels: ChatLa
   );
 }
 
-function Composer({ connected, labels }: { connected: boolean; labels: ChatLabels }) {
+function Composer({
+  connected,
+  labels,
+  voiceSupported,
+}: {
+  connected: boolean;
+  labels: ChatLabels;
+  voiceSupported: boolean;
+}) {
   return (
     <ComposerPrimitive.Root className="composer">
       <ComposerPrimitive.Input
@@ -239,6 +277,29 @@ function Composer({ connected, labels }: { connected: boolean; labels: ChatLabel
         rows={1}
         disabled={!connected}
       />
+      <AuiIf condition={(state) => state.composer.dictation == null}>
+        <ComposerPrimitive.Dictate
+          className="voice-button"
+          aria-label={labels.voiceInput}
+          aria-description={labels.voiceInputNotice}
+          title={voiceSupported ? labels.voiceInputNotice : labels.voiceUnsupported}
+          disabled={!connected || !voiceSupported}
+        >
+          <MicrophoneIcon />
+        </ComposerPrimitive.Dictate>
+      </AuiIf>
+      <AuiIf condition={(state) => state.composer.dictation != null}>
+        <ComposerPrimitive.StopDictation
+          className="voice-button is-listening"
+          aria-label={labels.stopVoiceInput}
+          title={labels.stopVoiceInput}
+        >
+          <span
+            className="stop-dictation-icon"
+            aria-hidden="true"
+          />
+        </ComposerPrimitive.StopDictation>
+      </AuiIf>
       <ComposerPrimitive.Send
         className="send-button"
         disabled={!connected}
@@ -247,6 +308,25 @@ function Composer({ connected, labels }: { connected: boolean; labels: ChatLabel
         &#8593;
       </ComposerPrimitive.Send>
     </ComposerPrimitive.Root>
+  );
+}
+
+function MicrophoneIcon() {
+  return (
+    <svg
+      aria-hidden="true"
+      viewBox="0 0 24 24"
+      focusable="false"
+    >
+      <rect
+        x="9"
+        y="3"
+        width="6"
+        height="12"
+        rx="3"
+      />
+      <path d="M5 11a7 7 0 0 0 14 0M12 18v3m-4 0h8" />
+    </svg>
   );
 }
 
@@ -268,6 +348,10 @@ const DEFAULT_LABELS: ChatLabels = {
   inputLabel: 'Message your assistant',
   inputPlaceholder: 'Send a message...',
   send: 'Send message',
+  voiceInput: 'Start voice input',
+  stopVoiceInput: 'Stop voice input',
+  voiceInputNotice: 'Speech recognition may process audio using your browser service.',
+  voiceUnsupported: 'Voice input is not supported in this browser',
 };
 
 class AssistantChat extends HTMLElement implements AssistantChatElement {

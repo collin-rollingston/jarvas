@@ -296,6 +296,52 @@ button:focus-visible,
   cursor: pointer;
 }
 
+.voice-button {
+  display: grid;
+  flex: 0 0 var(--s4);
+  width: var(--s4);
+  height: var(--s4);
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--chat-muted);
+  cursor: pointer;
+}
+
+.voice-button svg {
+  width: var(--s2);
+  height: var(--s2);
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+
+.voice-button:not(:disabled):hover {
+  background: var(--chat-surface);
+  color: var(--chat-ink);
+}
+
+.voice-button.is-listening {
+  background: color-mix(in srgb, var(--color-danger) 12%, transparent);
+  color: var(--color-danger);
+}
+
+.stop-dictation-icon {
+  width: var(--s);
+  height: var(--s);
+  border-radius: var(--radius-xs);
+  background: currentColor;
+}
+
+.voice-button:disabled {
+  cursor: not-allowed;
+  opacity: var(--state-disabled-alpha);
+}
+
 .send-button:disabled,
 .composer-input:disabled,
 .prompt-button:disabled {

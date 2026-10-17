@@ -17,6 +17,10 @@
     "INPUT_LABEL": "Message your assistant",
     "INPUT_PLACEHOLDER": "Message your assistant…",
     "SEND": "Send message",
+    "VOICE_INPUT": "Start voice input",
+    "STOP_VOICE_INPUT": "Stop voice input",
+    "VOICE_INPUT_NOTICE": "Speech recognition may process audio using your browser service.",
+    "VOICE_UNSUPPORTED": "Voice input is not supported in this browser",
     "LOAD_ERROR": "The local assistant interface could not be loaded. Build app packages and reload the app."
   },
   "APP": {

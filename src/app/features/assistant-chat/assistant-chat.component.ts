@@ -28,6 +28,10 @@ interface AssistantChatLabels {
   inputLabel: string;
   inputPlaceholder: string;
   send: string;
+  voiceInput: string;
+  stopVoiceInput: string;
+  voiceInputNotice: string;
+  voiceUnsupported: string;
 }
 
 interface AssistantChatElement extends HTMLElement {
@@ -144,6 +148,10 @@ export class AssistantChatComponent implements AfterViewInit {
       inputLabel: this._translate.instant(T.AUI.INPUT_LABEL),
       inputPlaceholder: this._translate.instant(T.AUI.INPUT_PLACEHOLDER),
       send: this._translate.instant(T.AUI.SEND),
+      voiceInput: this._translate.instant(T.AUI.VOICE_INPUT),
+      stopVoiceInput: this._translate.instant(T.AUI.STOP_VOICE_INPUT),
+      voiceInputNotice: this._translate.instant(T.AUI.VOICE_INPUT_NOTICE),
+      voiceUnsupported: this._translate.instant(T.AUI.VOICE_UNSUPPORTED),
     };
   }
 }
