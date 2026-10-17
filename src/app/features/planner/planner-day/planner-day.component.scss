@@ -1,0 +1,246 @@
+@use '../../../../styles/_globals.scss' as *;
+@use '../../tasks/task/task.component.mixins' as *;
+
+:host {
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  min-width: 260px;
+  width: 260px;
+  overflow: hidden;
+  padding-inline: var(--s);
+  border-inline-start: 1px solid var(--divider-color);
+  // there needs to be enough space for the fab buttons
+
+  padding-bottom: 96px;
+  margin-bottom: var(--s4);
+
+  @include mq(xs, max) {
+    width: 100%;
+    max-width: 100%;
+    min-width: 100%;
+    padding: 0;
+    margin-bottom: var(--s2);
+    border-inline-start: none;
+  }
+}
+
+:host header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--s-half) var(--s);
+  margin-top: var(--s);
+  padding: var(--s) 0 var(--s-half);
+
+  @include mq(xs, max) {
+    margin-top: 0;
+    padding: var(--s) 0 var(--s-half);
+  }
+}
+
+.day-title {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  gap: var(--s-half);
+  font-size: var(--font-size-lg);
+  font-weight: var(--font-weight-semibold);
+  line-height: var(--line-height-snug);
+  white-space: nowrap;
+
+  .date {
+    color: var(--text-color-muted);
+    font-size: var(--font-size-sm);
+    font-weight: normal;
+  }
+
+  mat-icon {
+    flex-shrink: 0;
+    width: var(--font-size-lg);
+    height: var(--font-size-lg);
+    font-size: var(--font-size-lg);
+  }
+}
+
+.day-counts {
+  display: flex;
+  flex-wrap: wrap;
+  grid-column: 1 / -1;
+  justify-content: center;
+  align-items: center;
+  color: var(--text-color-muted);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-snug);
+
+  mat-icon:last-of-type {
+    margin-left: var(--s);
+    width: var(--font-size-lg);
+    height: var(--font-size-lg);
+    font-size: var(--font-size-lg);
+  }
+
+  .day-load {
+    min-width: 0;
+    text-align: center;
+  }
+}
+
+.progress-container {
+  grid-column: 1 / -1;
+  width: 100%;
+  height: var(--s-half);
+  position: relative;
+}
+
+.section-title {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  margin: var(--s) 0 var(--s-half);
+  color: var(--text-color-muted);
+
+  mat-icon {
+    width: var(--planner-item-ico-size);
+    height: var(--planner-item-ico-size);
+    font-size: var(--planner-item-ico-size);
+  }
+}
+
+.normal-tasks,
+.scheduled,
+.deadlines {
+  margin-top: var(--s-half);
+  display: flex;
+  flex-direction: column;
+}
+
+.scheduled,
+.deadlines {
+  flex-grow: 1;
+  margin-top: var(--s);
+
+  &.no-items {
+    flex-grow: 0;
+    margin-top: var(--s-half);
+  }
+
+  @include mq(xs, max) {
+    &.no-items {
+      display: none;
+    }
+  }
+}
+
+.normal-tasks-items,
+.deadline-items {
+  min-height: var(--planner-item-height);
+  flex-grow: 1;
+}
+
+.scheduled-items {
+  min-height: calc(var(--planner-item-height) * 0.5);
+  flex-grow: 1;
+}
+
+// Rows read like the main task list: hairline-separated with no gap by
+// default; boxed themes set --task-list-row-gap and --task-separator: none.
+// The item components draw their own box border, so their top/bottom edge
+// goes through --task-row-edge (separator when flat, box border when boxed).
+.normal-tasks-items > :not(.empty),
+.deadline-items > :not(.empty) {
+  margin-bottom: var(--task-list-row-gap);
+  border-top: var(--task-row-edge);
+
+  &:last-child {
+    border-bottom: var(--task-row-edge);
+  }
+}
+
+// Scheduled rows are wrappers without a box of their own.
+.scheduled-items > .scheduled-item {
+  margin-bottom: var(--task-list-row-gap);
+  border-top: var(--task-separator);
+
+  &:last-child {
+    border-bottom: var(--task-separator);
+  }
+}
+
+.scheduled-item {
+  display: flex;
+  align-items: center;
+
+  &.Task .time {
+    cursor: pointer;
+    border-radius: 50%;
+    background: var(--task-c-bg);
+  }
+
+  .time {
+    text-align: center;
+    border-radius: 50%;
+    width: 40px;
+    height: 40px;
+    min-width: 40px;
+    margin-right: var(--s-half);
+    flex-grow: 0;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+
+    font-size: var(--planner-font-size-smaller-mobile);
+
+    @include mq(xs) {
+      font-size: var(--planner-font-size-smaller);
+    }
+
+    mat-icon {
+      display: none;
+    }
+
+    &:hover {
+      mat-icon {
+        display: block;
+      }
+
+      span {
+        display: none;
+      }
+    }
+  }
+
+  .time-time {
+    line-height: 1;
+    text-align: center;
+    white-space: wrap;
+    display: inline-flex;
+    max-width: 30px;
+
+    ::ng-deep span {
+      text-align: center;
+      font-size: 9px;
+    }
+  }
+
+  > :nth-child(2) {
+    flex-grow: 1;
+    min-width: 0;
+  }
+}
+
+.empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: var(--planner-item-height);
+  padding-inline: var(--s);
+  color: var(--text-color-muted);
+  font-size: var(--font-size-sm);
+  line-height: var(--line-height-snug);
+}
+
+.all-day-event {
+  opacity: 0.8;
+}

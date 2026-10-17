@@ -1,0 +1,482 @@
+import { inject, Injectable } from '@angular/core';
+import { Capacitor, PermissionState } from '@capacitor/core';
+import { LocalNotifications } from '@capacitor/local-notifications';
+import { Log } from '../log';
+import { CapacitorPlatformService } from './capacitor-platform.service';
+import {
+  CapacitorNotificationService,
+  NotificationActionEvent,
+  REMINDER_ACTION_TYPE_ID,
+} from './capacitor-notification.service';
+import {
+  IS_ANDROID_WEB_VIEW,
+  IS_ANDROID_WEB_VIEW_TOKEN,
+} from '../../util/is-android-web-view';
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
+import { androidInterface } from '../../features/android/android-interface';
+import { Observable } from 'rxjs';
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
+import { GlobalConfigService } from '../../features/config/global-config.service';
+
+export interface ScheduleReminderOptions {
+  /**
+   * Unique notification ID (numeric)
+   */
+  notificationId: number;
+  /**
+   * Reminder identifier (string, e.g., task ID)
+   */
+  reminderId: string;
+  /**
+   * Related entity ID (string, e.g., task ID)
+   */
+  relatedId: string;
+  /**
+   * Notification title
+   */
+  title: string;
+  /**
+   * Type of reminder (e.g., 'TASK')
+   */
+  reminderType: string;
+  /**
+   * Timestamp when the reminder should trigger (in milliseconds)
+   */
+  triggerAtMs: number;
+}
+
+/**
+ * Service for scheduling reminders across platforms.
+ *
+ * On Android: Uses native AlarmManager via androidInterface for precise timing
+ * On iOS: Uses Capacitor LocalNotifications for scheduled notifications
+ */
+@Injectable({
+  providedIn: 'root',
+})
+export class CapacitorReminderService {
+  private _platformService = inject(CapacitorPlatformService);
+  private _notificationService = inject(CapacitorNotificationService);
+  private _globalConfigService = inject(GlobalConfigService);
+  // Injected (vs reading IS_ANDROID_WEB_VIEW directly) so tests can override
+  // it via DI — matches the pattern in `task-reminder.effects.ts`.
+  private _isAndroidWebView = inject(IS_ANDROID_WEB_VIEW_TOKEN);
+  // See requestPermissionsInBackground().
+  private _backgroundPermissionRequest?: Promise<boolean>;
+  private _isBackgroundPermissionRequestSettled = false;
+
+  /**
+   * Observable that emits when a notification action is performed (iOS).
+   * Use this to handle snooze/done button taps from notifications.
+   */
+  get action$(): Observable<NotificationActionEvent> {
+    return this._notificationService.action$;
+  }
+
+  /**
+   * Check if reminder scheduling is available on this platform
+   */
+  get isAvailable(): boolean {
+    return this._platformService.capabilities.scheduledNotifications;
+  }
+
+  /**
+   * Initialize the reminder service.
+   * Registers notification action types on iOS.
+   */
+  async initialize(): Promise<void> {
+    if (this._platformService.isIOS()) {
+      // Action types must be registered before any notification with an
+      // actionTypeId is scheduled, so this runs at startup. The permission
+      // dialog is intentionally NOT requested here — CapacitorNotificationService.schedule()
+      // calls ensurePermissions() lazily, so the OS prompt appears the first
+      // time the user actually triggers a notification (creating a reminder,
+      // hitting an estimate-exceeded warning, etc.) — better grant rates than
+      // an unprompted launch-time dialog.
+      await this._notificationService.registerReminderActions();
+    }
+  }
+
+  /**
+   * Schedule a reminder notification
+   */
+  async scheduleReminder(options: ScheduleReminderOptions): Promise<boolean> {
+    if (!this.isAvailable) {
+      Log.warn('CapacitorReminderService: Scheduled notifications not available');
+      return false;
+    }
+
+    const now = Date.now();
+    const triggerAt = options.triggerAtMs <= now ? now + 1000 : options.triggerAtMs;
+
+    Log.log('📱 CapacitorReminderService.scheduleReminder called', {
+      notificationId: options.notificationId,
+      reminderId: options.reminderId,
+      triggerAt: new Date(triggerAt).toISOString(),
+      triggerInMs: triggerAt - now,
+      triggerInMinutes: Math.round((triggerAt - now) / 1000 / 60),
+      isAndroidWebView: IS_ANDROID_WEB_VIEW,
+      hasNativeScheduler: !!androidInterface?.scheduleNativeReminder,
+    });
+
+    // On Android, use native AlarmManager for precision
+    if (IS_ANDROID_WEB_VIEW && androidInterface.scheduleNativeReminder) {
+      try {
+        // Due-date notifications fire at an arbitrary hour (e.g. 9 AM) that the
+        // user did not explicitly choose, so they should never be alarm-style.
+        const useAlarmStyle =
+          options.reminderType !== 'DUE_DATE' &&
+          (this._globalConfigService.cfg()?.reminder?.useAlarmStyleReminders ?? false);
+        Log.log('🔔 Calling androidInterface.scheduleNativeReminder', {
+          notificationId: options.notificationId,
+          useAlarmStyle,
+        });
+
+        androidInterface.scheduleNativeReminder(
+          options.notificationId,
+          options.reminderId,
+          options.relatedId,
+          options.title,
+          options.reminderType,
+          triggerAt,
+          useAlarmStyle,
+          useAlarmStyle, // isOngoing: persistent notifications when alarm-style is enabled
+        );
+
+        Log.log('✅ CapacitorReminderService: Android reminder scheduled successfully', {
+          notificationId: options.notificationId,
+          reminderId: options.reminderId,
+          triggerAt: new Date(triggerAt).toISOString(),
+        });
+        return true;
+      } catch (error) {
+        Log.err(
+          '❌ CapacitorReminderService: Failed to schedule Android reminder',
+          error,
+        );
+        return false;
+      }
+    }
+
+    // On iOS (and Android as fallback), use Capacitor LocalNotifications
+    if (this._platformService.isNative) {
+      try {
+        const hasPermission = await this._notificationService.ensurePermissions();
+        if (!hasPermission) {
+          Log.warn('CapacitorReminderService: Notification permission not granted');
+          return false;
+        }
+
+        // Re-clamp after the permission await: a first-launch dialog can take
+        // several seconds, aging triggerAt into the past. The iOS plugin
+        // rejects past timestamps ("Scheduled time must be after current time"),
+        // which would silently fail the very first reminder.
+        const safeTriggerAt = Math.max(triggerAt, Date.now() + 1000);
+
+        await LocalNotifications.schedule({
+          notifications: [
+            {
+              id: options.notificationId,
+              title: options.title,
+              body: `Reminder: ${options.title}`,
+              // Play the default system notification sound.
+              // Without this, iOS delivers notifications silently (content.sound = nil).
+              // The string 'default' triggers iOS's file-not-found fallback to the system sound.
+              sound: 'default',
+              // Include action type for iOS notification actions (Done/Snooze buttons)
+              actionTypeId:
+                this._platformService.isIOS() && options.reminderType !== 'DUE_DATE'
+                  ? REMINDER_ACTION_TYPE_ID
+                  : undefined,
+              // Group notifications on iOS via thread identifier
+              threadIdentifier: this._platformService.isIOS()
+                ? 'sp_reminders'
+                : undefined,
+              schedule: {
+                at: new Date(safeTriggerAt),
+                allowWhileIdle: true,
+              },
+              extra: {
+                reminderId: options.reminderId,
+                relatedId: options.relatedId,
+                reminderType: options.reminderType,
+              },
+            },
+          ],
+        });
+
+        Log.log('CapacitorReminderService: iOS reminder scheduled', {
+          notificationId: options.notificationId,
+          reminderId: options.reminderId,
+          triggerAt: new Date(safeTriggerAt).toISOString(),
+        });
+        return true;
+      } catch (error) {
+        Log.err('CapacitorReminderService: Failed to schedule iOS reminder', error);
+        return false;
+      }
+    }
+
+    Log.warn('CapacitorReminderService: No reminder implementation for platform', {
+      platform: this._platformService.platform,
+    });
+    return false;
+  }
+
+  /**
+   * Cancel a scheduled reminder
+   */
+  async cancelReminder(notificationId: number): Promise<boolean> {
+    if (!this.isAvailable) {
+      return false;
+    }
+
+    Log.log('🚫 CapacitorReminderService.cancelReminder called', {
+      notificationId,
+      isAndroidWebView: IS_ANDROID_WEB_VIEW,
+      hasNativeCanceller: !!androidInterface?.cancelNativeReminder,
+    });
+
+    // On Android, use native cancellation
+    if (IS_ANDROID_WEB_VIEW && androidInterface.cancelNativeReminder) {
+      try {
+        androidInterface.cancelNativeReminder(notificationId);
+        Log.log('✅ CapacitorReminderService: Android reminder cancelled', {
+          notificationId,
+        });
+        return true;
+      } catch (error) {
+        Log.err('❌ CapacitorReminderService: Failed to cancel Android reminder', error);
+        return false;
+      }
+    }
+
+    // On iOS (and Android as fallback), use Capacitor LocalNotifications
+    if (this._platformService.isNative) {
+      return this._notificationService.cancel(notificationId);
+    }
+
+    return false;
+  }
+
+  /**
+   * Cancel multiple scheduled reminders
+   */
+  async cancelMultipleReminders(notificationIds: number[]): Promise<boolean> {
+    if (!this.isAvailable || notificationIds.length === 0) {
+      return false;
+    }
+
+    // On Android, cancel each individually
+    if (IS_ANDROID_WEB_VIEW && androidInterface.cancelNativeReminder) {
+      try {
+        for (const id of notificationIds) {
+          androidInterface.cancelNativeReminder(id);
+        }
+        Log.log('CapacitorReminderService: Android reminders cancelled', {
+          count: notificationIds.length,
+        });
+        return true;
+      } catch (error) {
+        Log.err('CapacitorReminderService: Failed to cancel Android reminders', error);
+        return false;
+      }
+    }
+
+    // On iOS (and Android as fallback), use batch cancellation
+    if (this._platformService.isNative) {
+      return this._notificationService.cancelMultiple(notificationIds);
+    }
+
+    return false;
+  }
+
+  /**
+   * Read notification permission state WITHOUT prompting the user.
+   *
+   * Used at startup to decide whether to warn (explicit 'denied') while
+   * deferring the actual OS prompt to the first real schedule (see
+   * `initialize()` — contextual prompts have better grant rates than an
+   * unprompted launch-time dialog).
+   *
+   * Legacy Android WebView: the upfront Capacitor check is unreliable there
+   * (no Capacitor bridge → stale `Notification.permission`, issue #7408), so
+   * report 'granted' and let the OS gate POST_NOTIFICATIONS at fire time —
+   * matching `ensurePermissions()`.
+   */
+  async getPermissionState(): Promise<PermissionState> {
+    if (!this.isAvailable) {
+      return 'denied';
+    }
+
+    if (this._isLegacyAndroidWebView()) {
+      return 'granted';
+    }
+
+    return this._notificationService.getPermissionState();
+  }
+
+  /**
+   * Ask for notification permission at most once per session WITHOUT making the
+   * caller wait for the OS dialog.
+   *
+   * For callers that are about to produce a notification but cannot await a
+   * dialog — the Android foreground-service starts (time tracking, focus mode)
+   * run inside synchronous effect taps. Nothing on those paths requested
+   * POST_NOTIFICATIONS, so on Android 13+ their notifications were silently
+   * suppressed and the app looked broken. See #9648.
+   *
+   * Other paths that CAN prompt (none of which a fresh user necessarily hits
+   * before their first timer): reminder scheduling in
+   * `MobileNotificationEffects`, and `NotifyService.notify()` →
+   * `CapacitorNotificationService.schedule()`, used by the estimate-exceeded
+   * notification and the tracking reminder.
+   *
+   * Consistent with the lazy-prompt design (#8120): starting a timer IS a
+   * contextual first use, not an unprompted launch-time dialog. Callers must
+   * keep it that way — only wire this to genuinely user-initiated starts, never
+   * to a cold-start/recovery path.
+   *
+   * Because the request is not awaited, the caller's startForeground() runs
+   * while the permission is still denied, so Android drops that notification —
+   * and both foreground services render steady-state time via a native
+   * chronometer with NO per-tick update pushes (#8243), so nothing re-posts it
+   * organically. Callers must therefore re-post their own notification when
+   * this resolves true (see the _repost*AfterGrant methods in the Android
+   * effects). Later sessions are unaffected.
+   */
+  requestPermissionsInBackground(): Promise<boolean> {
+    if (!this.isAvailable) {
+      return Promise.resolve(false);
+    }
+
+    // Callers arriving after the request settled posted their notification
+    // with the permission already in its final state — nothing was suppressed,
+    // so never report "newly granted" again (a stale true would trigger a
+    // redundant re-post on every later timer start this session).
+    if (this._isBackgroundPermissionRequestSettled) {
+      return Promise.resolve(false);
+    }
+
+    // Session-scoped: tracking and focus mode can start back-to-back, and a
+    // denial must not re-prompt for the rest of the session. Callers that
+    // arrive while the OS dialog is still open share the pending promise —
+    // their notifications were suppressed too and need the re-post signal.
+    this._backgroundPermissionRequest ??= this._requestAndDetectGrant().finally(() => {
+      this._isBackgroundPermissionRequestSettled = true;
+    });
+    return this._backgroundPermissionRequest;
+  }
+
+  /**
+   * Resolves true ONLY when the permission went from not-granted to granted —
+   * i.e. the caller's notification was suppressed and needs re-posting.
+   *
+   * Already-granted resolves false: nothing was suppressed, so re-posting would
+   * be pointless work (and on Android re-anchors the tracking counter). The
+   * `getPermissionState()` probe carries the #7408 legacy-WebView guard, so the
+   * legacy shell reports 'granted' and never reaches the Capacitor call.
+   */
+  private async _requestAndDetectGrant(): Promise<boolean> {
+    try {
+      if ((await this.getPermissionState()) === 'granted') {
+        return false;
+      }
+      return await this.ensurePermissions();
+    } catch (error) {
+      Log.warn('CapacitorReminderService: background permission request failed', error);
+      return false;
+    }
+  }
+
+  /**
+   * Ensure notification permissions are granted.
+   * Android exact-alarm permission is checked separately once notification
+   * permission is available.
+   */
+  async ensurePermissions(): Promise<boolean> {
+    if (!this.isAvailable) {
+      return false;
+    }
+
+    if (this._isLegacyAndroidWebView()) {
+      // No Capacitor bridge → `LocalNotifications.checkPermissions()` would
+      // fall back to `Notification.permission`, which Android WebView leaves
+      // at 'default' regardless of OS POST_NOTIFICATIONS state (issue #7408).
+      // Reminders here go through AlarmManager via the SUPAndroid bridge; the
+      // OS enforces permission at fire time, so we trust it and skip the
+      // upfront check.
+      return true;
+    }
+
+    const hasPermission = await this._notificationService.ensurePermissions();
+    if (!hasPermission) {
+      return false;
+    }
+
+    // Note: exact alarm permission is checked once by MobileNotificationEffects
+    // after notification permission is actually available. We intentionally do
+    // NOT check it here to avoid repeatedly opening the Android settings page
+    // on every scheduling cycle.
+
+    return true;
+  }
+
+  /**
+   * Whether Android may schedule exact alarms ("Alarms & reminders", Android
+   * 12+). Never prompts. Without it AlarmManager falls back to inexact delivery,
+   * which Doze can delay considerably (issue #10684).
+   *
+   * Resolves true wherever the question doesn't apply or can't be answered
+   * (non-Android, legacy WebView without a Capacitor bridge, a failing check),
+   * so callers only ever react to an explicit denial.
+   */
+  async isExactAlarmGranted(): Promise<boolean> {
+    if (!this._isAndroidWebView || this._isLegacyAndroidWebView()) {
+      // Legacy WebView: no Capacitor bridge, so the LocalNotifications
+      // exact-alarm helpers throw or return stale data (#7408).
+      return true;
+    }
+
+    try {
+      const status = await LocalNotifications.checkExactNotificationSetting();
+      return status?.exact_alarm === 'granted';
+    } catch (error) {
+      Log.warn('CapacitorReminderService: Exact alarm check failed', error);
+      return true;
+    }
+  }
+
+  /**
+   * Opens Android's "Alarms & reminders" page for this app. Only called from an
+   * explicit user action. Resolves with the permission state once the user
+   * returns; on grant the native ExactAlarmPermissionReceiver re-registers the
+   * pending alarms as exact.
+   */
+  async openExactAlarmSettings(): Promise<boolean> {
+    if (!this._isAndroidWebView || this._isLegacyAndroidWebView()) {
+      return true;
+    }
+
+    try {
+      const status = await LocalNotifications.changeExactNotificationSetting();
+      return status?.exact_alarm === 'granted';
+    } catch (error) {
+      Log.warn('CapacitorReminderService: Opening exact alarm settings failed', error);
+      return this.isExactAlarmGranted();
+    }
+  }
+
+  /**
+   * True on the legacy `FullscreenActivity`, which exposes the SUPAndroid
+   * bridge but does NOT host a Capacitor bridge. Capacitor plugin calls fall
+   * back to their web implementations there, and the Web Notifications API
+   * is unimplemented in Android WebView — making any LocalNotifications
+   * permission/exact-alarm check unreliable. Reminder scheduling on this
+   * path goes through AlarmManager via `androidInterface.scheduleNativeReminder`,
+   * which the OS gates with POST_NOTIFICATIONS at fire time. See issue #7408.
+   */
+  private _isLegacyAndroidWebView(): boolean {
+    return this._isAndroidWebView && !Capacitor.isNativePlatform();
+  }
+}

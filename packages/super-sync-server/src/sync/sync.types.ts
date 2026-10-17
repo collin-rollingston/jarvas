@@ -1,0 +1,552 @@
+import { Logger } from '../logger';
+import { Prisma } from '@prisma/client';
+import {
+  SUPER_SYNC_ERROR_CODES,
+  SUPER_SYNC_OP_TYPES,
+  SUPER_SYNC_SNAPSHOT_OP_TYPES,
+  type SuperSyncErrorCode,
+  type SuperSyncOpType,
+} from '@sp/shared-schema';
+
+import {
+  VectorClock,
+  VectorClockComparison,
+  compareVectorClocks,
+  limitVectorClockSize,
+  MAX_VECTOR_CLOCK_SIZE,
+} from '@sp/sync-core';
+
+const FULL_STATE_OP_TYPES: ReadonlySet<string> = new Set(SUPER_SYNC_SNAPSHOT_OP_TYPES);
+
+/**
+ * Database predicate for full-state operations that are proven to supersede
+ * their prefix. Legacy REPAIR rows have no causal base cursor, so they remain
+ * downloadable compatibility records but must never authorize fast-forward or
+ * history pruning.
+ */
+export const CAUSAL_FULL_STATE_OPERATION_WHERE = {
+  OR: [
+    { opType: { in: ['SYNC_IMPORT', 'BACKUP_IMPORT'] } },
+    { opType: 'REPAIR', repairBaseServerSeq: { not: null } },
+  ],
+} as const satisfies Prisma.OperationWhereInput;
+
+/**
+ * The newest causal full-state op, at or below `maxServerSeq` when given (the download
+ * path's fast-forward probe) or over the user's whole history when omitted (the upload
+ * path's clock-pruning author lookup) — the SAME predicate as
+ * {@link CAUSAL_FULL_STATE_OPERATION_WHERE}, but as raw SQL.
+ *
+ * WHY A SECOND COPY EXISTS. Prisma sends `op_type` as bind parameters. A partial index is
+ * only usable when `operator_predicate_proof` can prove the query implies the index
+ * predicate, and that proof requires `Const` nodes — a `Param` fails every branch
+ * (predtest.c). A generic plan has no bound values to fold, so `predOK` is false and
+ * `operations_user_id_causal_full_state_server_seq_idx` is unreachable.
+ *
+ * Migration 20260829000000 reasoned that the cost margin keeps such statements on custom
+ * plans. That holds for the fleet-wide sweep and is FALSE here. `choose_custom_plan`
+ * compares `generic_cost` against the average custom cost PLUS a synthetic planning charge
+ * of `1000 * cpu_operator_cost * (nrelations + 1)` = 5.00 for a single-table query
+ * (plancache.c, `cached_plan_cost`). This `LIMIT 1` lookup plans at ~1.94 with a floor of
+ * 0.29, so avg_custom >= 5.29 can never beat a generic_cost of 4.85: it flips to generic
+ * at execution 6, on every pooled connection, for every user, unconditionally — and then
+ * walks the user's entire history, which production cancelled at the 60s
+ * statement_timeout on the sync download path.
+ *
+ * THE OP-TYPE VALUES MUST STAY STRING LITERALS. Interpolating them (`${...}`) turns them
+ * back into bind parameters and silently restores the pathology: same rows, same tests,
+ * full backward walk. Guarded by
+ * tests/integration/download-full-state-plan.integration.spec.ts, which measures the
+ * GENERIC plan.
+ *
+ * Built per call rather than hoisted to a module constant so importing this module does
+ * not require a live `Prisma.sql` — several specs mock `@prisma/client` with a partial
+ * stub, and an import-time call would break them for no benefit.
+ */
+export const latestCausalFullStateSql = (
+  userId: number,
+  maxServerSeq?: number,
+): Prisma.Sql => Prisma.sql`
+  SELECT server_seq, client_id
+  FROM operations
+  WHERE user_id = ${userId}
+    ${
+      maxServerSeq === undefined
+        ? Prisma.empty
+        : Prisma.sql`AND server_seq <= ${maxServerSeq}`
+    }
+    AND (
+      op_type IN ('SYNC_IMPORT', 'BACKUP_IMPORT')
+      OR (op_type = 'REPAIR' AND repair_base_server_seq IS NOT NULL)
+    )
+  ORDER BY server_seq DESC
+  LIMIT 1
+`;
+
+/** Row shape of {@link latestCausalFullStateSql}. */
+export type LatestCausalFullStateRow = { server_seq: number; client_id: string };
+
+/**
+ * Fall back from a recent checkpoint to one whose entire prefix has aged out.
+ * Materialize the receipt-time range before MIN: a direct MIN(server_seq) can
+ * walk the whole historical sequence index to find the first recent row.
+ * Literal op types keep the causal partial index usable with generic plans.
+ */
+export const agedPrefixCausalFullStateSql = (
+  userId: number,
+  maxServerSeq: number,
+  cutoffTime: bigint,
+): Prisma.Sql => Prisma.sql`
+  WITH fresh_prefix AS MATERIALIZED (
+    SELECT server_seq FROM operations
+    WHERE user_id = ${userId}
+      AND received_at >= ${cutoffTime}
+      AND server_seq < ${maxServerSeq}
+    ORDER BY received_at
+  )
+  SELECT server_seq FROM operations
+  WHERE user_id = ${userId}
+    AND server_seq > 1
+    AND server_seq <= (SELECT min(server_seq) FROM fresh_prefix)
+    AND (
+      op_type IN ('SYNC_IMPORT', 'BACKUP_IMPORT')
+      OR (op_type = 'REPAIR' AND repair_base_server_seq IS NOT NULL)
+    )
+  ORDER BY server_seq DESC
+  LIMIT 1
+`;
+
+/**
+ * True when `opType` carries the user's full state (SYNC_IMPORT, BACKUP_IMPORT,
+ * REPAIR). Whether it is a proven causal boundary additionally depends on the
+ * REPAIR base cursor; use {@link isCausalFullStateOperation} for that decision.
+ */
+export const isFullStateOpType = (opType: string): boolean =>
+  FULL_STATE_OP_TYPES.has(opType);
+
+// Re-export for consumers of this module
+export {
+  VectorClock,
+  VectorClockComparison,
+  compareVectorClocks,
+  limitVectorClockSize,
+  MAX_VECTOR_CLOCK_SIZE,
+};
+
+// Structured error codes for client handling. Keep this server-local alias for
+// existing imports while sharing the vocabulary with the HTTP contract package.
+export const SYNC_ERROR_CODES = SUPER_SYNC_ERROR_CODES;
+
+export const STATE_REPLACEMENT_REQUIRED_ERROR =
+  'Download the latest full-state replacement before retrying';
+
+export type SyncErrorCode = SuperSyncErrorCode;
+
+export type ConflictType =
+  | 'concurrent'
+  | 'superseded'
+  | 'equal_different_client'
+  | 'unknown';
+
+export interface ConflictResult {
+  hasConflict: boolean;
+  reason?: string;
+  conflictType?: ConflictType;
+  existingClock?: VectorClock;
+}
+
+// Operation types - single source of truth
+export const OP_TYPES = SUPER_SYNC_OP_TYPES;
+
+export type OpType = SuperSyncOpType;
+
+// VectorClock, VectorClockComparison, and compareVectorClocks are imported from @sp/sync-core
+// and re-exported above. This ensures client and server use identical implementations.
+
+/**
+ * Validates and sanitizes a vector clock.
+ * Returns a sanitized clock with validated entries, or an error.
+ *
+ * Validation rules:
+ * - Maximum 50 entries (prevents DoS via huge clocks)
+ * - Keys must be non-empty strings, max 255 characters
+ * - Values must be non-negative integers, capped at 100,000,000
+ * - Invalid entries are removed (not rejected)
+ */
+export const sanitizeVectorClock = (
+  clock: unknown,
+): { valid: true; clock: VectorClock } | { valid: false; error: string } => {
+  if (typeof clock !== 'object' || clock === null || Array.isArray(clock)) {
+    return { valid: false, error: 'Vector clock must be an object' };
+  }
+
+  const entries = Object.entries(clock as Record<string, unknown>);
+
+  // Reject absurdly large clocks (DoS protection).
+  // Legitimate clocks can temporarily exceed MAX_VECTOR_CLOCK_SIZE during conflict
+  // resolution: entity clock IDs + client ID + merged clocks from multiple concurrent
+  // clients. 2.5x MAX gives room for multi-client merge scenarios while catching
+  // adversarial inputs. Server-side pruning (limitVectorClockSize) will trim to MAX
+  // before storage.
+  const MAX_SANITIZE_VECTOR_CLOCK_SIZE = Math.ceil(MAX_VECTOR_CLOCK_SIZE * 2.5);
+  if (entries.length > MAX_SANITIZE_VECTOR_CLOCK_SIZE) {
+    return {
+      valid: false,
+      error: `Vector clock has too many entries (${entries.length}, max ${MAX_SANITIZE_VECTOR_CLOCK_SIZE})`,
+    };
+  }
+
+  const sanitized: VectorClock = {};
+  let strippedCount = 0;
+
+  for (const [key, value] of entries) {
+    // Validate key
+    if (typeof key !== 'string' || key.length === 0 || key.length > 255) {
+      strippedCount++;
+      continue; // Skip invalid keys
+    }
+
+    // Validate value
+    if (
+      typeof value !== 'number' ||
+      !Number.isInteger(value) ||
+      value < 0 ||
+      // Cap at 100M — impossibly large for normal use (would need ~1 op/second
+      // for 3+ years) but prevents an adversarial client from sending a huge
+      // counter that makes all other clocks LESS_THAN it.
+      value > 100_000_000
+    ) {
+      strippedCount++;
+      continue; // Skip invalid values
+    }
+
+    sanitized[key] = value;
+  }
+
+  if (strippedCount > 0) {
+    Logger.warn(
+      `sanitizeVectorClock: Stripped ${strippedCount} invalid entries from vector clock`,
+    );
+  }
+
+  return { valid: true, clock: sanitized };
+};
+
+// compareVectorClocks is imported from @sp/sync-core (see imports at top of file)
+
+export interface Operation {
+  id: string;
+  clientId: string;
+  actionType: string;
+  opType: OpType;
+  entityType: string;
+  entityId?: string;
+  entityIds?: string[]; // For batch operations
+  payload: unknown;
+  vectorClock: VectorClock;
+  timestamp: number;
+  schemaVersion: number;
+  isPayloadEncrypted?: boolean; // True if payload is E2E encrypted
+  syncImportReason?: string;
+  repairBaseServerSeq?: number;
+}
+
+export const isCausalFullStateOperation = (
+  op: Pick<Operation, 'opType' | 'repairBaseServerSeq'>,
+): boolean =>
+  op.opType === 'SYNC_IMPORT' ||
+  op.opType === 'BACKUP_IMPORT' ||
+  (op.opType === 'REPAIR' && op.repairBaseServerSeq !== undefined);
+
+export interface DuplicateOperationCandidate {
+  id: string;
+  userId: number;
+  clientId: string;
+  actionType: string;
+  opType: string;
+  entityType: string;
+  entityId: string | null;
+  entityIds: string[];
+  payload: unknown;
+  vectorClock: unknown;
+  schemaVersion: number;
+  clientTimestamp: bigint | number | string;
+  receivedAt: bigint | number | string;
+  isPayloadEncrypted: boolean;
+  syncImportReason: string | null;
+  repairBaseServerSeq: number | null;
+}
+
+/**
+ * The exact column set `isSameDuplicateOperation` needs to compare an incoming
+ * op against a stored one. Shared by every duplicate-detection query (the two
+ * per-op checks and the snapshot handler) so a field added here can never be
+ * silently missed at one of the call sites.
+ */
+export const DUPLICATE_OP_SELECT = {
+  id: true,
+  userId: true,
+  clientId: true,
+  actionType: true,
+  opType: true,
+  entityType: true,
+  entityId: true,
+  entityIds: true,
+  payload: true,
+  vectorClock: true,
+  schemaVersion: true,
+  clientTimestamp: true,
+  receivedAt: true,
+  isPayloadEncrypted: true,
+  syncImportReason: true,
+  repairBaseServerSeq: true,
+} satisfies Prisma.OperationSelect;
+
+export interface LatestEntityOperationRow {
+  entityId: string;
+  clientId: string;
+  actionType: string;
+  vectorClock: unknown;
+  serverSeq?: number;
+}
+
+// Conservative enough to avoid planner-heavy BitmapOr + Sort plans on large
+// histories while still replacing up to 100 per-entity round trips with one query.
+export const CONFLICT_DETECTION_ENTITY_BATCH_SIZE = 100;
+
+export interface ServerOperation {
+  serverSeq: number;
+  op: Operation;
+  receivedAt: number;
+}
+
+// Upload types
+export interface UploadOpsRequest {
+  ops: Operation[];
+  clientId: string;
+  lastKnownServerSeq?: number;
+  requestId?: string; // For request deduplication on retries
+}
+
+export interface UploadResult {
+  opId: string;
+  accepted: boolean;
+  serverSeq?: number;
+  error?: string;
+  errorCode?: SyncErrorCode;
+  /**
+   * The existing entity's vector clock when rejecting due to conflict.
+   * Allows clients to create LWW updates that dominate the server's state.
+   */
+  existingClock?: VectorClock;
+}
+
+export const createStateReplacementRequiredResults = (
+  ops: ReadonlyArray<Pick<Operation, 'id'>>,
+): UploadResult[] =>
+  ops.map((op) => ({
+    opId: op.id,
+    accepted: false,
+    error: STATE_REPLACEMENT_REQUIRED_ERROR,
+    // Released clients already leave INTERNAL_ERROR operations pending and
+    // process piggybacked operations before retrying.
+    errorCode: SYNC_ERROR_CODES.INTERNAL_ERROR,
+  }));
+
+/**
+ * Internal return of the serial-path `processOperation`: the client-facing
+ * `UploadResult` plus the op's storage size, computed once at the persist site,
+ * so the caller can accumulate `acceptedDeltaBytes` without re-measuring the
+ * (potentially multi-MB) payload. `storageBytes` / `fallback` are only
+ * meaningful when `result.accepted` is true.
+ */
+export interface ProcessOperationResult {
+  result: UploadResult;
+  storageBytes: number;
+  fallback: boolean;
+}
+
+export interface UploadOpsResponse {
+  results: UploadResult[];
+  newOps?: ServerOperation[];
+  latestSeq: number;
+  /**
+   * True when piggybacked ops were limited (more ops exist on server).
+   * Client should trigger a download to get the remaining operations.
+   */
+  hasMorePiggyback?: boolean;
+}
+
+// Download types
+export interface DownloadOpsQuery {
+  sinceSeq: number;
+  limit?: number;
+  excludeClient?: string;
+}
+
+export interface DownloadOpsResponse {
+  ops: ServerOperation[];
+  hasMore: boolean;
+  latestSeq: number;
+  /**
+   * Set to true if operations were deleted and the client should re-sync
+   * from a snapshot. This happens when:
+   * - The requested sinceSeq is older than retained operations
+   * - There's a gap in sequence numbers (operations were purged)
+   */
+  gapDetected?: boolean;
+  /**
+   * Aggregated vector clock from all ops before and including the snapshot.
+   * Only set when snapshot optimization is used.
+   * Clients need this to create merged updates that dominate all known clocks.
+   */
+  snapshotVectorClock?: VectorClock;
+  /**
+   * Server timestamp for client clock drift detection.
+   */
+  serverTime?: number;
+  capabilities?: {
+    causalRepairSnapshots: true;
+  };
+}
+
+// Device types
+/** One device's sync activity, as returned by `GET /api/sync/devices`. */
+export interface SyncDeviceInfo {
+  clientId: string;
+  lastSeenAt: number;
+}
+
+export interface SyncDevicesResponse {
+  devices: SyncDeviceInfo[];
+}
+
+// Status types
+export interface SyncStatusResponse {
+  latestSeq: number;
+  devicesOnline: number;
+  snapshotAge?: number;
+  storageUsedBytes: number;
+  storageQuotaBytes: number;
+}
+
+// Snapshot generation result (shared by SnapshotService + SnapshotGenerationService)
+export interface SnapshotResult {
+  state: unknown;
+  serverSeq: number;
+  generatedAt: number;
+  schemaVersion: number;
+}
+
+// Payload validation result
+export interface PayloadValidationResult {
+  valid: boolean;
+  error?: string;
+}
+
+/**
+ * Validates operation payload structure based on operation type.
+ * This is a server-side security check to ensure payloads have the expected structure.
+ *
+ * Note: The entity ID is stored in operation.entityId, NOT in the payload.
+ * Payloads contain the entity data, e.g., { task: { id: '...', title: '...' } }
+ *
+ * Rules:
+ * - CRT: Must be a non-null object (contains the entity being created)
+ * - UPD: Must be an object (partial update)
+ * - DEL: Can be empty object, null, or object with deletion metadata
+ * - MOV: Must be an object (contains move/reorder data)
+ * - BATCH: Must be an object, optionally with 'entities' object
+ * - SYNC_IMPORT/BACKUP_IMPORT/REPAIR: Accept any (too complex to validate)
+ */
+export const validatePayload = (
+  opType: OpType,
+  payload: unknown,
+): PayloadValidationResult => {
+  // Skip validation for full-state operations (too complex to validate server-side)
+  if (isFullStateOpType(opType)) {
+    return { valid: true };
+  }
+
+  // DEL can have empty payload, null, or metadata object
+  if (opType === 'DEL') {
+    if (payload === null || payload === undefined) {
+      return { valid: true };
+    }
+    if (typeof payload === 'object' && !Array.isArray(payload)) {
+      return { valid: true };
+    }
+    // Encrypted DEL payload might be a string
+    if (typeof payload === 'string') {
+      return { valid: true };
+    }
+    return {
+      valid: false,
+      error: 'DEL payload must be null, an object, or an encrypted string',
+    };
+  }
+
+  // Encrypted payloads are strings - allow them
+  if (typeof payload === 'string') {
+    return { valid: true };
+  }
+
+  // All other operations require an object payload
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+    return { valid: false, error: `${opType} payload must be a non-null object` };
+  }
+
+  const payloadObj = payload as Record<string, unknown>;
+
+  // BATCH with 'entities' must have entities as an object
+  if (opType === 'BATCH' && 'entities' in payloadObj) {
+    if (
+      typeof payloadObj.entities !== 'object' ||
+      payloadObj.entities === null ||
+      Array.isArray(payloadObj.entities)
+    ) {
+      return { valid: false, error: 'BATCH entities must be an object keyed by ID' };
+    }
+  }
+
+  return { valid: true };
+};
+
+// Configuration
+export interface SyncConfig {
+  maxPayloadSizeBytes: number;
+  uploadRateLimit: { max: number; windowMs: number };
+  retentionMs: number; // Unified retention period for stored ops and devices
+  maxClockDriftMs: number;
+}
+
+// Time constants (in milliseconds)
+export const MS_PER_MINUTE = 60 * 1000;
+export const MS_PER_HOUR = 60 * MS_PER_MINUTE;
+export const MS_PER_DAY = 24 * MS_PER_HOUR;
+
+// Retention period
+export const RETENTION_DAYS = 45;
+export const RETENTION_MS = RETENTION_DAYS * MS_PER_DAY;
+
+// Device thresholds
+export const ONLINE_DEVICE_THRESHOLD_MS = 5 * MS_PER_MINUTE; // 5 minutes
+
+/**
+ * Minimum age a `sync_devices` row must reach before a download refreshes it.
+ *
+ * Downloads run on every poll, so the refresh is throttled to one write per
+ * device per window. The window is 2x the default client sync interval
+ * (`syncInterval` in `default-global-config.const.ts`, 1 minute): with the two
+ * equal, every default poll lands at or past the window boundary and the
+ * throttle never engages. Must stay below `ONLINE_DEVICE_THRESHOLD_MS` so
+ * `getOnlineDeviceCount` cannot miss a device whose refresh was suppressed.
+ */
+export const DEVICE_TOUCH_THROTTLE_MS = 2 * MS_PER_MINUTE;
+
+export const DEFAULT_SYNC_CONFIG: SyncConfig = {
+  maxPayloadSizeBytes: 20 * 1024 * 1024, // 20MB - needed for large imports
+  uploadRateLimit: { max: 100, windowMs: MS_PER_MINUTE },
+  retentionMs: RETENTION_MS, // 45 days - used for stored ops and devices
+  maxClockDriftMs: MS_PER_MINUTE, // 60 seconds
+};

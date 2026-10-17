@@ -1,0 +1,119 @@
+import {
+  ChangeDetectionStrategy,
+  Component,
+  computed,
+  inject,
+  input,
+} from '@angular/core';
+import { MatIconButton } from '@angular/material/button';
+import { MatIcon } from '@angular/material/icon';
+import { MatTooltip } from '@angular/material/tooltip';
+import { TranslatePipe } from '@ngx-translate/core';
+import { LayoutService } from '../../layout/layout.service';
+import { T } from '../../../t.const';
+import { KeyboardConfig } from '@sp/keyboard-config';
+import { GlobalConfigService } from '../../../features/config/global-config.service';
+
+@Component({
+  selector: 'desktop-panel-buttons',
+  standalone: true,
+  imports: [MatIconButton, MatIcon, MatTooltip, TranslatePipe],
+  template: `
+    @if (isScheduleDayPanelEnabled()) {
+      <button
+        class="panel-btn e2e-toggle-schedule-day-panel"
+        [class.isActive]="isShowScheduleDayPanel()"
+        (click)="layoutService.toggleScheduleDayPanel()"
+        mat-icon-button
+        matTooltip="{{ T.MH.SCHEDULE | translate }}"
+      >
+        <mat-icon>schedule</mat-icon>
+      </button>
+    }
+
+    @if (isIssuesPanelEnabled()) {
+      <button
+        class="panel-btn e2e-toggle-issue-provider-panel"
+        [class.isActive]="isShowIssuePanel()"
+        (click)="layoutService.toggleAddTaskPanel()"
+        mat-icon-button
+        matTooltip="{{ T.MH.TOGGLE_SHOW_ISSUE_PANEL | translate }} {{
+          kb()?.toggleIssuePanel ? '[' + kb()?.toggleIssuePanel + ']' : ''
+        }}"
+      >
+        <mat-icon>webhook</mat-icon>
+      </button>
+    }
+
+    @if (isProjectNotesEnabled()) {
+      <button
+        class="panel-btn e2e-toggle-notes-btn"
+        [class.isActive]="isShowNotes()"
+        (click)="layoutService.toggleNotes()"
+        mat-icon-button
+        matTooltip="{{ T.MH.TOGGLE_SHOW_NOTES | translate }} {{
+          kb()?.openProjectNotes ? '[' + kb()?.openProjectNotes + ']' : ''
+        }}"
+      >
+        <mat-icon>comment</mat-icon>
+      </button>
+    }
+  `,
+  styles: [
+    `
+      :host {
+        display: contents;
+      }
+
+      .panel-btn {
+        position: relative;
+        transition: all 0.2s ease;
+        overflow: visible !important;
+
+        .mat-icon {
+          transition: transform 0.2s ease;
+          display: block;
+        }
+
+        &.isActive {
+          box-shadow: none;
+          color: var(--brand);
+          background-color: var(--state-selected);
+
+          &::after {
+            border-radius: 4px;
+          }
+
+          .mat-icon {
+            transform: none;
+          }
+        }
+
+        &:hover:not(.isActive) {
+          background-color: var(--state-hover);
+        }
+      }
+    `,
+  ],
+  changeDetection: ChangeDetectionStrategy.OnPush,
+})
+export class DesktopPanelButtonsComponent {
+  readonly T = T;
+  readonly layoutService = inject(LayoutService);
+  private readonly _configService = inject(GlobalConfigService);
+
+  readonly kb = input<KeyboardConfig | null>();
+  readonly isShowScheduleDayPanel = input.required<boolean>();
+  readonly isShowIssuePanel = input.required<boolean>();
+  readonly isShowNotes = input.required<boolean>();
+
+  readonly isIssuesPanelEnabled = computed(
+    () => this._configService.appFeatures().isIssuesPanelEnabled,
+  );
+  readonly isScheduleDayPanelEnabled = computed(
+    () => this._configService.appFeatures().isScheduleDayPanelEnabled,
+  );
+  readonly isProjectNotesEnabled = computed(
+    () => this._configService.appFeatures().isProjectNotesEnabled,
+  );
+}

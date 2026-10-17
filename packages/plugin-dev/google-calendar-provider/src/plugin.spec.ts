@@ -1,0 +1,682 @@
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
+import type { IssueProviderPluginDefinition } from '@super-productivity/plugin-api';
+
+let definition: IssueProviderPluginDefinition;
+
+beforeAll(async () => {
+  (globalThis as any).PluginAPI = {
+    registerIssueProvider: vi.fn((def: IssueProviderPluginDefinition) => {
+      definition = def;
+    }),
+    getOAuthToken: vi.fn().mockResolvedValue('mock-token'),
+    clearOAuthToken: vi.fn().mockResolvedValue(undefined),
+    log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+  };
+  await import('./plugin');
+});
+
+describe('Google Calendar Plugin', () => {
+  beforeEach(() => {
+    (globalThis as any).PluginAPI.getOAuthToken.mockReset();
+    (globalThis as any).PluginAPI.getOAuthToken.mockResolvedValue('mock-token');
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  describe('OAuth config', () => {
+    it('does not expose a browser web OAuth client', () => {
+      const oauthField = definition.configFields.find((field) => field.key === 'oauth');
+      const oauthConfig = oauthField?.oauthConfig;
+
+      expect(oauthConfig?.webClientId).toBeUndefined();
+    });
+
+    it('requests only verified Google Calendar scopes', () => {
+      const oauthField = definition.configFields.find((field) => field.key === 'oauth');
+      const oauthConfig = oauthField?.oauthConfig;
+
+      expect(oauthConfig?.scopes).toEqual([
+        'https://www.googleapis.com/auth/calendar.events',
+        'https://www.googleapis.com/auth/calendar.calendarlist.readonly',
+      ]);
+      expect(oauthConfig?.scopes).not.toContain(
+        'https://www.googleapis.com/auth/calendar.readonly',
+      );
+    });
+
+    it('reads OAuth token with transient provider-specific token key', async () => {
+      const getOAuthToken = (globalThis as any).PluginAPI.getOAuthToken;
+      getOAuthToken.mockResolvedValueOnce('account-token');
+
+      await expect(
+        definition.getHeaders({ __spOAuthTokenKey: 'provider-a' }),
+      ).resolves.toEqual({
+        Authorization: 'Bearer account-token',
+      });
+
+      expect(getOAuthToken).toHaveBeenCalledWith('provider-a');
+    });
+
+    it('does not fall back to the legacy token when a scoped token is missing', async () => {
+      const getOAuthToken = (globalThis as any).PluginAPI.getOAuthToken;
+      getOAuthToken.mockResolvedValueOnce(null);
+
+      await expect(
+        definition.getHeaders({ __spOAuthTokenKey: 'provider-with-cleared-token' }),
+      ).rejects.toThrow('Not authenticated. Please connect your Google account first.');
+
+      expect(getOAuthToken).toHaveBeenCalledOnce();
+      expect(getOAuthToken).toHaveBeenCalledWith('provider-with-cleared-token');
+    });
+
+    it('falls back to legacy default OAuth token when config has no token key', async () => {
+      const getOAuthToken = (globalThis as any).PluginAPI.getOAuthToken;
+      getOAuthToken.mockResolvedValueOnce('legacy-token');
+
+      await expect(definition.getHeaders({})).resolves.toEqual({
+        Authorization: 'Bearer legacy-token',
+      });
+
+      expect(getOAuthToken).toHaveBeenCalledWith();
+    });
+  });
+
+  describe('fieldMappings', () => {
+    const ctx = { issueId: 'event-1' };
+
+    describe('title <-> summary', () => {
+      it('should pass title through to issue (toIssueValue)', () => {
+        const mapping = definition.fieldMappings!.find((m) => m.taskField === 'title')!;
+        expect(mapping.toIssueValue('My Event', ctx)).toBe('My Event');
+      });
+
+      it('should strip [DONE] prefix from summary (toTaskValue)', () => {
+        const mapping = definition.fieldMappings!.find((m) => m.taskField === 'title')!;
+        expect(mapping.toTaskValue('[DONE] My Event', ctx)).toBe('My Event');
+      });
+
+      it('should return summary as-is when no [DONE] prefix', () => {
+        const mapping = definition.fieldMappings!.find((m) => m.taskField === 'title')!;
+        expect(mapping.toTaskValue('My Event', ctx)).toBe('My Event');
+      });
+
+      it('should return (No title) for empty summary', () => {
+        const mapping = definition.fieldMappings!.find((m) => m.taskField === 'title')!;
+        expect(mapping.toTaskValue('', ctx)).toBe('(No title)');
+      });
+    });
+
+    describe('notes <-> description', () => {
+      it('should pass notes to issue', () => {
+        const mapping = definition.fieldMappings!.find((m) => m.taskField === 'notes')!;
+        expect(mapping.toIssueValue('some notes', ctx)).toBe('some notes');
+      });
+
+      it('should pass description to task', () => {
+        const mapping = definition.fieldMappings!.find((m) => m.taskField === 'notes')!;
+        expect(mapping.toTaskValue('some desc', ctx)).toBe('some desc');
+      });
+
+      it('should return empty string for falsy values', () => {
+        const mapping = definition.fieldMappings!.find((m) => m.taskField === 'notes')!;
+        expect(mapping.toIssueValue('', ctx)).toBe('');
+        expect(mapping.toTaskValue('', ctx)).toBe('');
+      });
+    });
+
+    describe('dueWithTime <-> start_dateTime', () => {
+      it('should convert ms timestamp to local ISO string (toIssueValue)', () => {
+        const mapping = definition.fieldMappings!.find(
+          (m) => m.taskField === 'dueWithTime',
+        )!;
+        const ts = new Date('2026-03-20T10:00:00Z').getTime();
+        const result = mapping.toIssueValue(ts, ctx) as string;
+        expect(new Date(result).getTime()).toBe(ts);
+      });
+
+      it('should convert ISO string to ms timestamp (toTaskValue)', () => {
+        const mapping = definition.fieldMappings!.find(
+          (m) => m.taskField === 'dueWithTime',
+        )!;
+        const iso = '2026-03-20T10:00:00Z';
+        expect(mapping.toTaskValue(iso, ctx)).toBe(new Date(iso).getTime());
+      });
+
+      it('should return null for falsy toIssueValue and undefined for falsy toTaskValue', () => {
+        const mapping = definition.fieldMappings!.find(
+          (m) => m.taskField === 'dueWithTime',
+        )!;
+        expect(mapping.toIssueValue(0, ctx)).toBeNull();
+        expect(mapping.toTaskValue('', ctx)).toBeUndefined();
+      });
+
+      it('should declare dueDay as mutually exclusive', () => {
+        const mapping = definition.fieldMappings!.find(
+          (m) => m.taskField === 'dueWithTime',
+        )!;
+        expect(mapping.mutuallyExclusive).toEqual(['dueDay']);
+      });
+    });
+
+    describe('timeEstimate <-> duration_ms', () => {
+      it('should pass number through both directions', () => {
+        const mapping = definition.fieldMappings!.find(
+          (m) => m.taskField === 'timeEstimate',
+        )!;
+        expect(mapping.toIssueValue(3600000, ctx)).toBe(3600000);
+        expect(mapping.toTaskValue(1800000, ctx)).toBe(1800000);
+      });
+
+      it('should return 0 for falsy values', () => {
+        const mapping = definition.fieldMappings!.find(
+          (m) => m.taskField === 'timeEstimate',
+        )!;
+        expect(mapping.toIssueValue(0, ctx)).toBe(0);
+        expect(mapping.toTaskValue(0, ctx)).toBe(0);
+      });
+    });
+
+    describe('dueDay <-> start_date', () => {
+      it('should pass date string through both directions', () => {
+        const mapping = definition.fieldMappings!.find((m) => m.taskField === 'dueDay')!;
+        expect(mapping.toIssueValue('2026-03-20', ctx)).toBe('2026-03-20');
+        expect(mapping.toTaskValue('2026-03-20', ctx)).toBe('2026-03-20');
+      });
+
+      it('should return null for falsy toIssueValue and undefined for falsy toTaskValue', () => {
+        const mapping = definition.fieldMappings!.find((m) => m.taskField === 'dueDay')!;
+        expect(mapping.toIssueValue('', ctx)).toBeNull();
+        expect(mapping.toTaskValue('', ctx)).toBeUndefined();
+      });
+
+      it('should declare dueWithTime as mutually exclusive', () => {
+        const mapping = definition.fieldMappings!.find((m) => m.taskField === 'dueDay')!;
+        expect(mapping.mutuallyExclusive).toEqual(['dueWithTime']);
+      });
+    });
+  });
+
+  describe('extractSyncValues', () => {
+    it('should normalize timed event to UTC ISO', () => {
+      const issue = {
+        id: 'e1',
+        title: 'Meeting',
+        body: 'notes',
+        start: { dateTime: '2026-03-20T12:00:00+02:00' },
+        end: { dateTime: '2026-03-20T13:00:00+02:00' },
+      };
+
+      const result = definition.extractSyncValues!(issue as any);
+
+      expect(result.start_dateTime).toBe('2026-03-20T10:00:00.000Z');
+      expect(result.duration_ms).toBe(3600000);
+      expect(result.summary).toBe('Meeting');
+      expect(result.description).toBe('notes');
+    });
+
+    it('should extract all-day event fields', () => {
+      const issue = {
+        id: 'e1',
+        title: 'Holiday',
+        body: '',
+        start: { date: '2026-03-20' },
+        end: { date: '2026-03-21' },
+      };
+
+      const result = definition.extractSyncValues!(issue as any);
+
+      expect(result.start_date).toBe('2026-03-20');
+      expect(result.start_dateTime).toBeUndefined();
+      expect(result.duration_ms).toBe(0);
+    });
+
+    it('should handle missing start/end gracefully', () => {
+      const issue = { id: 'e1', title: 'Bare', body: '' };
+
+      const result = definition.extractSyncValues!(issue as any);
+
+      expect(result.start_dateTime).toBeUndefined();
+      expect(result.start_date).toBeUndefined();
+      expect(result.duration_ms).toBe(0);
+    });
+  });
+
+  describe('updateIssue', () => {
+    let mockHttp: { get: any; post: any; put: any; patch: any; delete: any };
+    const cfg = { calendarId: 'test-cal' };
+
+    beforeEach(() => {
+      mockHttp = {
+        get: vi.fn(),
+        post: vi.fn(),
+        put: vi.fn(),
+        patch: vi.fn(),
+        delete: vi.fn(),
+      };
+    });
+
+    it('should patch summary when title changes', async () => {
+      await definition.updateIssue!(
+        'event-1',
+        { summary: 'New Title' },
+        cfg as any,
+        mockHttp as any,
+      );
+
+      expect(mockHttp.patch).toHaveBeenCalledTimes(1);
+      const [, body] = mockHttp.patch.mock.calls[0];
+      expect(body.summary).toBe('New Title');
+    });
+
+    it('should patch description when notes change', async () => {
+      await definition.updateIssue!(
+        'event-1',
+        { description: 'New notes' },
+        cfg as any,
+        mockHttp as any,
+      );
+
+      expect(mockHttp.patch).toHaveBeenCalledTimes(1);
+      const [, body] = mockHttp.patch.mock.calls[0];
+      expect(body.description).toBe('New notes');
+    });
+
+    it('should set start/end dateTime and null out date for timed events', async () => {
+      const startIso = '2026-03-20T10:00:00+00:00';
+      await definition.updateIssue!(
+        'event-1',
+        { start_dateTime: startIso, duration_ms: 3600000 },
+        cfg as any,
+        mockHttp as any,
+      );
+
+      expect(mockHttp.patch).toHaveBeenCalledTimes(1);
+      const [, body] = mockHttp.patch.mock.calls[0];
+      expect(body.start.dateTime).toBeDefined();
+      expect(body.start.date).toBeNull();
+      expect(body.end.dateTime).toBeDefined();
+      expect(body.end.date).toBeNull();
+      const endTs = new Date(body.end.dateTime).getTime();
+      const startTs = new Date(body.start.dateTime).getTime();
+      expect(endTs - startTs).toBe(3600000);
+    });
+
+    it('should set start/end date and null out dateTime for all-day events', async () => {
+      await definition.updateIssue!(
+        'event-1',
+        { start_date: '2026-03-20' },
+        cfg as any,
+        mockHttp as any,
+      );
+
+      expect(mockHttp.patch).toHaveBeenCalledTimes(1);
+      const [, body] = mockHttp.patch.mock.calls[0];
+      expect(body.start.date).toBe('2026-03-20');
+      expect(body.start.dateTime).toBeNull();
+      expect(body.end.date).toBe('2026-03-21');
+      expect(body.end.dateTime).toBeNull();
+    });
+
+    it('should fetch current event and update end when only duration changes', async () => {
+      mockHttp.get.mockResolvedValue({
+        start: { dateTime: '2026-03-20T10:00:00Z' },
+      });
+
+      await definition.updateIssue!(
+        'event-1',
+        { duration_ms: 7200000 },
+        cfg as any,
+        mockHttp as any,
+      );
+
+      expect(mockHttp.get).toHaveBeenCalledTimes(1);
+      expect(mockHttp.patch).toHaveBeenCalledTimes(1);
+      const [, body] = mockHttp.patch.mock.calls[0];
+      const endTs = new Date(body.end.dateTime).getTime();
+      expect(endTs).toBe(new Date('2026-03-20T10:00:00Z').getTime() + 7200000);
+    });
+
+    it('should not call patch when no recognized fields changed', async () => {
+      await definition.updateIssue!(
+        'event-1',
+        { unknown_field: 'value' },
+        cfg as any,
+        mockHttp as any,
+      );
+
+      expect(mockHttp.patch).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('createIssue', () => {
+    it('should create an all-day event with today/tomorrow dates', async () => {
+      const mockHttp = {
+        get: vi.fn(),
+        post: vi.fn().mockResolvedValue({
+          id: 'new-event-1',
+          summary: 'New Task',
+          status: 'confirmed',
+        }),
+        put: vi.fn(),
+        patch: vi.fn(),
+        delete: vi.fn(),
+      };
+
+      const result = await definition.createIssue!(
+        'New Task',
+        { calendarId: 'test-cal' } as any,
+        mockHttp as any,
+      );
+
+      expect(mockHttp.post).toHaveBeenCalledTimes(1);
+      const [, body] = mockHttp.post.mock.calls[0];
+      expect(body.summary).toBe('New Task');
+      expect(body.start.date).toBeDefined();
+      expect(body.end.date).toBeDefined();
+      expect(body.start.dateTime).toBeUndefined();
+      expect(result.issueId).toBe('test-cal::new-event-1');
+    });
+  });
+
+  describe('getNewIssuesForBacklog', () => {
+    const makeEvent = (over: Record<string, unknown>): Record<string, unknown> => ({
+      id: 'real-1',
+      summary: 'Real meeting',
+      status: 'confirmed',
+      start: { dateTime: '2026-05-14T15:00:00Z' },
+      end: { dateTime: '2026-05-14T16:00:00Z' },
+      ...over,
+    });
+
+    // #8171: with auto-time-block on, scheduling a task writes a mirror event to
+    // Google Calendar. When the read calendar overlaps the time-block calendar,
+    // that mirror is fetched back and must NOT surface as a separate agenda event
+    // (it would duplicate the local task that created it).
+    it('excludes SP auto-time-block mirror events tagged with spTaskId', async () => {
+      const mockHttp = {
+        get: vi.fn().mockResolvedValue({
+          items: [
+            makeEvent({}),
+            makeEvent({
+              id: 'spdeadbeef',
+              summary: 'My Scheduled Task',
+              extendedProperties: { private: { spTaskId: 'task-1' } },
+            }),
+          ],
+        }),
+        post: vi.fn(),
+        put: vi.fn(),
+        patch: vi.fn(),
+        delete: vi.fn(),
+      };
+
+      const results = await definition.getNewIssuesForBacklog!(
+        { readCalendarIds: ['primary'] } as any,
+        mockHttp as any,
+      );
+
+      expect(results.map((r) => r.title)).toEqual(['Real meeting']);
+      expect(results.some((r) => r.id.includes('spdeadbeef'))).toBe(false);
+    });
+
+    it('keeps regular events that have unrelated extendedProperties', async () => {
+      const mockHttp = {
+        get: vi.fn().mockResolvedValue({
+          items: [
+            makeEvent({
+              extendedProperties: { private: { someOtherApp: 'x' } },
+            }),
+          ],
+        }),
+        post: vi.fn(),
+        put: vi.fn(),
+        patch: vi.fn(),
+        delete: vi.fn(),
+      };
+
+      const results = await definition.getNewIssuesForBacklog!(
+        { readCalendarIds: ['primary'] } as any,
+        mockHttp as any,
+      );
+
+      expect(results).toHaveLength(1);
+    });
+
+    // #10190: Google applies `timeMin` (exclusive) to an event's END time. With
+    // `timeMin = now`, an event dropped out of the schedule/agenda on the first
+    // poll after it ended. The window must start at the user's LOCAL start of
+    // day (or 2h ago, if earlier), not at UTC midnight. Each case pins TZ for
+    // this process, so the result is the same on CI (UTC) and locally.
+    describe('query window start (timeMin)', () => {
+      afterEach(() => {
+        vi.unstubAllEnvs();
+      });
+
+      it.each([
+        {
+          label: 'UTC: 15:00-16:00 meeting, polled at 16:05',
+          tz: 'UTC',
+          offsetMin: 0,
+          now: '2026-05-14T16:05:00Z',
+          eventEnd: '2026-05-14T16:00:00Z',
+          expectedTimeMin: '2026-05-14T00:00:00.000Z',
+        },
+        {
+          // UTC midnight equals the event's end, so a UTC anchor drops it.
+          label: 'America/Los_Angeles: 16:00-17:00 meeting, polled at 17:01',
+          tz: 'America/Los_Angeles',
+          offsetMin: 420,
+          now: '2026-05-15T00:01:00Z',
+          eventEnd: '2026-05-15T00:00:00Z',
+          expectedTimeMin: '2026-05-14T07:00:00.000Z',
+        },
+        {
+          // UTC midnight falls between the event's end and the poll.
+          label: 'Australia/Brisbane: 08:00-09:00 meeting, polled at 10:01',
+          tz: 'Australia/Brisbane',
+          offsetMin: -600,
+          now: '2026-05-15T00:01:00Z',
+          eventEnd: '2026-05-14T23:00:00Z',
+          expectedTimeMin: '2026-05-14T14:00:00.000Z',
+        },
+        {
+          // Local midnight is after the event's end; the 2h lookback keeps it.
+          label: 'America/Los_Angeles: 22:30-23:30 meeting, polled at 00:30 next day',
+          tz: 'America/Los_Angeles',
+          offsetMin: 420,
+          now: '2026-05-15T07:30:00Z',
+          eventEnd: '2026-05-15T06:30:00Z',
+          expectedTimeMin: '2026-05-15T05:30:00.000Z',
+        },
+      ])(
+        'keeps an event that ended earlier: $label',
+        async ({ tz, offsetMin, now, eventEnd, expectedTimeMin }) => {
+          vi.stubEnv('TZ', tz);
+          vi.useFakeTimers();
+          vi.setSystemTime(new Date(now));
+          // Guard: fail loudly if the runtime ignored the TZ override.
+          expect(new Date(now).getTimezoneOffset()).toBe(offsetMin);
+          const mockHttp = {
+            get: vi.fn().mockResolvedValue({
+              items: [makeEvent({ end: { dateTime: eventEnd } })],
+            }),
+            post: vi.fn(),
+            put: vi.fn(),
+            patch: vi.fn(),
+            delete: vi.fn(),
+          };
+
+          await definition.getNewIssuesForBacklog!(
+            { readCalendarIds: ['primary'], syncRangeWeeks: '2' } as any,
+            mockHttp as any,
+          );
+
+          const params = mockHttp.get.mock.calls[0][1].params;
+          expect(params.timeMin).toBe(expectedTimeMin);
+          expect(new Date(params.timeMin).getTime()).toBeLessThan(
+            new Date(eventEnd).getTime(),
+          );
+        },
+      );
+    });
+  });
+
+  describe('timeBlock.upsertEvent', () => {
+    const cfg = { timeBlockCalendarId: 'cal-1' };
+    const eventData = {
+      title: 'My Task',
+      dueWithTime: new Date('2026-05-14T15:00:00Z').getTime(),
+      durationMs: 30 * 60 * 1000,
+      isDone: false,
+    };
+    let mockHttp: { get: any; post: any; put: any; patch: any; delete: any };
+
+    beforeEach(() => {
+      mockHttp = {
+        get: vi.fn(),
+        post: vi.fn().mockResolvedValue({}),
+        put: vi.fn(),
+        patch: vi.fn().mockResolvedValue({}),
+        delete: vi.fn(),
+      };
+    });
+
+    it('patches the existing event without an insert first (single write)', async () => {
+      await definition.timeBlock!.upsertEvent(
+        'task-1',
+        eventData,
+        cfg as any,
+        mockHttp as any,
+      );
+
+      expect(mockHttp.patch).toHaveBeenCalledTimes(1);
+      expect(mockHttp.post).not.toHaveBeenCalled();
+      const [url, body] = mockHttp.patch.mock.calls[0];
+      expect(url).toContain('/calendars/cal-1/events/');
+      expect(body.summary).toBe('My Task');
+      expect(body.start.dateTime).toBeDefined();
+      expect(body.end.dateTime).toBeDefined();
+    });
+
+    it('falls back to insert with the full body when the event does not exist (patch 404)', async () => {
+      mockHttp.patch.mockRejectedValueOnce({ status: 404 });
+
+      await definition.timeBlock!.upsertEvent(
+        'task-1',
+        eventData,
+        cfg as any,
+        mockHttp as any,
+      );
+
+      expect(mockHttp.patch).toHaveBeenCalledTimes(1);
+      expect(mockHttp.post).toHaveBeenCalledTimes(1);
+      const [postUrl, postBody] = mockHttp.post.mock.calls[0];
+      expect(postUrl).toContain('/calendars/cal-1/events');
+      expect(postBody.id).toBeDefined();
+      expect(postBody.extendedProperties.private.spTaskId).toBe('task-1');
+    });
+
+    it('recovers when a concurrent create wins the race (insert returns 409)', async () => {
+      mockHttp.patch.mockRejectedValueOnce({ status: 404 }).mockResolvedValueOnce({});
+      mockHttp.post.mockRejectedValueOnce({ status: 409 });
+
+      await definition.timeBlock!.upsertEvent(
+        'task-1',
+        eventData,
+        cfg as any,
+        mockHttp as any,
+      );
+
+      // patch (404 not-found) -> post (409 lost race) -> patch (now exists) ok
+      expect(mockHttp.post).toHaveBeenCalledTimes(1);
+      expect(mockHttp.patch).toHaveBeenCalledTimes(2);
+    });
+
+    it('retries on a 403 rateLimitExceeded and then succeeds', async () => {
+      vi.useFakeTimers();
+      const rateLimitErr = {
+        status: 403,
+        error: {
+          error: {
+            code: 403,
+            message: 'Rate Limit Exceeded',
+            errors: [
+              {
+                domain: 'usageLimits',
+                reason: 'rateLimitExceeded',
+                message: 'Rate Limit Exceeded',
+              },
+            ],
+          },
+        },
+      };
+      mockHttp.patch.mockRejectedValueOnce(rateLimitErr).mockResolvedValueOnce({});
+
+      const p = definition.timeBlock!.upsertEvent(
+        'task-1',
+        eventData,
+        cfg as any,
+        mockHttp as any,
+      );
+      await vi.runAllTimersAsync();
+      await p;
+
+      expect(mockHttp.patch).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not retry a non-rate-limit 403 (forbiddenForNonOrganizer)', async () => {
+      const forbidden = {
+        status: 403,
+        error: { error: { code: 403, errors: [{ reason: 'forbiddenForNonOrganizer' }] } },
+      };
+      mockHttp.patch.mockRejectedValue(forbidden);
+
+      await expect(
+        definition.timeBlock!.upsertEvent(
+          'task-1',
+          eventData,
+          cfg as any,
+          mockHttp as any,
+        ),
+      ).rejects.toBeDefined();
+      expect(mockHttp.patch).toHaveBeenCalledTimes(1);
+      expect(mockHttp.post).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('timeBlock.deleteEvent', () => {
+    const cfg = { timeBlockCalendarId: 'cal-1' };
+    let mockHttp: { get: any; post: any; put: any; patch: any; delete: any };
+
+    beforeEach(() => {
+      mockHttp = {
+        get: vi.fn(),
+        post: vi.fn(),
+        put: vi.fn(),
+        patch: vi.fn(),
+        delete: vi.fn().mockResolvedValue({}),
+      };
+    });
+
+    it('swallows a 404 (event already gone)', async () => {
+      mockHttp.delete.mockRejectedValue({ status: 404 });
+
+      await expect(
+        definition.timeBlock!.deleteEvent('task-1', cfg as any, mockHttp as any),
+      ).resolves.toBeUndefined();
+    });
+
+    it('retries on a rate-limit error and then succeeds', async () => {
+      vi.useFakeTimers();
+      mockHttp.delete.mockRejectedValueOnce({ status: 429 }).mockResolvedValueOnce({});
+
+      const p = definition.timeBlock!.deleteEvent('task-1', cfg as any, mockHttp as any);
+      await vi.runAllTimersAsync();
+      await p;
+
+      expect(mockHttp.delete).toHaveBeenCalledTimes(2);
+    });
+  });
+});

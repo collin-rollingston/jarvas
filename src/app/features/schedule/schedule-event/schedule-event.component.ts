@@ -1,0 +1,682 @@
+import {
+  ChangeDetectionStrategy,
+  Component,
+  AfterViewInit,
+  computed,
+  ElementRef,
+  inject,
+  input,
+  NgZone,
+  OnDestroy,
+  signal,
+  viewChild,
+  viewChildren,
+} from '@angular/core';
+import { hasLinkHints, RenderLinksPipe } from '../../../ui/pipes/render-links.pipe';
+import { CdkDrag } from '@angular/cdk/drag-drop';
+import { ScheduleEvent, ScheduleFromCalendarEvent } from '../schedule.model';
+import { MatIcon } from '@angular/material/icon';
+import { MatMenu, MatMenuItem, MatMenuTrigger } from '@angular/material/menu';
+import { MatTooltip } from '@angular/material/tooltip';
+import { delay, first } from 'rxjs/operators';
+import { Store } from '@ngrx/store';
+import { selectProjectById } from '../../project/store/project.selectors';
+import { getClockStringFromHours } from '../../../util/get-clock-string-from-hours';
+import {
+  SCHEDULE_TASK_MIN_DURATION_IN_MS,
+  SVEType,
+  T_ID_PREFIX,
+} from '../schedule.const';
+import { isDraggableSE } from '../map-schedule-data/is-schedule-types-type';
+import { MatDialog } from '@angular/material/dialog';
+import { DialogEditTaskRepeatCfgComponent } from '../../task-repeat-cfg/dialog-edit-task-repeat-cfg/dialog-edit-task-repeat-cfg.component';
+import { TaskRepeatCfg } from '../../task-repeat-cfg/task-repeat-cfg.model';
+import { TranslateModule, TranslateService } from '@ngx-translate/core';
+import { T } from '../../../t.const';
+import { TaskCopy } from '../../tasks/task.model';
+import { selectTaskByIdWithSubTaskData } from '../../tasks/store/task.selectors';
+import { TaskSharedActions } from '../../../root-store/meta/task-shared.actions';
+import { TaskService } from '../../tasks/task.service';
+import { DialogTimeEstimateComponent } from '../../tasks/dialog-time-estimate/dialog-time-estimate.component';
+import { TaskContextMenuComponent } from '../../tasks/task-context-menu/task-context-menu.component';
+import { DateTimeFormatService } from '../../../core/date-time-format/date-time-format.service';
+import { FH } from '../schedule.const';
+import { CalendarEventActionsService } from '../../calendar-integration/calendar-event-actions.service';
+import { isTouchActive } from '../../../util/input-intent';
+import { isLinkTarget } from '../../../util/dom-element';
+
+const FIVE_MINUTES_IN_MS = 5 * 60 * 1000;
+
+@Component({
+  selector: 'schedule-event',
+  imports: [
+    MatIcon,
+    TranslateModule,
+    TaskContextMenuComponent,
+    RenderLinksPipe,
+    MatMenu,
+    MatMenuItem,
+    MatMenuTrigger,
+    MatTooltip,
+  ],
+  templateUrl: './schedule-event.component.html',
+  styleUrl: './schedule-event.component.scss',
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  /* eslint-disable @typescript-eslint/naming-convention */
+  host: {
+    '[id]': 'elementId()',
+    '[title]': 'hoverTitle()',
+    '[class]': 'cssClass()',
+    '[style]': 'style()',
+    '[style.--title-line-clamp]': '_titleLineClamp()',
+    '[style.--project-color]': 'calEventColor() || projectColor()',
+    '[style.height]': '_resizeHeight()',
+    '(click)': 'clickHandler($event)',
+    '(contextmenu)': 'onContextMenu($event)',
+  },
+  /* eslint-enable @typescript-eslint/naming-convention */
+  hostDirectives: [
+    {
+      directive: CdkDrag,
+      inputs: ['cdkDragData', 'cdkDragDisabled', 'cdkDragStartDelay'],
+      outputs: ['cdkDragStarted', 'cdkDragReleased', 'cdkDragEnded', 'cdkDragMoved'],
+    },
+  ],
+})
+export class ScheduleEventComponent implements AfterViewInit, OnDestroy {
+  private _store = inject(Store);
+  private _elRef = inject(ElementRef);
+  private _matDialog = inject(MatDialog);
+  private _dateTimeFormatService = inject(DateTimeFormatService);
+  private _translateService = inject(TranslateService);
+  private _taskService = inject(TaskService);
+  private _calEventActions = inject(CalendarEventActionsService);
+  private _ngZone = inject(NgZone);
+  readonly titleHasLinks = computed(() => {
+    const t = this.title();
+    return !!t && hasLinkHints(t);
+  });
+
+  readonly hasCalendarEventUrl = computed<boolean>(() => {
+    const evt = this.se();
+    if (evt.type !== SVEType.CalendarEvent) return false;
+    return this._calEventActions.hasEventUrl(evt.data as ScheduleFromCalendarEvent);
+  });
+
+  readonly T: typeof T = T;
+  readonly isDragPreview = input<boolean>(false);
+  readonly isMonthView = input<boolean>(false);
+  readonly isResizeDisabled = input<boolean>(false);
+  readonly event = input.required<ScheduleEvent>();
+
+  readonly taskContextMenu = viewChild('taskContextMenu', {
+    read: TaskContextMenuComponent,
+  });
+
+  readonly calMenuTrigger = viewChild('calMenuTrigger', { read: MatMenuTrigger });
+  private readonly _calMenuItems = viewChildren(MatMenuItem);
+  private readonly _titleEl = viewChild<ElementRef<HTMLElement>>('titleEl');
+
+  protected readonly SVEType = SVEType;
+  private _isBeingSubmitted = false;
+  private _resizeObserver?: ResizeObserver;
+  private _measureRafId?: number;
+  readonly _titleLineClamp = signal(1);
+
+  // Computed signals for derived state
+  readonly se = computed(() => this.event());
+  readonly task = computed<TaskCopy | undefined>(() => {
+    const evt = this.se();
+    if (
+      evt.type === SVEType.Task ||
+      evt.type === SVEType.SplitTask ||
+      evt.type === SVEType.TaskPlannedForDay ||
+      evt.type === SVEType.SplitTaskPlannedForDay ||
+      evt.type === SVEType.ScheduledTask ||
+      // continued segments carry the same task, so selecting and the context
+      // menu work on them too; dragging stays disabled via isDraggableSE()
+      // since only the head segment marks where the task starts
+      evt.type === SVEType.SplitTaskContinued ||
+      evt.type === SVEType.SplitTaskContinuedLast
+    ) {
+      return evt.data as TaskCopy;
+    }
+    return undefined;
+  });
+
+  readonly title = computed(() => {
+    const evt = this.se();
+    return (
+      (evt as any)?.data?.title ||
+      (evt.type === SVEType.LunchBreak ? 'Lunch Break' : 'TITLE')
+    );
+  });
+
+  readonly scheduledClockStr = computed(() => {
+    const evt = this.se();
+    const is12Hour = !this._dateTimeFormatService.is24HourFormat();
+    return getClockStringFromHours(
+      is12Hour && evt.startHours > 12 ? evt.startHours - 12 : evt.startHours,
+    );
+  });
+
+  readonly beyondBudgetTooltip = this._translateService.instant(
+    T.F.SCHEDULE.EXCESS_TASK_TOOLTIP,
+  );
+
+  readonly hoverTitle = computed(() => {
+    const evt = this.se();
+    const is12Hour = !this._dateTimeFormatService.is24HourFormat();
+    const startClockStr = getClockStringFromHours(
+      is12Hour && evt.startHours > 12 ? evt.startHours - 12 : evt.startHours,
+    );
+    const endHours = evt.startHours + evt.timeLeftInHours;
+    const endClockStr = getClockStringFromHours(
+      is12Hour && endHours > 12 ? endHours - 12 : endHours,
+    );
+    const titleStr = this.title();
+    const t = this.task();
+
+    let result = startClockStr + ' - ' + endClockStr + '  ' + titleStr;
+    if (
+      t &&
+      (evt.type === SVEType.Task || evt.type === SVEType.TaskPlannedForDay) &&
+      t.timeEstimate === SCHEDULE_TASK_MIN_DURATION_IN_MS &&
+      t.timeSpent === 0
+    ) {
+      result += '  !!!!! ESTIMATE FOR SCHEDULE WAS SET TO 10MIN !!!!!';
+    }
+    if (evt.isBeyondBudget) {
+      result += `  ${this.beyondBudgetTooltip}`;
+    }
+    return result;
+  });
+
+  readonly isSplitStart = computed(() => {
+    const evt = this.se();
+    return (
+      evt.type === SVEType.SplitTask ||
+      evt.type === SVEType.RepeatProjectionSplit ||
+      evt.type === SVEType.SplitTaskPlannedForDay
+    );
+  });
+
+  readonly isSplitContinued = computed(() => {
+    const evt = this.se();
+    return (
+      evt.type === SVEType.SplitTaskContinued ||
+      evt.type === SVEType.RepeatProjectionSplitContinued
+    );
+  });
+
+  readonly isSplitContinuedLast = computed(() => {
+    const evt = this.se();
+    return (
+      evt.type === SVEType.SplitTaskContinuedLast ||
+      evt.type === SVEType.RepeatProjectionSplitContinuedLast
+    );
+  });
+
+  readonly cssClass = computed(() => {
+    const evt = this.se();
+    let addClass = '';
+    if (this.isSplitContinued()) {
+      addClass = 'split-continued';
+    } else if (this.isSplitContinuedLast()) {
+      addClass = 'split-continued-last';
+    } else if (this.isSplitStart()) {
+      addClass = 'split-start';
+    }
+
+    if (evt.timeLeftInHours <= 1 / 4) {
+      addClass += ' very-short-event';
+    }
+
+    if (this._isResizing()) {
+      addClass += ' is-resizing';
+    }
+
+    if (this.isReferenceCalendar()) {
+      addClass += ' is-reference-calendar';
+    }
+
+    if (evt.isBeyondBudget) {
+      addClass += ' is-beyond-budget';
+    }
+
+    return evt.type + '  ' + addClass;
+  });
+
+  readonly style = computed(() => {
+    const { overlap, style } = this.se();
+    return (
+      (!this.isMonthView() && !this.isDragPreview() && overlap
+        ? `margin-left: calc(${overlap.offset * (100 / overlap.count)}% + var(--margin-left)); ` +
+          `width: calc(${100 / overlap.count}% - var(--margin-left) - var(--margin-right)); ` +
+          // Content inside the event element can spill out when the width is limited enough
+          'overflow: hidden !important; '
+        : '') + style
+    );
+  });
+
+  ngAfterViewInit(): void {
+    const hostEl = this._elRef.nativeElement as HTMLElement;
+    const titleEl = this._titleEl()?.nativeElement;
+    if (!titleEl) {
+      return;
+    }
+
+    this._ngZone.runOutsideAngular(() => {
+      this._resizeObserver = new ResizeObserver(() =>
+        this._scheduleTitleLineClampUpdate(),
+      );
+      this._resizeObserver.observe(hostEl);
+      this._scheduleTitleLineClampUpdate();
+    });
+  }
+
+  ngOnDestroy(): void {
+    if (this._measureRafId !== undefined) {
+      cancelAnimationFrame(this._measureRafId);
+    }
+    this._resizeObserver?.disconnect();
+    this._endResizeGesture?.();
+  }
+
+  private _scheduleTitleLineClampUpdate(): void {
+    if (this._measureRafId !== undefined) {
+      return;
+    }
+
+    this._measureRafId = requestAnimationFrame(() => {
+      this._measureRafId = undefined;
+      this._updateTitleLineClamp();
+    });
+  }
+
+  private _updateTitleLineClamp(): void {
+    const hostEl = this._elRef.nativeElement as HTMLElement;
+    const titleEl = this._titleEl()?.nativeElement;
+    if (!titleEl) {
+      return;
+    }
+
+    const styles = getComputedStyle(titleEl);
+    const lineHeight = parseFloat(styles.lineHeight);
+    const paddingTop = parseFloat(styles.paddingTop);
+    const paddingBottom = parseFloat(styles.paddingBottom);
+    const availableTitleHeight = hostEl.clientHeight - paddingTop - paddingBottom;
+    const lineClamp = Math.max(1, Math.floor(availableTitleHeight / lineHeight));
+
+    if (Number.isFinite(lineClamp) && lineClamp !== this._titleLineClamp()) {
+      this._ngZone.run(() => this._titleLineClamp.set(lineClamp));
+    }
+  }
+
+  private readonly _projectId = computed(() => this.task()?.projectId || null);
+
+  readonly projectColor = computed(() => {
+    const projectId = this._projectId();
+    if (!projectId) return null;
+    // Use store.select and convert to immediate value
+    let color: string | null = null;
+    this._store
+      .select(selectProjectById, { id: projectId })
+      .pipe(first())
+      .subscribe((project) => {
+        color = project?.theme?.primary || null;
+      });
+    return color;
+  });
+
+  readonly calEventColor = computed(() => {
+    const evt = this.se();
+    if (evt.type !== SVEType.CalendarEvent) return null;
+    return (evt.data as ScheduleFromCalendarEvent).color || null;
+  });
+
+  readonly elementId = computed(() => {
+    const evt = this.se();
+    return isDraggableSE(evt) ? T_ID_PREFIX + (evt.data as any).id : '';
+  });
+
+  readonly icoType = computed<
+    | 'REPEAT'
+    | 'FLOW'
+    | 'SCHEDULED_TASK'
+    | 'PLANNED_FOR_DAY'
+    | 'CAL_PROJECTION'
+    | 'SPLIT_CONTINUE'
+    | 'LUNCH_BREAK'
+  >(() => {
+    const evt = this.se();
+    switch (evt.type) {
+      case SVEType.ScheduledRepeatProjection:
+      case SVEType.RepeatProjection:
+      case SVEType.RepeatProjectionSplit:
+        return 'REPEAT';
+      case SVEType.TaskPlannedForDay:
+      case SVEType.SplitTaskPlannedForDay:
+        return 'PLANNED_FOR_DAY';
+      case SVEType.Task:
+      case SVEType.SplitTask:
+        return 'FLOW';
+      case SVEType.CalendarEvent:
+        return 'CAL_PROJECTION';
+      case SVEType.ScheduledTask:
+        return 'SCHEDULED_TASK';
+      case SVEType.LunchBreak:
+        return 'LUNCH_BREAK';
+    }
+    return 'SPLIT_CONTINUE';
+  });
+
+  async clickHandler(event: MouseEvent): Promise<void> {
+    if (isLinkTarget(event.target)) {
+      return; // Let link clicks propagate without opening the schedule event panel
+    }
+    // Prevent opening dialog when resizing or just finished resizing
+    if (this._isResizing() || this._justFinishedResizing()) {
+      return;
+    }
+
+    const t = this.task();
+    const evt = this.se();
+
+    if (t) {
+      // Use bottom panel on mobile, sidebar on desktop
+      this._taskService.setSelectedId(t.id);
+    } else if (
+      evt.type === SVEType.RepeatProjection ||
+      evt.type === SVEType.RepeatProjectionSplit ||
+      evt.type === SVEType.ScheduledRepeatProjection ||
+      evt.type === SVEType.RepeatProjectionSplitContinued ||
+      evt.type === SVEType.RepeatProjectionSplitContinuedLast
+    ) {
+      const repeatCfg: TaskRepeatCfg = evt.data as TaskRepeatCfg;
+      this._matDialog.open(DialogEditTaskRepeatCfgComponent, {
+        data: {
+          repeatCfg,
+          targetDate: evt.sourceOccurrenceDate ?? evt.plannedForDay,
+        },
+      });
+    } else if (evt.type === SVEType.CalendarEvent) {
+      if (this._calMenuItems().length) {
+        this.calMenuTrigger()?.openMenu();
+      }
+    }
+  }
+
+  readonly isCalendarEventFromPlugin = computed(() => {
+    const evt = this.se();
+    if (evt.type !== SVEType.CalendarEvent) return false;
+    return this._calEventActions.isPluginEvent(evt.data as ScheduleFromCalendarEvent);
+  });
+
+  readonly isReferenceCalendar = computed(() => {
+    const evt = this.se();
+    if (evt.type !== SVEType.CalendarEvent) return false;
+    return !!(evt.data as ScheduleFromCalendarEvent).isReferenceCalendar;
+  });
+
+  readonly canRescheduleCalendarEvent = computed(() => {
+    const evt = this.se();
+    if (evt.type !== SVEType.CalendarEvent) return false;
+    return this._calEventActions.canMoveEvent(evt.data as ScheduleFromCalendarEvent);
+  });
+
+  async openCalendarEventLink(): Promise<void> {
+    const evt = this.se();
+    if (evt.type !== SVEType.CalendarEvent) return;
+    await this._calEventActions.openEventLink(evt.data as ScheduleFromCalendarEvent);
+  }
+
+  createCalendarEventAsTask(): void {
+    const evt = this.se();
+    if (evt.type !== SVEType.CalendarEvent || this._isBeingSubmitted) return;
+    this._isBeingSubmitted = true;
+    const data = this.se().data as ScheduleFromCalendarEvent;
+    this._calEventActions.createAsTask(data);
+  }
+
+  async rescheduleCalendarEvent(): Promise<void> {
+    const evt = this.se();
+    if (evt.type !== SVEType.CalendarEvent) return;
+    await this._calEventActions.reschedule(evt.data as ScheduleFromCalendarEvent);
+  }
+
+  async deleteCalendarEvent(): Promise<void> {
+    const evt = this.se();
+    if (evt.type !== SVEType.CalendarEvent) return;
+    await this._calEventActions.deleteEvent(evt.data as ScheduleFromCalendarEvent);
+  }
+
+  hideCalendarEvent(): void {
+    const evt = this.se();
+    if (evt.type !== SVEType.CalendarEvent) return;
+    this._calEventActions.hideForever(evt.data as ScheduleFromCalendarEvent);
+  }
+
+  onContextMenu(ev: MouseEvent | TouchEvent): void {
+    const t = this.task();
+    if (t) {
+      this.openContextMenu(ev);
+    }
+  }
+
+  openContextMenu(event: TouchEvent | MouseEvent): void {
+    this.taskContextMenu()?.open(event);
+  }
+
+  deleteTask(): void {
+    const t = this.task();
+    if (!t) return;
+
+    this._store
+      .select(selectTaskByIdWithSubTaskData, { id: t.id })
+      .pipe(
+        first(),
+        // NOTE without the delay selectTaskByIdWithSubTaskData triggers twice for unknown reasons
+        delay(50),
+      )
+      .subscribe((task) => {
+        if (task) {
+          this._taskService.remove(task);
+        }
+      });
+  }
+
+  estimateTime(): void {
+    const t = this.task();
+    if (!t) return;
+
+    this._matDialog.open(DialogTimeEstimateComponent, {
+      data: { task: t, isFocusEstimateOnMousePrimaryDevice: true },
+    });
+  }
+
+  markAsDone(): void {
+    const t = this.task();
+    if (!t) return;
+
+    this._store.dispatch(
+      TaskSharedActions.updateTask({
+        task: {
+          id: t.id,
+          changes: {
+            isDone: true,
+          },
+        },
+      }),
+    );
+  }
+
+  markAsUnDone(): void {
+    const t = this.task();
+    if (!t) return;
+
+    this._store.dispatch(
+      TaskSharedActions.updateTask({
+        task: {
+          id: t.id,
+          changes: {
+            isDone: false,
+          },
+        },
+      }),
+    );
+  }
+
+  // Resize functionality
+  // --------------------
+  private readonly _isResizing = signal(false);
+  private readonly _justFinishedResizing = signal(false);
+  readonly _resizeHeight = signal('');
+  private _startY = 0;
+  private _startHeight = 0;
+  private _heightDelta = 0;
+  private _endResizeGesture: (() => void) | null = null;
+
+  isResizable(): boolean {
+    if (this.isResizeDisabled() || this.isDragPreview() || this.isMonthView()) {
+      return false;
+    }
+
+    // Not on touch. The handle is a 12px band along the bottom edge of every event —
+    // about 2mm on a phone, against a finger contact patch of 8-10mm. It cannot be hit
+    // on purpose, only by accident, which on a densely filled schedule turned every
+    // scroll swipe into a duration change (#9675). Estimates stay editable by tapping
+    // the event and using the task detail panel.
+    if (isTouchActive()) {
+      return false;
+    }
+
+    const t = this.task();
+    const evt = this.se();
+    // Allow resizing for all task types with a time estimate.
+    // NOT for continued segments: a split task already has a handle on its head,
+    // and SplitTaskContinuedLast is not reliably the final segment — every day
+    // slice of a multi-day scheduled task carries that type (see
+    // create-view-entries-for-block.ts), so the middle ones cannot grow at all.
+    return (
+      !!t &&
+      (evt.type === SVEType.ScheduledTask ||
+        evt.type === SVEType.Task ||
+        evt.type === SVEType.TaskPlannedForDay ||
+        evt.type === SVEType.SplitTaskPlannedForDay) &&
+      t.timeEstimate > 0
+    );
+  }
+
+  onResizeStart(event: MouseEvent): void {
+    if (!this.isResizable()) return;
+
+    // Keep the gesture away from the host's cdkDrag: the handle resizes, the body moves.
+    event.stopPropagation();
+    event.preventDefault();
+
+    this._endResizeGesture?.();
+    this._startY = event.clientY;
+    this._startHeight = this._elRef.nativeElement.offsetHeight;
+    this._heightDelta = 0;
+
+    const moveHandler = (e: MouseEvent): void => this._onResizeMove(e);
+    const endHandler = (): void => this._onResizeEnd();
+    document.addEventListener('mousemove', moveHandler);
+    document.addEventListener('mouseup', endHandler);
+    this._endResizeGesture = () => {
+      document.removeEventListener('mousemove', moveHandler);
+      document.removeEventListener('mouseup', endHandler);
+      this._endResizeGesture = null;
+      this._isResizing.set(false);
+    };
+
+    this._isResizing.set(true);
+  }
+
+  private _onResizeMove(event: MouseEvent): void {
+    if (!this._isResizing()) return;
+
+    event.preventDefault();
+    const deltaY = event.clientY - this._startY;
+
+    // Calculate new height based on grid row height for snap-to-grid behavior
+    const gridContainer = this._elRef.nativeElement.closest(
+      '.grid-container',
+    ) as HTMLElement | null;
+    if (gridContainer) {
+      const gridHeight = gridContainer.getBoundingClientRect().height;
+      const rowHeight = gridHeight / (24 * FH);
+      const rowsChanged = Math.round(deltaY / rowHeight);
+      const snappedDelta = rowsChanged * rowHeight;
+      const newHeight = Math.max(rowHeight, this._startHeight + snappedDelta);
+
+      // Update the element height temporarily for visual feedback
+      this._heightDelta = newHeight - this._startHeight;
+      this._resizeHeight.set(newHeight + 'px');
+    } else {
+      // Fallback to original behavior
+      const newHeight = Math.max(20, this._startHeight + deltaY);
+      this._heightDelta = newHeight - this._startHeight;
+      this._resizeHeight.set(newHeight + 'px');
+    }
+  }
+
+  private _onResizeEnd(): void {
+    if (!this._isResizing()) return;
+
+    this._endResizeGesture?.();
+
+    // Set cooldown flag to prevent immediate click events
+    this._justFinishedResizing.set(true);
+    setTimeout(() => {
+      this._justFinishedResizing.set(false);
+    }, 200); // 200ms cooldown
+
+    // Convert height change to time change (based on grid row height)
+    // Each row represents a time slice (FH rows per hour)
+    const timeChangeInMs = this._calculateTimeFromHeightDelta(this._heightDelta);
+
+    const t = this.task();
+    if (t && Math.abs(timeChangeInMs) > 30000) {
+      // Only update if change is more than 30 seconds (to be more responsive)
+      const rawEstimate = t.timeEstimate + timeChangeInMs;
+      const roundedEstimate = Math.max(
+        FIVE_MINUTES_IN_MS,
+        Math.round(rawEstimate / FIVE_MINUTES_IN_MS) * FIVE_MINUTES_IN_MS,
+      );
+
+      if (roundedEstimate !== t.timeEstimate) {
+        this._store.dispatch(
+          TaskSharedActions.updateTask({
+            task: {
+              id: t.id,
+              changes: {
+                timeEstimate: roundedEstimate,
+              },
+            },
+          }),
+        );
+      }
+    }
+
+    // Reset element height to let CSS handle it
+    this._resizeHeight.set('');
+  }
+
+  private _calculateTimeFromHeightDelta(heightDelta: number): number {
+    // Get the grid container to calculate row height
+    const gridContainer = this._elRef.nativeElement.closest(
+      '.grid-container',
+    ) as HTMLElement | null;
+    if (!gridContainer) return 0;
+
+    const gridHeight = gridContainer.getBoundingClientRect().height;
+    const rowHeight = gridHeight / (24 * FH); // Total rows = 24 hours * FH rows per hour
+    const rowsChanged = heightDelta / rowHeight;
+    const hoursChanged = rowsChanged / FH;
+
+    // Convert to milliseconds
+    return hoursChanged * 60 * 60 * 1000;
+  }
+}

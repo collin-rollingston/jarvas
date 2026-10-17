@@ -1,0 +1,42 @@
+<mat-form-field>
+  <mat-label>{{ label() }}</mat-label>
+  <mat-chip-grid #chipListElRef>
+    @for (modelItem of modelItems; track modelItem.id) {
+      <mat-chip-row
+        (removed)="remove(modelItem.id)"
+        [removable]="true"
+      >
+        <tag [tag]="modelItem"></tag>
+
+        <mat-icon
+          [matTooltip]="T.G.REMOVE | translate"
+          matChipRemove
+          >cancel
+        </mat-icon>
+      </mat-chip-row>
+    }
+    <input
+      #inputElRef
+      (matChipInputTokenEnd)="add($event)"
+      [formControl]="inputCtrl"
+      [matAutocomplete]="autoElRef"
+      [matChipInputAddOnBlur]="true"
+      [matChipInputFor]="chipListElRef"
+      [matChipInputSeparatorKeyCodes]="separatorKeysCodes"
+      (keydown)="onInputKeydown($event)"
+      spChipAutocompleteKeys
+      (suggestionAccepted)="acceptSuggestion($event)"
+      (textCommitted)="commitText($event)"
+    />
+  </mat-chip-grid>
+  <mat-autocomplete
+    #autoElRef="matAutocomplete"
+    (optionSelected)="selected($event)"
+  >
+    @for (suggestion of filteredSuggestions | async; track suggestion.id) {
+      <mat-option [value]="suggestion.id">
+        <tag [tag]="suggestion"></tag>
+      </mat-option>
+    }
+  </mat-autocomplete>
+</mat-form-field>

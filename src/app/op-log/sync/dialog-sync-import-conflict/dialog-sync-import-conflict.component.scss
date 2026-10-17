@@ -1,0 +1,105 @@
+@use '../../../../styles/_globals.scss' as *;
+
+h1 {
+  display: flex;
+  align-items: center;
+  gap: var(--s);
+}
+
+.warning-icon {
+  color: var(--text-color-muted);
+}
+
+.message {
+  margin-bottom: var(--s2);
+  line-height: 1.5;
+}
+
+.import-info {
+  // Ink-on-surface overlay, not a surface token: the base light theme collapses
+  // --surface-2/-3/-4 to #fff, so --bg-lighter on a dialog card renders as
+  // nothing there (themes with a real ladder, e.g. plainspace, are unaffected).
+  background: var(--state-hover);
+  border-radius: 8px;
+  padding: 12px var(--s2);
+  margin-bottom: var(--s);
+}
+
+.info-row {
+  display: flex;
+  justify-content: space-between;
+  padding: var(--s-half) 0;
+
+  .label {
+    color: var(--text-color-muted);
+  }
+
+  .value {
+    font-weight: 500;
+
+    &.highlight {
+      color: var(--palette-warn-500);
+      font-weight: 700;
+    }
+  }
+}
+
+.reason {
+  font-size: 13px;
+  color: var(--text-color-muted);
+  margin-bottom: 12px;
+}
+
+.recommendation {
+  font-weight: 500;
+  margin-bottom: var(--s2);
+}
+
+.first-sync-warning {
+  display: flex;
+  align-items: center;
+  gap: var(--s-half);
+  font-weight: 500;
+  color: var(--palette-warn-500);
+  margin-bottom: var(--s2);
+
+  .warning-icon {
+    color: var(--palette-warn-500);
+    flex-shrink: 0;
+  }
+}
+
+.wrap-buttons {
+  display: flex;
+  gap: var(--s);
+  flex-wrap: wrap;
+}
+
+// Mobile responsiveness
+@include mq(xs, max) {
+  .wrap-buttons {
+    width: 100%;
+    flex-direction: column;
+
+    button {
+      width: 100%;
+    }
+  }
+}
+
+:host ::ng-deep {
+  .mat-mdc-dialog-container {
+    @include mq(xs, max) {
+      max-width: calc(100vw - 32px);
+      margin: var(--s2);
+    }
+  }
+
+  .mat-mdc-dialog-content {
+    @include mq(xs, max) {
+      padding: 0 var(--s2);
+      max-width: 100%;
+      overflow-x: hidden;
+    }
+  }
+}

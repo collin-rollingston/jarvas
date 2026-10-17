@@ -1,0 +1,39 @@
+@use '../../../../styles/_globals.scss' as *;
+
+:host {
+  //@include grabCursor();
+  display: flex;
+  align-items: center;
+  padding: 0;
+  border-radius: var(--task-border-radius);
+
+  background: var(--task-c-bg);
+  // Flat row matching the task list: hairline separators, no resting shadow.
+  // Routed through the same tokens so boxed themes get their box back.
+  box-shadow: none;
+  border: var(--task-border);
+  border-top: var(--task-row-edge);
+  color: var(--text-color);
+
+  &:last-of-type {
+    border-bottom: var(--task-row-edge);
+  }
+  //border-color: var(--extra-border-color);
+
+  &.isDone {
+    opacity: 0.7;
+
+    .title {
+      text-decoration: line-through;
+    }
+  }
+}
+
+.title {
+  flex-grow: 1;
+  padding: var(--s-half) 0;
+}
+
+.open-issue {
+  opacity: 0.6;
+}

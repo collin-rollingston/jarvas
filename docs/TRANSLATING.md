@@ -1,0 +1,88 @@
+# Translation Guide
+
+Super Productivity uses JSON files for translations, located in `src/assets/i18n/`.
+
+## How to Contribute
+
+> **Important:** When adding or changing translation keys, **only edit `en.json` directly**. Other locale files are managed via the i18n script workflow described in [i18n-script-usage.md](i18n-script-usage.md). Editing other locale files by hand may cause your changes to be overwritten.
+
+> **Exception – placeholders:** when an English string gains a placeholder such as `{{count}}`, every other locale that already translates that string must be updated by hand to interpolate the same placeholder. `npm run int:test` (`tools/test-lng-files.js`) fails when a locale drops a placeholder that `en.json` declares, and the i18n script only fills in keys that are missing entirely.
+
+1. Add or update translation keys in `src/assets/i18n/en.json`
+2. Run the i18n script to propagate changes to other locales (see [i18n-script-usage.md](i18n-script-usage.md))
+3. Submit a pull request
+
+## Using translations in code
+
+[T](../src/app/t.const.ts) contains translation keys, not display text. After
+editing [en.json](../src/assets/i18n/en.json), run `npm run int` to regenerate T;
+this command does not propagate locale files. Use the workflow above for those.
+
+Translate both template text and attributes (ensure the component exposes T and
+imports the translate pipe as neighboring components do):
+
+```html
+<button [title]="T.G.SAVE | translate">{{ T.G.SAVE | translate }}</button>
+```
+
+In TypeScript, use `TranslateService` where an API expects display text. APIs
+that already translate keys, such as [SnackService](../src/app/core/snack/snack.service.ts),
+should receive the key directly; check the receiving API before replacing a string.
+Reuse existing keys and their nested naming structure before adding new ones.
+
+Run `npm run int:test` for locale/placeholder consistency and the applicable
+[code checks](../AGENTS.md#core-commands). These checks do not prove that text is
+translated on screen; verify the changed UI as well.
+
+## Important Notes
+
+### Fallback Language
+
+**English (`en.json`) is the fallback language.** If a translation is missing or empty, the app automatically displays the English text.
+
+### Suffixes for Inflected/Dative Forms (`_NTH`)
+
+Some keys have duplicates with an `_NTH` suffix (e.g., `ORD_FIRST` vs `ORD_FIRST_NTH`).
+
+- `ORD_FIRST` is used as a standalone option in the quick-setting menu (e.g., "first").
+- `ORD_FIRST_NTH` is used inside full sentences (e.g., dative/inflected form in German or other inflected languages like "Monthly on the first Monday").
+- In languages without inflection (like English), these values are identical.
+
+### Empty Values Are Intentional
+
+When you see empty strings (`""`), this is **intentional** - it triggers the English fallback. Do not copy the English text into empty fields unless you're providing an actual translation.
+
+```json
+{
+  "SOME_KEY": ""
+}
+```
+
+The above will display the English text for `SOME_KEY`.
+
+### File Format
+
+- Nested JSON structure
+- Keys use SCREAMING_SNAKE_CASE
+- Keep the structure intact - only change the string values
+
+### Example
+
+```json
+{
+  "G": {
+    "CANCEL": "Abbrechen",
+    "SAVE": "Speichern"
+  }
+}
+```
+
+## Tips
+
+- Use `en.json` as reference for context
+- Keep translations concise (UI space is limited)
+- Test your translations locally if possible (`ng serve`)
+
+## Translation Management Script
+
+For managing missing translations and maintaining consistency, use the `tools/add-missing-i18n-variables.js` script. See [i18n-script-usage.md](i18n-script-usage.md) for detailed instructions.

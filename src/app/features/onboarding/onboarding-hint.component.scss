@@ -1,0 +1,144 @@
+:host {
+  pointer-events: none;
+}
+
+.hint-container {
+  position: fixed;
+  z-index: var(--z-onboarding-hint);
+  pointer-events: auto;
+  animation: hint-appear var(--transition-duration-l) var(--ani-enter-timing);
+}
+
+.hint-chip {
+  background: var(--card-bg);
+  border: 1px solid var(--palette-primary-500);
+  border-radius: var(--s);
+  padding: var(--s) var(--s2);
+  box-shadow: var(--whiteframe-shadow-8dp);
+  max-width: 260px;
+  font-size: 14px;
+  color: var(--text-color);
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s);
+}
+
+.hint-text {
+  flex: 1;
+}
+
+.hint-title {
+  font-weight: bold;
+  margin-bottom: var(--s-quarter);
+}
+
+.hint-buttons {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: var(--s-half);
+}
+
+.hint-message {
+  display: flex;
+  align-items: center;
+  gap: var(--s-half);
+  line-height: 1.35;
+
+  mat-icon {
+    flex-shrink: 0;
+    width: 18px;
+    height: 18px;
+    font-size: 18px;
+    color: var(--palette-primary-500);
+  }
+}
+
+.shortcut-hint {
+  color: var(--text-color-muted);
+  font-size: 12px;
+  margin-inline-start: var(--s-half);
+
+  kbd {
+    display: inline-block;
+    padding: 1px var(--s-half);
+    font-size: 11px;
+    font-family: inherit;
+    background: rgba(var(--ink-on-channel), 0.08);
+    border: 1px solid rgba(var(--ink-on-channel), var(--border-alpha));
+    border-radius: 3px;
+  }
+}
+
+.close-btn {
+  position: relative;
+  flex-shrink: 0;
+  color: var(--text-color);
+  opacity: 0.5;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  background: none;
+  border: none;
+  padding: 0;
+  transition:
+    opacity var(--transition-duration-s) ease,
+    outline-color var(--transition-duration-s) ease;
+
+  // 44px touch target via pseudo-element
+  &::after {
+    content: '';
+    position: absolute;
+    inset: -12px;
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  &:hover {
+    opacity: 1;
+  }
+
+  &:focus-visible {
+    opacity: 1;
+    outline: 2px solid var(--palette-primary-500);
+    outline-offset: 4px;
+  }
+}
+
+.hint-arrow {
+  position: absolute;
+  // decorative; it can overlap the "+" FAB it points at and swallow taps
+  pointer-events: none;
+  width: 8px;
+  height: 8px;
+  background: var(--card-bg);
+  border-block-start: 1px solid var(--palette-primary-500);
+  border-inline-start: 1px solid var(--palette-primary-500);
+
+  &.arrow-up {
+    top: -5px;
+    transform: translateX(-4px) rotate(45deg);
+  }
+
+  &.arrow-down {
+    bottom: -5px;
+    transform: translateX(-4px) rotate(225deg);
+  }
+}
+
+@keyframes hint-appear {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hint-container {
+    animation: none;
+  }
+}

@@ -1,0 +1,150 @@
+import { INBOX_PROJECT } from '../../project/project.const';
+import { TimeSpentOnDay, TaskReminderOptionId } from '../task.model';
+import { TaskAttachment } from '../task-attachment/task-attachment.model';
+import { ShortSyntaxRepeat } from '../short-syntax';
+
+// The recurrence the bar will apply on submit. A preset or an interval creates
+// the config directly; DIALOG is the menu's "Custom recurring config" entry,
+// which defers everything to the repeat dialog and therefore carries no config
+// of its own. Keeping it a separate variant is what lets a syntax-parsed
+// interval be a CUSTOM config without also opening that dialog.
+export type AddTaskBarRepeat = ShortSyntaxRepeat | { type: 'DIALOG' };
+
+export interface AddTaskBarState {
+  projectId: string;
+  tagIds: string[];
+  tagIdsFromTxt: string[];
+  date: string | null;
+  time: string | null;
+  isDateExplicitlyCleared?: boolean;
+  spent: TimeSpentOnDay | null;
+  estimate: number | null;
+  newTagTitles: string[];
+  cleanText: string | null;
+  remindOption: TaskReminderOptionId | null;
+  attachments: TaskAttachment[];
+  repeat: AddTaskBarRepeat | null;
+  deadlineDate?: string | null;
+  deadlineTime?: string | null;
+  deadlineRemindOption?: TaskReminderOptionId | null;
+}
+const M = 60 * 1000;
+const H = 60 * M;
+export const ESTIMATE_OPTIONS = [
+  { label: '5m', value: '5m', ms: 5 * M },
+  { label: '10m', value: '10m', ms: 10 * M },
+  { label: '15m', value: '15m', ms: 15 * M },
+  { label: '30m', value: '30m', ms: 30 * M },
+  { label: '1h', value: '1h', ms: 1 * H },
+  { label: '2h', value: '2h', ms: 2 * H },
+  { label: '3h', value: '3h', ms: 3 * H },
+  { label: '4h', value: '4h', ms: 4 * H },
+  { label: '8h', value: '8h', ms: 8 * H },
+];
+
+export const INITIAL_ADD_TASK_BAR_STATE: AddTaskBarState = {
+  projectId: INBOX_PROJECT.id,
+  tagIds: [],
+  tagIdsFromTxt: [],
+  date: null,
+  time: null,
+  isDateExplicitlyCleared: false,
+  spent: null,
+  estimate: null,
+  newTagTitles: [],
+  cleanText: null,
+  remindOption: null,
+  attachments: [],
+  repeat: null,
+  deadlineDate: null,
+  deadlineTime: null,
+  deadlineRemindOption: null,
+};
+
+// Every entry must be a phrase shortSyntax() parses to a date that is not in
+// the past, or picking it leaves the text in the title and schedules nothing.
+// mention-config.service.spec.ts runs each entry through the parser.
+export const CHRONO_SUGGESTIONS: string[] = [
+  // Relative Days
+  'today',
+  'tomorrow',
+  'tonight',
+  'this morning',
+  'this afternoon',
+  'this evening',
+
+  // Relative Weeks
+  'next week',
+  'this week',
+  'next weekend',
+
+  // Days of Week
+  'monday',
+  'tuesday',
+  'wednesday',
+  'thursday',
+  'friday',
+  'saturday',
+  'sunday',
+  'next monday',
+  'next friday',
+
+  // Months (a bare "may" is not read as the month)
+  'january',
+  'february',
+  'march',
+  'april',
+  'may 1',
+  'june',
+  'july',
+  'august',
+  'september',
+  'october',
+  'november',
+  'december',
+  'next january',
+
+  // Relative Time
+  'in 5 minutes',
+  'in 15 minutes',
+  'in 30 minutes',
+  'in 1 hour',
+  'in 2 hours',
+  'in 3 hours',
+  'in 1 day',
+  'in 2 days',
+  'in 3 days',
+  'in 1 week',
+  'in 2 weeks',
+  'in 1 month',
+
+  // Absolute Times
+  'at 7am',
+  'at 9am',
+  'at noon',
+  'at 3pm',
+  'at 5pm',
+  'at 7pm',
+  'at 9pm',
+  'at midnight',
+
+  'now',
+];
+
+// Recurrence phrases are only parsed when creating a task in the add task bar,
+// so they are offered for its due-date trigger alone.
+export const REPEAT_SUGGESTIONS: string[] = [
+  'daily',
+  'weekly',
+  'monthly',
+  'yearly',
+  'every day',
+  'every weekday',
+  'every week',
+  'every monday',
+  'every friday',
+  'every month',
+  'every 2 days',
+  'every 2 weeks',
+  'every 2 fridays',
+];

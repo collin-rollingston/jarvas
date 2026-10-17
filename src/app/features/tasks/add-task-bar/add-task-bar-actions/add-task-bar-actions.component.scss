@@ -1,0 +1,256 @@
+@use '../../../../../styles/_globals.scss' as *;
+@use '../../shared-tag-project-styles';
+
+:host {
+  display: block;
+  min-width: 0;
+  position: relative;
+
+  @include mq(xxs, max) {
+    &::after {
+      content: '';
+      position: absolute;
+      inset-block: 0;
+      inset-inline-end: 0;
+      width: var(--s3);
+      background: linear-gradient(to right, transparent, var(--bg-lighter));
+      pointer-events: none;
+    }
+  }
+}
+
+:host-context([dir='rtl'])::after {
+  background: linear-gradient(to left, transparent, var(--bg-lighter));
+}
+
+.clear-btn {
+  --mat-button-text-label-text-color: var(--text-color-muted);
+
+  border-radius: var(--card-border-radius) !important;
+  margin-left: calc(var(--s) * -1);
+  min-width: var(--s4);
+  padding: 0;
+  text-align: center;
+  display: flex;
+  justify-content: center;
+  flex-shrink: 0;
+  transition:
+    color var(--transition-fast),
+    background-color var(--transition-fast);
+
+  @include mq(xs) {
+    margin-left: calc(var(--s) * -1);
+  }
+
+  mat-icon {
+    margin: 0;
+  }
+
+  &:hover,
+  &:focus-visible {
+    --mat-button-text-label-text-color: var(--text-color-most-intense);
+
+    background-color: var(--state-hover);
+  }
+}
+
+.project-icon-emoji {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  line-height: 1;
+  text-align: center;
+  vertical-align: middle;
+  margin-right: var(--s);
+}
+
+.menu-icon-emoji {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  line-height: 1;
+  text-align: center;
+  vertical-align: middle;
+  margin-right: var(--s);
+  overflow: hidden;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+}
+
+.action-bar {
+  position: relative;
+  padding-top: 0;
+  display: flex;
+  flex-wrap: nowrap;
+  border-top: 1px solid var(--divider-color);
+  overflow-x: auto;
+  overflow-y: hidden;
+
+  @include mq(xs) {
+    gap: var(--s-quarter);
+  }
+
+  @include mq(xxs, max) {
+    // Reserve enough scrollable room for the final action to clear the edge cue.
+    padding-inline-end: var(--s3);
+  }
+
+  .action-btn {
+    --mat-button-text-label-text-color: var(--text-color-muted);
+
+    cursor: pointer;
+    display: flex !important;
+    align-items: center;
+    overflow: hidden;
+    font-size: 13px;
+    min-width: 70px !important;
+    flex-shrink: 0;
+    // prevent dark theme being lighter than background
+    background-color: transparent;
+    transition:
+      color var(--transition-fast),
+      background-color var(--transition-fast);
+
+    ::ng-deep > mat-icon.hide {
+      width: 0;
+      overflow: hidden;
+    }
+
+    // Override mat-button padding to be more compact
+    &.mat-mdc-button {
+      padding: 0 var(--s);
+
+      .mat-mdc-button-touch-target {
+        display: none; // Remove touch target that can affect layout
+      }
+    }
+
+    @include mq(xs, max) {
+      font-size: 12px;
+    }
+
+    // Material button label wrapper
+    .mdc-button__label {
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      min-width: 0;
+    }
+
+    // Apply ellipsis to the text inside the button
+
+    ::ng-deep > span,
+    > span,
+    .mdc-button__label > span {
+      @include truncateText();
+      min-width: 0; // Allow span to shrink
+      display: inline-block; // Needed for ellipsis to work
+      max-width: 100%; // Ensure it doesn't exceed parent
+    }
+
+    mat-icon {
+      flex-shrink: 0; // Prevent icon from shrinking
+      margin-right: var(--s-half);
+
+      &.repeat-icon {
+        transform: rotate(45deg);
+      }
+    }
+
+    &:hover,
+    &:focus-visible {
+      --mat-button-text-label-text-color: var(--text-color-most-intense);
+
+      background-color: var(--state-hover);
+    }
+
+    &.has-value {
+      --mat-button-text-label-text-color: var(--text-color-most-intense);
+
+      @include darkTheme() {
+        font-weight: var(--font-weight-semibold);
+      }
+
+      mat-icon {
+        color: var(--brand);
+      }
+    }
+
+    &.deadline-chip {
+      color: var(--c-warn) !important;
+
+      mat-icon {
+        color: var(--c-warn) !important;
+      }
+    }
+
+    // Highlight when menu is open
+    &.menu-open {
+      --mat-button-text-label-text-color: var(--text-color-most-intense);
+
+      background-color: var(--state-focus);
+
+      mat-icon {
+        color: inherit;
+      }
+    }
+
+    .new-tags-indicator {
+      font-size: 0.8em;
+      font-weight: normal;
+      opacity: 0.8;
+      margin-left: var(--s-half);
+    }
+
+    .tags-display {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      overflow: hidden;
+      position: relative;
+      min-height: 20px; // Ensure consistent baseline height
+      line-height: 1; // Normalize line height
+
+      // When nested in span, use inline-flex
+      &:only-child {
+        display: inline-flex;
+        vertical-align: middle;
+      }
+
+      .tag-item {
+        display: flex;
+        align-items: center;
+        gap: var(--s-quarter);
+        flex-shrink: 0;
+        min-width: 0;
+
+        &.new-tag {
+          .tag-title {
+            font-style: italic;
+            opacity: 0.8;
+          }
+
+          mat-icon {
+            color: var(--c-accent);
+          }
+        }
+
+        mat-icon {
+          font-size: 16px;
+          width: 16px;
+          height: 16px;
+          line-height: 16px;
+        }
+
+        .tag-title {
+          @include truncateText();
+          min-width: 0;
+          font-size: 0.9em;
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,18 @@
+.content {
+  max-width: 400px;
+}
+
+:host mat-form-field {
+  margin-bottom: 0;
+  width: 100%;
+}
+
+.option-section {
+  text-align: center;
+  margin-top: var(--s2);
+}
+
+.option-label {
+  margin-bottom: 12px;
+  font-size: 0.9em;
+}

@@ -1,0 +1,749 @@
+import {
+  ChangeDetectionStrategy,
+  Component,
+  computed,
+  effect,
+  inject,
+  signal,
+} from '@angular/core';
+import { Task, TaskCopy, TaskReminderOptionId } from '../../tasks/task.model';
+import {
+  MAT_DIALOG_DATA,
+  MatDialogActions,
+  MatDialogContent,
+  MatDialogRef,
+  MatDialogTitle,
+} from '@angular/material/dialog';
+import { MatDialog } from '@angular/material/dialog';
+import { TaskRepeatCfgService } from '../task-repeat-cfg.service';
+import {
+  DEFAULT_TASK_REPEAT_CFG,
+  TaskRepeatCfg,
+  TaskRepeatCfgCopy,
+} from '../task-repeat-cfg.model';
+import { FormlyFieldConfig, FormlyModule } from '@ngx-formly/core';
+import { UntypedFormGroup } from '@angular/forms';
+import {
+  TASK_REPEAT_CFG_ADVANCED_FORM_CFG,
+  TASK_REPEAT_CFG_ESSENTIAL_FORM_CFG,
+} from './task-repeat-cfg-form.const';
+import { buildRepeatQuickSettingOptions } from './build-repeat-quick-setting-options';
+import { T } from '../../../t.const';
+import { TagService } from '../../tag/tag.service';
+import { unique } from '../../../util/unique';
+import { exists } from '../../../util/exists';
+import { TranslatePipe, TranslateService } from '@ngx-translate/core';
+import { getDbDateStr, isDBDateStr } from '../../../util/get-db-date-str';
+import { formatMonthDay } from '../../../util/format-month-day.util';
+import { dateStrToUtcDate } from '../../../util/date-str-to-utc-date';
+import { first } from 'rxjs/operators';
+import { getQuickSettingUpdates } from './get-quick-setting-updates';
+import { getDefaultSkipOverdue } from './get-default-skip-overdue';
+import { getTaskRepeatCfgChanges } from './get-task-repeat-cfg-changes';
+import { clockStringFromDate } from '../../../ui/duration/clock-string-from-date';
+import { ChipListInputComponent } from '../../../ui/chip-list-input/chip-list-input.component';
+import { MatButton } from '@angular/material/button';
+import { MatIcon } from '@angular/material/icon';
+import { Log } from '../../../core/log';
+import { toSignal } from '@angular/core/rxjs-interop';
+import { DialogConfirmComponent } from '../../../ui/dialog-confirm/dialog-confirm.component';
+import { GlobalConfigService } from '../../config/global-config.service';
+import { DEFAULT_GLOBAL_CONFIG } from '../../config/default-global-config.const';
+import { DateTimeFormatService } from 'src/app/core/date-time-format/date-time-format.service';
+import { RepeatTaskHeatmapComponent } from '../repeat-task-heatmap/repeat-task-heatmap.component';
+import { CollapsibleComponent } from '../../../ui/collapsible/collapsible.component';
+import { DialogScheduleTaskComponent } from '../../planner/dialog-schedule-task/dialog-schedule-task.component';
+import { getRepeatDueWithTime } from '../store/get-repeat-due-with-time.util';
+import { remindOptionToMilliseconds } from '../../tasks/util/remind-option-to-milliseconds';
+import { isValidSplitTime } from '../../../util/is-valid-split-time';
+import { DateService } from '../../../core/date/date.service';
+import { MAT_SELECT_CONFIG } from '@angular/material/select';
+import { getNextCreatedOccurrence } from '../store/get-next-created-occurrence.util';
+import { getNewestPossibleDueDate } from '../store/get-newest-possible-due-date.util';
+import { SCHEDULE_AFFECTING_FIELDS } from '../store/schedule-affecting-fields.const';
+import { getTaskPriority } from '../../tasks/task-priority.const';
+
+// Fields whose change requires offering "Update all task instances?" — covers
+// what propagates to existing tasks (vs. schedule fields, which only affect
+// future occurrences).
+const RELEVANT_KEYS_FOR_UPDATE_ALL_TASKS: (keyof TaskRepeatCfgCopy)[] = [
+  'title',
+  'defaultEstimate',
+  'priority',
+  'remindAt',
+  'startTime',
+  'notes',
+  'tagIds',
+];
+
+// A CUSTOM weekly recurrence with no weekday checked never produces an
+// occurrence, so it must be blocked at save time (#8025).
+const WEEKDAY_KEYS: (keyof TaskRepeatCfgCopy)[] = [
+  'monday',
+  'tuesday',
+  'wednesday',
+  'thursday',
+  'friday',
+  'saturday',
+  'sunday',
+];
+
+// Unsaved edits to these would move the next occurrence. quickSetting is only
+// expanded into the pattern fields on save, repeatFromCompletionDate moves the
+// anchor and repeatUntilDay can leave no next occurrence, so they count here
+// although the reschedule effect ignores them.
+const NEXT_OCCURRENCE_FIELDS: (keyof TaskRepeatCfgCopy)[] = [
+  ...SCHEDULE_AFFECTING_FIELDS,
+  'quickSetting',
+  'repeatFromCompletionDate',
+  'repeatUntilDay',
+];
+
+// TASK_REPEAT_CFG_FORM_CFG
+@Component({
+  selector: 'dialog-edit-task-repeat-cfg',
+  templateUrl: './dialog-edit-task-repeat-cfg.component.html',
+  styleUrls: ['./dialog-edit-task-repeat-cfg.component.scss'],
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  providers: [
+    {
+      provide: MAT_SELECT_CONFIG,
+      useValue: { canSelectNullableOptions: true },
+    },
+  ],
+  imports: [
+    MatDialogTitle,
+    TranslatePipe,
+    MatDialogContent,
+    FormlyModule,
+    ChipListInputComponent,
+    MatDialogActions,
+    MatButton,
+    MatIcon,
+    RepeatTaskHeatmapComponent,
+    CollapsibleComponent,
+  ],
+})
+export class DialogEditTaskRepeatCfgComponent {
+  private _globalConfigService = inject(GlobalConfigService);
+  private _tagService = inject(TagService);
+  private _dateService = inject(DateService);
+
+  plannedStartDateStr = computed(() => {
+    const d = this.repeatCfg().startDate;
+    if (!d) return this._translateService.instant(T.F.TASK_REPEAT.F.START_DATE);
+    const date = dateStrToUtcDate(d);
+    // Spelled-out weekday/month names follow the UI language under the ISO 8601
+    // option (the `sv` sentinel would otherwise leak Swedish, e.g. "ons 15 juli
+    // 2026"). The clock time below keeps currentLocale() so 24h is preserved.
+    const formattedDate = date.toLocaleDateString(
+      this._dateTimeFormatService.textLocale(),
+      {
+        weekday: 'short',
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+      },
+    );
+    const time = this.repeatCfg().startTime;
+    if (time && isValidSplitTime(time)) {
+      const [hours, minutes] = time.split(':').map(Number);
+      const safeTimeDate = new Date(2000, 0, 1, hours, minutes, 0, 0);
+      const formattedTime = this._dateTimeFormatService.formatTime(
+        safeTimeDate.getTime(),
+        this._dateTimeFormatService.currentLocale(),
+      );
+      return `${formattedDate}, ${formattedTime}`;
+    }
+    return formattedDate;
+  });
+
+  openScheduleDialog(): void {
+    const currentCfg = this.repeatCfg();
+    const dummyTask: TaskCopy = {
+      title: currentCfg.title || '',
+      dueDay: currentCfg.startDate || undefined,
+      dueWithTime: undefined,
+      remindAt: undefined,
+      timeEstimate: 0,
+      timeSpent: 0,
+      subTaskIds: [],
+      isDone: false,
+      projectId: '',
+      timeSpentOnDay: {},
+      attachments: [],
+      tagIds: [],
+      created: Date.now(),
+    } as unknown as TaskCopy;
+
+    const defaultRemindOption =
+      this._data.defaultRemindOption ??
+      this._globalConfigService.cfg()?.reminder.defaultTaskRemindOption ??
+      DEFAULT_GLOBAL_CONFIG.reminder.defaultTaskRemindOption!;
+    const remindAt =
+      currentCfg.remindAt !== undefined ? currentCfg.remindAt : defaultRemindOption;
+
+    const hasValidTime = !!currentCfg.startTime && isValidSplitTime(currentCfg.startTime);
+
+    if (currentCfg.startDate && hasValidTime) {
+      const dt = getRepeatDueWithTime(
+        currentCfg.startTime!,
+        dateStrToUtcDate(currentCfg.startDate),
+        this._dateService.getStartOfNextDayDiffMs(),
+      );
+      dummyTask.dueWithTime = dt;
+      if (remindAt && remindAt !== TaskReminderOptionId.DoNotRemind) {
+        dummyTask.remindAt = remindOptionToMilliseconds(dt, remindAt);
+      }
+    }
+
+    this._matDialog
+      .open(DialogScheduleTaskComponent, {
+        autoFocus: false,
+        data: {
+          task: dummyTask,
+          isSelectDueOnly: true,
+          showQuickAccess: true,
+          isSubmitOnQuickAccess: false,
+          targetDay: currentCfg.startDate || undefined,
+          targetTime: hasValidTime ? currentCfg.startTime : undefined,
+          minDate: this.isEdit() ? null : this._getReferenceDate(),
+        },
+      })
+      .afterClosed()
+      .subscribe((result) => {
+        if (result) {
+          const newDateStr = getDbDateStr(result.date);
+          const hasTime = !!result.time && isValidSplitTime(result.time);
+          this.repeatCfg.update((cfg) => ({
+            ...cfg,
+            startDate: newDateStr,
+            startTime: result.time || undefined,
+            remindAt: hasTime ? result.remindOption || undefined : undefined,
+          }));
+        }
+      });
+  }
+
+  private _taskRepeatCfgService = inject(TaskRepeatCfgService);
+  private _matDialog = inject(MatDialog);
+  private _matDialogRef =
+    inject<MatDialogRef<DialogEditTaskRepeatCfgComponent>>(MatDialogRef);
+  private _translateService = inject(TranslateService);
+  private _dateTimeFormatService = inject(DateTimeFormatService);
+  private _data = inject<{
+    task?: Task;
+    repeatCfg?: TaskRepeatCfg;
+    targetDate?: string;
+    initialStartDate?: string;
+    defaultRemindOption?: TaskReminderOptionId;
+    isRemoveConfirmationRequired?: boolean;
+  }>(MAT_DIALOG_DATA);
+
+  T: typeof T = T;
+  isHeatmapExpanded = false;
+
+  repeatCfgInitial = signal<TaskRepeatCfgCopy | undefined>(undefined);
+  repeatCfg = signal<Omit<TaskRepeatCfgCopy, 'id'> | TaskRepeatCfg>(
+    this._initializeRepeatCfg(),
+  );
+  isLoading = signal<boolean>(false);
+  isEdit = computed(() => {
+    if (this._data.repeatCfg) return true;
+    if (this._data.task?.repeatCfgId) return true;
+    return false;
+  });
+
+  // A CUSTOM weekly config with zero weekdays selected would never recur;
+  // surface it as a blocking validation error (#8025). Derived from the
+  // `repeatCfg` signal so it re-evaluates on every checkbox toggle.
+  isWeekdaySelectionInvalid = computed(() => {
+    const cfg = this.repeatCfg();
+    if (cfg.quickSetting !== 'CUSTOM' || cfg.repeatCycle !== 'WEEKLY') {
+      return false;
+    }
+    return !WEEKDAY_KEYS.some((day) => cfg[day]);
+  });
+
+  repeatCfgId = computed(() => {
+    const cfg = this.repeatCfg();
+    if ('id' in cfg && cfg.id) {
+      return cfg.id;
+    }
+    return this._data.repeatCfg?.id || this._data.task?.repeatCfgId || null;
+  });
+
+  // Computed from the saved config, like the Upcoming list's "Next" tooltip.
+  // Unsaved schedule edits are applied by the reschedule effect on save, which
+  // can also relocate the live instance, so no date is shown for them.
+  nextOccurrenceText = computed<string | null>(() => {
+    const saved = this.repeatCfgInitial();
+    const cfg = this.repeatCfg();
+    if (!this.isEdit() || !saved || cfg.isPaused) {
+      return null;
+    }
+    if (this.hasUnsavedScheduleChanges()) {
+      return this._translateService.instant(
+        T.F.TASK_REPEAT.D_EDIT.NEXT_OCCURRENCE_UNSAVED,
+      );
+    }
+    const now = new Date();
+    if (cfg.waitForCompletion) {
+      // An occurrence that is already due is held back until the live instance
+      // is done and is created at that moment, so its date is not predictable.
+      const due = getNewestPossibleDueDate(saved as TaskRepeatCfg, now);
+      if (due && !saved.deletedInstanceDates?.includes(getDbDateStr(due))) {
+        return this._translateService.instant(
+          T.F.TASK_REPEAT.D_EDIT.NEXT_OCCURRENCE_AFTER_COMPLETION,
+        );
+      }
+    }
+    const next = getNextCreatedOccurrence(saved as TaskRepeatCfg, now);
+    if (!next) {
+      return null;
+    }
+    const date = next.toLocaleDateString(this._dateTimeFormatService.textLocale(), {
+      weekday: 'short',
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+    });
+    const key = cfg.waitForCompletion
+      ? T.F.TASK_REPEAT.D_EDIT.NEXT_OCCURRENCE_WAIT_FOR_COMPLETION
+      : cfg.repeatFromCompletionDate
+        ? T.F.TASK_REPEAT.D_EDIT.NEXT_OCCURRENCE_FROM_COMPLETION
+        : T.F.TASK_REPEAT.D_EDIT.NEXT_OCCURRENCE;
+    return this._translateService.instant(key, { date });
+  });
+
+  hasUnsavedScheduleChanges = computed(() => {
+    const saved = this.repeatCfgInitial();
+    if (!saved) {
+      return false;
+    }
+    const changes = getTaskRepeatCfgChanges(
+      saved,
+      this._normalizeMonthlyAnchor(this.repeatCfg()),
+    );
+    return NEXT_OCCURRENCE_FIELDS.some((field) => field in changes);
+  });
+
+  inheritedSubtaskTitles = computed(() => {
+    const cfg = this.repeatCfg();
+    // Enabling inheritance replaces the templates on save with a snapshot of the
+    // newest instance's subtasks, so the stored templates would be stale here.
+    const saved = this.repeatCfgInitial();
+    const isNewlyInherited = !!saved && !saved.shouldInheritSubtasks;
+    return cfg.shouldInheritSubtasks && !isNewlyInherited
+      ? (cfg.subTaskTemplates ?? []).map((subTask) => subTask.title)
+      : [];
+  });
+
+  essentialFormFields = signal<FormlyFieldConfig[]>([]);
+  advancedFormFields = signal<FormlyFieldConfig[]>(TASK_REPEAT_CFG_ADVANCED_FORM_CFG);
+
+  formGroup1 = signal(new UntypedFormGroup({}));
+  formGroup2 = signal(new UntypedFormGroup({}));
+  tagSuggestions = toSignal(this._tagService.tagsNoMyDayAndNoList$, { initialValue: [] });
+  canRemoveInstance = signal<boolean>(false);
+  skipInstanceButtonText = computed(() => {
+    if (!this._data.targetDate) {
+      return this._translateService.instant(T.F.TASK_REPEAT.F.SKIP_INSTANCE);
+    }
+
+    // Format date using same logic as ShortDate2Pipe
+    const date = isDBDateStr(this._data.targetDate)
+      ? dateStrToUtcDate(this._data.targetDate)
+      : new Date(this._data.targetDate);
+
+    const formattedDate = formatMonthDay(
+      date,
+      this._dateTimeFormatService.currentLocale(),
+    );
+
+    return this._translateService.instant(T.F.TASK_REPEAT.F.SKIP_FOR_DATE, {
+      date: formattedDate,
+    });
+  });
+
+  constructor() {
+    // Initialize form config
+    this._initializeFormConfig();
+
+    // Set up effect to load task repeat config if editing
+    effect(() => {
+      if (this.isEdit() && this._data.task?.repeatCfgId) {
+        this.isLoading.set(true);
+        this._taskRepeatCfgService
+          .getTaskRepeatCfgByIdAllowUndefined$(this._data.task.repeatCfgId)
+          .pipe(first())
+          .subscribe((cfg) => {
+            // Repeat config was deleted (e.g. via cross-client sync) but the task
+            // still references it — abort editing instead of crashing. (#8715)
+            if (!cfg) {
+              this.isLoading.set(false);
+              this.close();
+              return;
+            }
+            this._setRepeatCfgInitiallyForEditOnly(cfg);
+            this._checkCanRemoveInstance();
+            this.isLoading.set(false);
+          });
+      }
+      this._checkCanRemoveInstance();
+    });
+  }
+
+  private _initializeRepeatCfg(): Omit<TaskRepeatCfgCopy, 'id'> | TaskRepeatCfg {
+    if (this._data.repeatCfg) {
+      // Process the repeat config to determine if quickSetting needs to be changed to CUSTOM
+      const processedCfg = this._processQuickSettingForDate({ ...this._data.repeatCfg });
+      processedCfg.priority = getTaskPriority(processedCfg.priority);
+      if (processedCfg.startTime && processedCfg.remindAt === undefined) {
+        processedCfg.remindAt =
+          this._data.defaultRemindOption ??
+          this._globalConfigService.cfg()?.reminder.defaultTaskRemindOption ??
+          DEFAULT_GLOBAL_CONFIG.reminder.defaultTaskRemindOption!;
+      }
+
+      // Set initial value for comparison
+      this.repeatCfgInitial.set({
+        ...this._data.repeatCfg,
+        priority: getTaskPriority(this._data.repeatCfg.priority),
+      });
+      return processedCfg;
+    } else if (this._data.task) {
+      const startTime = this._data.task.dueWithTime
+        ? clockStringFromDate(this._data.task.dueWithTime)
+        : undefined;
+      return {
+        ...DEFAULT_TASK_REPEAT_CFG,
+        // New configs open on the "Daily" quick setting, where collapsing empty
+        // overdue instances is both useful and safe; see getDefaultSkipOverdue.
+        // Re-derived from the final schedule on save in case the user switches.
+        skipOverdue: getDefaultSkipOverdue(DEFAULT_TASK_REPEAT_CFG),
+        startDate:
+          this._data.initialStartDate ??
+          this._data.task.dueDay ??
+          // the logical day, so a late-night time keeps its night (#3378)
+          (this._data.task.dueWithTime
+            ? getDbDateStr(
+                this._data.task.dueWithTime - this._dateService.getStartOfNextDayDiffMs(),
+              )
+            : this._dateService.todayStr()),
+        startTime,
+        remindAt: startTime
+          ? (this._data.defaultRemindOption ??
+            this._globalConfigService.cfg()?.reminder.defaultTaskRemindOption ??
+            DEFAULT_GLOBAL_CONFIG.reminder.defaultTaskRemindOption!)
+          : undefined,
+        shouldInheritSubtasks: this._data.task.subTaskIds.length > 0,
+        title: this._data.task.title,
+        notes: this._data.task.notes || undefined,
+        tagIds: unique(this._data.task.tagIds),
+        defaultEstimate: this._data.task.timeEstimate,
+        priority: getTaskPriority(this._data.task.priority),
+      };
+    } else {
+      throw new Error('Invalid params given for repeat dialog!');
+    }
+  }
+
+  private _initializeFormConfig(): void {
+    const translateService = this._translateService;
+
+    const buildOptions = (refDate: Date): { value: string; label: string }[] =>
+      // Read currentLocale() reactively each time options are built so the
+      // correct locale is used even when the config store hasn't emitted yet
+      // at construction time (previously captured once as a const → en-GB).
+      // textLocale() localizes the spelled-out weekday name (UI language under
+      // the ISO option), while numeric day/month keep currentLocale().
+      buildRepeatQuickSettingOptions(
+        refDate,
+        this._dateTimeFormatService.currentLocale(),
+        translateService,
+        this._dateTimeFormatService.textLocale(),
+      );
+
+    const formConfig = TASK_REPEAT_CFG_ESSENTIAL_FORM_CFG.map((field) => ({
+      ...field,
+    }));
+
+    // Clamp logic for startDate is now handled reactively by calendarMinDate signal
+
+    // Deep-clone the quickSetting field to avoid mutating the shared constant
+    const quickSettingIdx = formConfig.findIndex((f) => f.key === 'quickSetting');
+    if (quickSettingIdx === -1) {
+      throw new Error(
+        'quickSetting field not found in TASK_REPEAT_CFG_ESSENTIAL_FORM_CFG',
+      );
+    }
+    const quickSettingField: FormlyFieldConfig = {
+      ...formConfig[quickSettingIdx],
+      templateOptions: { ...formConfig[quickSettingIdx].templateOptions },
+    };
+    formConfig[quickSettingIdx] = quickSettingField;
+
+    // Set initial options
+    quickSettingField.templateOptions!.options = buildOptions(this._getReferenceDate());
+
+    // Memoize to avoid rebuilding options on every formly change cycle
+    let lastStartDate: string | undefined;
+    let lastLocaleKey: string | undefined;
+    let cachedOptions: { value: string; label: string }[];
+
+    // Update options when startDate or either locale changes. The key must track
+    // textLocale, not just currentLocale: under the ISO option currentLocale()
+    // stays 'sv' while textLocale() carries the UI language for the weekday
+    // label. Those move independently — applyLanguageFromState$ deliberately
+    // applies the UI language from remote sync too, so lng can change while this
+    // dialog is open, shifting textLocale() with currentLocale() frozen at 'sv'.
+    // A currentLocale-only key would serve a stale weekday label there.
+    quickSettingField.expressionProperties = {
+      ...quickSettingField.expressionProperties,
+      ['templateOptions.options']: (model: Record<string, unknown>) => {
+        const sd = model['startDate'] as string | undefined;
+        const currentLocale = this._dateTimeFormatService.currentLocale();
+        const textLocale = this._dateTimeFormatService.textLocale();
+        const localeKey = `${currentLocale}|${textLocale}`;
+        if (sd !== lastStartDate || localeKey !== lastLocaleKey || !cachedOptions) {
+          lastStartDate = sd;
+          lastLocaleKey = localeKey;
+          const refDate = sd ? dateStrToUtcDate(sd) : this._getReferenceDate();
+          cachedOptions = buildOptions(refDate);
+        }
+        return cachedOptions;
+      },
+    };
+
+    this.essentialFormFields.set(formConfig);
+  }
+
+  save(): void {
+    const formGroup1 = this.formGroup1();
+    const formGroup2 = this.formGroup2();
+
+    // Check if both forms are valid
+    if (!formGroup1.valid || !formGroup2.valid) {
+      // Mark all fields as touched to show validation errors
+      formGroup1.markAllAsTouched();
+      formGroup2.markAllAsTouched();
+      Log.err('Form validation failed', {
+        form1Errors: formGroup1.errors,
+        form2Errors: formGroup2.errors,
+      });
+      return;
+    }
+
+    // Enter-key submit bypasses the disabled Save button, so re-check here (#8025).
+    if (this.isWeekdaySelectionInvalid()) {
+      return;
+    }
+
+    const currentRepeatCfg = this.repeatCfg();
+
+    // workaround for formly not always updating hidden fields correctly (in time??)
+    if (currentRepeatCfg.quickSetting !== 'CUSTOM') {
+      // Pass startDate to use correct weekday for WEEKLY_CURRENT_WEEKDAY (fixes #5806)
+      const referenceDate = currentRepeatCfg.startDate
+        ? dateStrToUtcDate(currentRepeatCfg.startDate)
+        : undefined;
+      const updatesForQuickSetting = getQuickSettingUpdates(
+        currentRepeatCfg.quickSetting,
+        referenceDate,
+      );
+      if (updatesForQuickSetting) {
+        this.repeatCfg.update((cfg) => ({ ...cfg, ...updatesForQuickSetting }));
+      }
+    }
+
+    // Normalize the monthly anchor fields at the boundary: convert the form's
+    // `null` sentinels (incl. a cleared end date) to `undefined`, and strip a
+    // stale `monthlyLastDay` flag.
+    const finalRepeatCfg = this._normalizeMonthlyAnchor(this.repeatCfg());
+
+    if (this.isEdit()) {
+      const initial = this.repeatCfgInitial();
+      if (!initial) {
+        throw new Error('Initial task repeat cfg missing (code error)');
+      }
+      // Pass only the fields that actually changed. Sending the whole config
+      // would make rescheduleTaskOnRepeatCfgUpdate$ fire on every save (its
+      // filter checks `field in changes`), pushing today's task to tomorrow
+      // when only the time was edited (issue #7373).
+      const changes = getTaskRepeatCfgChanges(initial, finalRepeatCfg);
+      const isRelevantChangesForUpdateAllTasks = RELEVANT_KEYS_FOR_UPDATE_ALL_TASKS.some(
+        (k) => k in changes,
+      );
+
+      this._taskRepeatCfgService.updateTaskRepeatCfg(
+        exists((finalRepeatCfg as TaskRepeatCfg).id),
+        changes,
+        isRelevantChangesForUpdateAllTasks,
+      );
+      this.close();
+    } else {
+      // Seed skipOverdue from the FINAL schedule (the initial default assumed
+      // Daily; the user may have switched to e.g. Monthly). Skip this only when
+      // the user explicitly toggled the Advanced checkbox, so an opt-in/out is
+      // honoured. For any new non-Daily config whose Advanced panel is opened
+      // but left untouched, the checkbox may visibly show the seeded ON while we
+      // persist the safe re-derived value — an accepted, conservative display
+      // gap in a rarely-opened panel (never persists the wrong value).
+      const skipOverdueTouched = this.formGroup2().get('skipOverdue')?.dirty ?? false;
+      const newRepeatCfg = skipOverdueTouched
+        ? finalRepeatCfg
+        : { ...finalRepeatCfg, skipOverdue: getDefaultSkipOverdue(finalRepeatCfg) };
+      const createdRepeatCfgId = this._taskRepeatCfgService.addTaskRepeatCfgToTask(
+        (this._data.task as Task).id,
+        (this._data.task as Task).projectId || null,
+        newRepeatCfg,
+      );
+      this.close(createdRepeatCfgId);
+    }
+  }
+
+  private _normalizeMonthlyAnchor<
+    T extends {
+      monthlyWeekOfMonth?: unknown;
+      monthlyLastDay?: boolean;
+      quickSetting?: string;
+      repeatUntilDay?: string | null;
+    },
+  >(cfg: T): T {
+    let result = cfg;
+    // The form uses `null` as the "(Day of month)" sentinel on the
+    // monthlyWeekOfMonth select. Persisted cfgs use `undefined` for absent
+    // optional fields (project convention). Normalizing here keeps existing
+    // day-of-month cfgs from producing spurious change diffs.
+    if (result.monthlyWeekOfMonth === null) {
+      result = { ...result, monthlyWeekOfMonth: undefined };
+    }
+    // `monthlyLastDay` has no CUSTOM-mode form control, so a flag left over
+    // from the MONTHLY_LAST_DAY preset would silently override the
+    // day-of-month a CUSTOM cfg shows. It is only ever valid for that
+    // preset — strip it for any other quick setting (#7726).
+    if (result.monthlyLastDay && result.quickSetting !== 'MONTHLY_LAST_DAY') {
+      result = { ...result, monthlyLastDay: undefined };
+    }
+    // A cleared end-date picker can leave `null`; persist `undefined` so the
+    // clear is sent via `clearedFields` (#10091).
+    if (result.repeatUntilDay === null) {
+      result = { ...result, repeatUntilDay: undefined };
+    }
+    return result;
+  }
+
+  remove(): void {
+    const currentRepeatCfg = this.repeatCfg();
+    const repeatCfgId = exists((currentRepeatCfg as TaskRepeatCfg).id);
+    if (this._data.isRemoveConfirmationRequired !== false) {
+      this._taskRepeatCfgService.deleteTaskRepeatCfgWithDialog(repeatCfgId);
+    } else {
+      this._taskRepeatCfgService.deleteTaskRepeatCfg(repeatCfgId);
+    }
+    this.close();
+  }
+
+  deleteInstance(): void {
+    if (!this._data.targetDate || !this.canRemoveInstance()) {
+      return;
+    }
+
+    const currentRepeatCfg = this.repeatCfg() as TaskRepeatCfg;
+    const targetDate = this._data.targetDate;
+    const confirmationDate = isDBDateStr(targetDate)
+      ? dateStrToUtcDate(targetDate)
+      : new Date(targetDate);
+
+    this._matDialog
+      .open(DialogConfirmComponent, {
+        restoreFocus: true,
+        data: {
+          message: this._translateService.instant(T.F.TASK_REPEAT.D_SKIP_INSTANCE.MSG, {
+            date: confirmationDate.toLocaleDateString(
+              this._dateTimeFormatService.currentLocale(),
+            ),
+          }),
+          okTxt: this._translateService.instant(T.F.TASK_REPEAT.D_SKIP_INSTANCE.OK),
+        },
+      })
+      .afterClosed()
+      .subscribe((isConfirm: boolean) => {
+        if (isConfirm) {
+          this._taskRepeatCfgService.deleteTaskRepeatCfgInstance(
+            exists(currentRepeatCfg.id),
+            targetDate,
+          );
+          this.close();
+        }
+      });
+  }
+
+  close(createdRepeatCfgId?: string): void {
+    this._matDialogRef.close(createdRepeatCfgId);
+  }
+
+  addTag(id: string): void {
+    this.repeatCfg.update((cfg) => ({
+      ...cfg,
+      tagIds: unique([...cfg.tagIds, id]),
+    }));
+  }
+
+  addNewTag(title: string): void {
+    const id = this._tagService.addTag({ title });
+    this.repeatCfg.update((cfg) => ({
+      ...cfg,
+      tagIds: unique([...cfg.tagIds, id]),
+    }));
+  }
+
+  removeTag(id: string): void {
+    this.repeatCfg.update((cfg) => ({
+      ...cfg,
+      tagIds: cfg.tagIds.filter((tagId) => tagId !== id),
+    }));
+  }
+
+  private _setRepeatCfgInitiallyForEditOnly(repeatCfg: TaskRepeatCfg): void {
+    const normalizedCfg = { ...repeatCfg, priority: getTaskPriority(repeatCfg.priority) };
+    const processedCfg = this._processQuickSettingForDate(normalizedCfg);
+    this.repeatCfg.set(processedCfg);
+    this.repeatCfgInitial.set(normalizedCfg);
+  }
+
+  private _getReferenceDate(): Date {
+    if (this._data.task?.dueDay) {
+      return dateStrToUtcDate(this._data.task.dueDay);
+    }
+    if (this._data.repeatCfg?.startDate) {
+      return dateStrToUtcDate(this._data.repeatCfg.startDate);
+    }
+    const d = this._dateService.getLogicalTodayDate();
+    d.setHours(0, 0, 0, 0);
+    return d;
+  }
+
+  private _processQuickSettingForDate<
+    TCfg extends { quickSetting?: string; startDate?: string },
+  >(cfg: TCfg): TCfg {
+    const SETTINGS_WITHOUT_START_DATE = new Set(['DAILY', 'MONDAY_TO_FRIDAY', 'CUSTOM']);
+    if (cfg.quickSetting && !SETTINGS_WITHOUT_START_DATE.has(cfg.quickSetting)) {
+      if (!cfg.startDate) {
+        return { ...cfg, quickSetting: 'CUSTOM' };
+      }
+    }
+    return cfg;
+  }
+
+  private _checkCanRemoveInstance(): void {
+    if (!this._data.targetDate) {
+      this.canRemoveInstance.set(false);
+      return;
+    }
+    const todayStr = this._dateService.todayStr();
+    const isTargetTodayOrPast = this._data.targetDate <= todayStr;
+    this.canRemoveInstance.set(!isTargetTodayOrPast);
+  }
+}

@@ -1,0 +1,694 @@
+import {
+  ChangeDetectionStrategy,
+  Component,
+  computed,
+  inject,
+  signal,
+} from '@angular/core';
+import { toSignal } from '@angular/core/rxjs-interop';
+import { map } from 'rxjs/operators';
+import { PluginService } from '../../plugin.service';
+import { PluginInstance } from '../../plugin-api.model';
+import { PluginMetaPersistenceService } from '../../plugin-meta-persistence.service';
+import { PluginCacheService } from '../../plugin-cache.service';
+import { PluginConfigService } from '../../plugin-config.service';
+import { MAX_PLUGIN_ZIP_SIZE } from '../../plugin.const';
+import {
+  MatCard,
+  MatCardActions,
+  MatCardContent,
+  MatCardHeader,
+  MatCardSubtitle,
+  MatCardTitle,
+} from '@angular/material/card';
+import { MatSlideToggle, MatSlideToggleChange } from '@angular/material/slide-toggle';
+import { MatIcon } from '@angular/material/icon';
+import { MatButton, MatIconButton } from '@angular/material/button';
+import { MatChip, MatChipSet } from '@angular/material/chips';
+import { MatTooltip } from '@angular/material/tooltip';
+import { MatError } from '@angular/material/form-field';
+import { MatDialog } from '@angular/material/dialog';
+import { TranslatePipe, TranslateService } from '@ngx-translate/core';
+import { T } from '../../../t.const';
+import { PluginIconComponent } from '../plugin-icon/plugin-icon.component';
+import { PluginConfigDialogComponent } from '../plugin-config-dialog/plugin-config-dialog.component';
+import { IS_ELECTRON } from '../../../app.constants';
+import { PluginLog } from '../../../core/log';
+import { SnackService } from '../../../core/snack/snack.service';
+import { PluginBridgeService } from '../../plugin-bridge.service';
+import { CollapsibleComponent } from '../../../ui/collapsible/collapsible.component';
+import { DEFAULT_LANGUAGE, LanguageCode } from '../../../core/locale.constants';
+import { GlobalConfigService } from '../../../features/config/global-config.service';
+import { escapeHtml } from '../../../util/escape-html';
+import { getUploadedPluginIds } from '../../plugin-state.model';
+import { DialogConfirmComponent } from '../../../ui/dialog-confirm/dialog-confirm.component';
+import { firstValueFrom } from 'rxjs';
+import { Store } from '@ngrx/store';
+import { Router } from '@angular/router';
+import { selectAll as selectAllIssueProviders } from '../../../features/issue/store/issue-provider.selectors';
+import { LayoutService } from '../../../core-ui/layout/layout.service';
+import COMMUNITY_PLUGINS_DATA from '../../../../assets/community-plugins.json';
+import { PluginApiAccess, PluginSecurityService } from '../../plugin-security';
+import { DEV_ONLY_BUNDLED_PLUGIN_IDS } from '../../bundled-plugins.const';
+import { environment } from '../../../../environments/environment';
+
+interface CommunityPlugin {
+  name: string;
+  shortDescription: string;
+  url: string;
+  author: string;
+  authorUrl?: string;
+  stars?: number;
+}
+
+interface PluginManifestAuthor {
+  author?: unknown;
+}
+
+/**
+ * The app's Chinese codes stand for scripts, not regions: `zh` is Simplified
+ * and `zh-tw` is Traditional. Read literally, `zh-tw` would be "Chinese (Taiwan)".
+ */
+const LANGUAGE_CODE_TO_BCP47: Readonly<Record<string, string>> = {
+  [LanguageCode.zh]: 'zh-Hans',
+  [LanguageCode.zh_tw]: 'zh-Hant',
+};
+
+const createLanguageDisplayNames = (locale: string): Intl.DisplayNames | null => {
+  try {
+    return new Intl.DisplayNames([locale], {
+      type: 'language',
+      languageDisplay: 'standard',
+    });
+  } catch {
+    return null;
+  }
+};
+
+/** Never throws: an unknown or malformed code is shown as is. */
+const getLanguageName = (
+  displayNames: Intl.DisplayNames | null,
+  code: string,
+): string => {
+  try {
+    return displayNames?.of(LANGUAGE_CODE_TO_BCP47[code] ?? code) ?? code;
+  } catch {
+    return code;
+  }
+};
+
+@Component({
+  selector: 'plugin-management',
+  templateUrl: './plugin-management.component.html',
+  styleUrls: ['./plugin-management.component.scss'],
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  imports: [
+    MatCard,
+    MatCardActions,
+    MatCardHeader,
+    MatCardTitle,
+    MatCardSubtitle,
+    MatCardContent,
+    MatSlideToggle,
+    MatIcon,
+    MatButton,
+    MatIconButton,
+    MatChip,
+    MatChipSet,
+    MatError,
+    MatTooltip,
+    TranslatePipe,
+    PluginIconComponent,
+    CollapsibleComponent,
+  ],
+})
+export class PluginManagementComponent {
+  private readonly _pluginService = inject(PluginService);
+  private readonly _pluginMetaPersistenceService = inject(PluginMetaPersistenceService);
+  private readonly _pluginCacheService = inject(PluginCacheService);
+  private readonly _pluginConfigService = inject(PluginConfigService);
+  private readonly _translateService = inject(TranslateService);
+  private readonly _globalConfigService = inject(GlobalConfigService);
+  private readonly _dialog = inject(MatDialog);
+  private readonly _store = inject(Store);
+  private readonly _router = inject(Router);
+  private readonly _layoutService = inject(LayoutService);
+  private readonly _pluginBridge = inject(PluginBridgeService);
+  private readonly _pluginSecurity = inject(PluginSecurityService);
+  private readonly _snackService = inject(SnackService);
+  private readonly _allIssueProviders = this._store.selectSignal(selectAllIssueProviders);
+
+  /** Current UI language; follows `TranslateService.use()` so a switch re-renders. */
+  private readonly _uiLang = toSignal(
+    this._translateService.onLangChange.pipe(map((event) => event.lang)),
+    { initialValue: this._translateService.getCurrentLang() },
+  );
+
+  /** One formatter per UI language, shared by every plugin card. */
+  private readonly _languageDisplayNames = computed(() =>
+    createLanguageDisplayNames(this._uiLang() || DEFAULT_LANGUAGE),
+  );
+
+  readonly communityPlugins = signal<CommunityPlugin[]>(
+    [...(COMMUNITY_PLUGINS_DATA as CommunityPlugin[])].sort((a, b) =>
+      a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }),
+    ),
+  );
+
+  T: typeof T = T;
+  readonly IS_ELECTRON = IS_ELECTRON;
+
+  // Plugin size limits for display
+  readonly maxPluginSizeMB = (MAX_PLUGIN_ZIP_SIZE / 1024 / 1024).toFixed(1);
+
+  // Computed signal for all plugins derived from pluginStates
+  readonly allPlugins = computed(() => {
+    const plugins: PluginInstance[] = [];
+    const states = this._pluginService.pluginStates();
+
+    for (const state of states.values()) {
+      if (state.instance) {
+        // Plugin is loaded, use the instance
+        plugins.push(state.instance);
+      } else {
+        // Create a placeholder instance
+        plugins.push({
+          manifest: state.manifest,
+          loaded: state.status === 'loaded',
+          isEnabled: state.isEnabled,
+          error: state.error,
+        });
+      }
+    }
+    return plugins;
+  });
+
+  // Development and E2E builds (plain `ng build`) are not `production`, so they list them.
+  private readonly _isShowDevPlugins = !environment.production;
+  // Dev-only plugins seen enabled stay listed, so disabling one does not make it vanish.
+  // Filled from inside pluginGroups (via isPluginListed); it only ever grows while this
+  // page is open, so re-running the computed gives the same result.
+  private readonly _shownDevPluginIds = new Set<string>();
+
+  // Uploaded plugins, then built-in integrations (issue and calendar providers), then
+  // other built-ins, each in load order. Grouped by origin and type rather than enabled
+  // state, so a card never moves while its toggle is used.
+  readonly pluginGroups = computed(() => {
+    const plugins = this.allPlugins().filter((p) => this._isListed(p));
+    const states = this._pluginService.pluginStates();
+    const isUploaded = (p: PluginInstance): boolean =>
+      states.get(p.manifest.id)?.type === 'uploaded';
+    const builtIn = plugins.filter((p) => !isUploaded(p));
+    return [
+      { titleKey: T.PLUGINS.GROUP_UPLOADED, plugins: plugins.filter(isUploaded) },
+      {
+        titleKey: T.PLUGINS.GROUP_INTEGRATIONS,
+        plugins: builtIn.filter((p) => this.isIssueProviderPlugin(p)),
+      },
+      {
+        titleKey: T.PLUGINS.GROUP_OTHER,
+        plugins: builtIn.filter((p) => !this.isIssueProviderPlugin(p)),
+      },
+    ].filter((group) => group.plugins.length > 0);
+  });
+
+  // Upload state
+  readonly isUploading = signal<boolean>(false);
+  readonly uploadError = signal<string | null>(null);
+
+  onPluginToggle(plugin: PluginInstance, event: MatSlideToggleChange): void {
+    if (event.checked) {
+      this.enablePlugin(plugin, event);
+    } else {
+      this.disablePlugin(plugin, event);
+    }
+  }
+
+  private async enablePlugin(
+    plugin: PluginInstance,
+    event: MatSlideToggleChange,
+  ): Promise<void> {
+    PluginLog.log('Enabling plugin:', plugin.manifest.id);
+
+    try {
+      // Check if plugin requires Node.js execution consent
+      const hasConsent = await this._pluginService.checkNodeExecutionPermission(
+        plugin.manifest,
+      );
+      if (!hasConsent) {
+        PluginLog.log(
+          'User denied Node.js execution permission for plugin:',
+          plugin.manifest.id,
+        );
+        // The toggle switched itself on on click; turn it back off since nothing was enabled
+        event.source.checked = false;
+        return;
+      }
+
+      // Set plugin as enabled in persistence ONLY after consent is granted
+      await this._pluginMetaPersistenceService.setPluginEnabled(plugin.manifest.id, true);
+
+      // Activate the plugin (lazy load if needed)
+      // Pass true to indicate this is a manual activation from UI
+      const instance = await this._pluginService.activatePlugin(plugin.manifest.id, true);
+      if (instance) {
+        PluginLog.log('Plugin activated successfully:', plugin.manifest.id);
+      }
+
+      // Refresh UI with updated plugin states
+    } catch (error) {
+      PluginLog.err('Failed to enable plugin:', error);
+    }
+  }
+
+  private async disablePlugin(
+    plugin: PluginInstance,
+    event: MatSlideToggleChange,
+  ): Promise<void> {
+    PluginLog.log('Disabling plugin:', plugin.manifest.id);
+
+    // Check if this plugin has attached issue providers
+    const attachedProviders = this._allIssueProviders().filter(
+      (ip) =>
+        'pluginId' in ip && (ip as { pluginId: string }).pluginId === plugin.manifest.id,
+    );
+    if (attachedProviders.length > 0) {
+      if (
+        !(await this._confirmInDialog(T.PLUGINS.CONFIRM_DISABLE_WITH_ISSUE_PROVIDERS, {
+          count: attachedProviders.length,
+          name: escapeHtml(plugin.manifest.name),
+        }))
+      ) {
+        // The toggle switched itself off on click; turn it back on since the user cancelled
+        event.source.checked = true;
+        return;
+      }
+    }
+
+    try {
+      // Persist isEnabled=false, tear down the runtime, and revoke nodeExecution consent
+      // (session grant + persisted) in one place so re-enabling re-prompts — issue #8512
+      // Phase 2: "consent is revocable" via the existing toggle, no separate UI. See
+      // PluginService.disablePlugin for why the revoke is funnelled there.
+      await this._pluginService.disablePlugin(plugin.manifest.id);
+
+      // Reload plugins to get the updated state from the service
+    } catch (error) {
+      PluginLog.err('Failed to disable plugin:', error);
+    }
+  }
+
+  private _isListed(plugin: PluginInstance): boolean {
+    return isPluginListed(plugin, this._isShowDevPlugins, this._shownDevPluginIds);
+  }
+
+  isPluginLoading(plugin: PluginInstance): boolean {
+    const state = this._pluginService.pluginStates().get(plugin.manifest.id);
+    return state?.status === 'loading' || false;
+  }
+
+  requiresNodeExecution(plugin: PluginInstance): boolean {
+    return plugin.manifest.permissions?.includes('nodeExecution') || false;
+  }
+
+  canEnablePlugin(plugin: PluginInstance): boolean {
+    // Plugin can be enabled if there's no error AND either:
+    // 1. It doesn't require nodeExecution, OR
+    // 2. We're running in Electron
+    return !plugin.error && (!this.requiresNodeExecution(plugin) || IS_ELECTRON);
+  }
+
+  getPluginAuthor(plugin: PluginInstance): string | null {
+    const author = (plugin.manifest as PluginManifestAuthor).author;
+    return typeof author === 'string' && author.trim().length > 0 ? author.trim() : null;
+  }
+
+  getNodeExecutionMessage(): string {
+    return this._translateService.instant('PLUGINS.NODE_EXECUTION_REQUIRED');
+  }
+
+  async onFileSelected(event: Event): Promise<void> {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+
+    if (!file) {
+      return;
+    }
+
+    if (!file.name.endsWith('.zip')) {
+      this.uploadError.set(
+        this._translateService.instant(T.PLUGINS.PLEASE_SELECT_ZIP_FILE),
+      );
+      return;
+    }
+
+    if (file.size > MAX_PLUGIN_ZIP_SIZE) {
+      this.uploadError.set(
+        this._translateService.instant(T.PLUGINS.FILE_TOO_LARGE, {
+          maxSize: this.maxPluginSizeMB,
+          fileSize: (file.size / 1024 / 1024).toFixed(1),
+        }),
+      );
+      return;
+    }
+
+    this.uploadError.set(null);
+    if (!(await this._confirmInstall())) {
+      input.value = '';
+      return;
+    }
+
+    this.isUploading.set(true);
+
+    try {
+      const plugin = await this._pluginService.loadPluginFromZip(file);
+      // A plugin whose code fails at load time still resolves, with `error`
+      // set and its card showing the failure; only a clean load gets a snack.
+      if (!plugin.error) {
+        this._snackService.open({
+          type: 'SUCCESS',
+          msg: T.PLUGINS.PLUGIN_INSTALLED,
+          translateParams: { name: plugin.manifest.name },
+        });
+      }
+
+      // Clear the input
+      input.value = '';
+    } catch (error) {
+      PluginLog.err('Failed to load plugin from ZIP:', error);
+      this.uploadError.set(
+        error instanceof Error
+          ? error.message
+          : this._translateService.instant(T.PLUGINS.FAILED_TO_INSTALL),
+      );
+    } finally {
+      this.isUploading.set(false);
+    }
+  }
+
+  async clearPluginCache(): Promise<void> {
+    // Counts the same plugins clearUploadedPluginsFromMemory removes. With none
+    // installed, nothing visible is lost, so the cache is cleared without asking.
+    const uploadedCount = getUploadedPluginIds(this._pluginService.pluginStates()).length;
+    if (
+      uploadedCount > 0 &&
+      !(await this._confirmInDialog(
+        T.PLUGINS.CONFIRM_CLEAR_CACHE,
+        { count: uploadedCount },
+        T.PLUGINS.CLEAR_PLUGIN_CACHE,
+      ))
+    ) {
+      return;
+    }
+
+    try {
+      this.isUploading.set(true);
+      this.uploadError.set(null);
+
+      await this._pluginCacheService.clearCache();
+      // Awaited so persisted nodeExecution consent is cleared for every wiped uploaded
+      // plugin before the method returns (issue #8512 Phase 2 — see the service method).
+      await this._pluginService.clearUploadedPluginsFromMemory();
+
+      PluginLog.log('Plugin cache cleared successfully');
+    } catch (error) {
+      PluginLog.err('Failed to clear plugin cache:', error);
+      this.uploadError.set(
+        error instanceof Error
+          ? error.message
+          : this._translateService.instant(T.PLUGINS.FAILED_TO_CLEAR_CACHE),
+      );
+    } finally {
+      this.isUploading.set(false);
+    }
+  }
+
+  isUploadedPlugin(plugin: PluginInstance): boolean {
+    // Check if this is an uploaded plugin by checking if it has persistence data with 'uploaded' source
+    // This is a simple heuristic - uploaded plugins have the uploaded:// path prefix
+    return (
+      this._pluginService.getPluginPath(plugin.manifest.id)?.startsWith('uploaded://') ??
+      false
+    );
+  }
+
+  async removeUploadedPlugin(plugin: PluginInstance): Promise<void> {
+    // The name comes from the uploaded ZIP and the dialog renders the message as HTML.
+    if (
+      !(await this._confirmInDialog(
+        T.PLUGINS.CONFIRM_REMOVE,
+        { name: escapeHtml(plugin.manifest.name) },
+        T.PLUGINS.REMOVE,
+      ))
+    ) {
+      return;
+    }
+
+    try {
+      this.isUploading.set(true);
+      this.uploadError.set(null);
+
+      await this._pluginService.removeUploadedPlugin(plugin.manifest.id);
+
+      PluginLog.log(`Plugin ${plugin.manifest.id} removed successfully`);
+    } catch (error) {
+      PluginLog.err('Failed to remove plugin:', error);
+      this.uploadError.set(
+        error instanceof Error
+          ? error.message
+          : this._translateService.instant(T.PLUGINS.FAILED_TO_REMOVE),
+      );
+    } finally {
+      this.isUploading.set(false);
+    }
+  }
+
+  /** Resolves true only for the OK button; Cancel, Esc and backdrop resolve false. */
+  // Uploaded code is unreviewed, so the full risk list is shown here, right before it
+  // is installed, instead of above every plugin on the page.
+  private async _confirmInstall(): Promise<boolean> {
+    const t = (key: string): string => escapeHtml(this._translateService.instant(key));
+    const risks = [
+      T.PLUGINS.RISK_DATA_ACCESS,
+      T.PLUGINS.RISK_MALICIOUS_CODE,
+      T.PLUGINS.RISK_SYSTEM_ACCESS,
+      T.PLUGINS.RISK_PERFORMANCE,
+    ];
+    const message =
+      `<p>${t(T.PLUGINS.SECURITY_WARNING)}</p>` +
+      `<ul>${risks.map((risk) => `<li>${t(risk)}</li>`).join('')}</ul>` +
+      `<p>${t(T.PLUGINS.RECOMMENDATION)}</p>`;
+    const result = await firstValueFrom(
+      this._dialog
+        .open(DialogConfirmComponent, {
+          restoreFocus: true,
+          data: { message, okTxt: T.PLUGINS.INSTALL_PLUGIN },
+        })
+        .afterClosed(),
+    );
+    return result === true;
+  }
+
+  private async _confirmInDialog(
+    message: string,
+    translateParams: Record<string, string | number>,
+    okTxt?: string,
+  ): Promise<boolean> {
+    const result = await firstValueFrom(
+      this._dialog
+        .open(DialogConfirmComponent, {
+          restoreFocus: true,
+          data: { message, translateParams, okTxt },
+        })
+        .afterClosed(),
+    );
+    return result === true;
+  }
+
+  getPluginDescription(plugin: PluginInstance): string {
+    // Use manifest description if available
+    if (plugin.manifest.description) {
+      return plugin.manifest.description;
+    }
+
+    // Fallback: generate a basic description based on plugin manifest
+    const features: string[] = [];
+
+    if (plugin.manifest.hooks?.length > 0) {
+      features.push(
+        this._translateService.instant(T.PLUGINS.HOOKS, {
+          count: plugin.manifest.hooks.length,
+        }),
+      );
+    }
+
+    if (plugin.manifest.permissions?.length > 0) {
+      features.push(
+        this._translateService.instant(T.PLUGINS.PERMISSIONS, {
+          count: plugin.manifest.permissions.length,
+        }),
+      );
+    }
+
+    if (plugin.manifest.type) {
+      features.push(
+        this._translateService.instant(T.PLUGINS.TYPE, {
+          type: plugin.manifest.type,
+        }),
+      );
+    }
+
+    return features.length > 0
+      ? features.join(' • ')
+      : this._translateService.instant(T.PLUGINS.NO_ADDITIONAL_INFO);
+  }
+
+  /**
+   * Hosts the plugin can actually reach via `PluginAPI.request`. `allowedHosts` only takes
+   * effect when the plugin also declares the `http` capability — the bridge rejects `request`
+   * without it — so the UI must not advertise "network access" for `allowedHosts` alone.
+   */
+  getApiAccess(plugin: PluginInstance): PluginApiAccess[] {
+    return this._pluginSecurity.getDeclaredApiAccess(plugin.manifest);
+  }
+
+  /** Declared permissions not described by getApiAccess (nothing checks them). */
+  getOtherPermissions(plugin: PluginInstance): string[] {
+    const described = new Set(this.getApiAccess(plugin).map((a) => a.permission));
+    return (plugin.manifest.permissions ?? []).filter((p) => !described.has(p));
+  }
+
+  getDetailsTitle(plugin: PluginInstance): string {
+    const details = this._translateService.instant(T.PLUGINS.DETAILS);
+    const summary = this.getPermissionsHooksTitle(plugin);
+    return summary ? `${details} · ${summary}` : details;
+  }
+
+  getPermissionsHooksTitle(plugin: PluginInstance): string {
+    const parts: string[] = [];
+    const pCount = plugin.manifest.permissions?.length || 0;
+    const hCount = plugin.manifest.hooks?.length || 0;
+
+    if (pCount > 0) {
+      parts.push(`${this._translateService.instant(T.PLUGINS.PERMISSIONS)} (${pCount})`);
+    }
+    if (hCount > 0) {
+      parts.push(`${this._translateService.instant(T.PLUGINS.HOOKS)} (${hCount})`);
+    }
+
+    return parts.join(' / ');
+  }
+
+  hasConfigHandler(plugin: PluginInstance): boolean {
+    return this._pluginBridge.hasConfigHandler(plugin.manifest.id);
+  }
+
+  isIssueProviderPlugin(plugin: PluginInstance): boolean {
+    return plugin.manifest.type === 'issueProvider';
+  }
+
+  /**
+   * Sends the user to the issue-provider panel, the hub where connections are
+   * added and managed. Enabling an issue-provider plugin here only registers it;
+   * setup (and multiple connections per provider) lives in that panel's "+" tab,
+   * which is otherwise hard to find. Navigates to the work view first since the
+   * panel only renders there, then reveals it (guarded so we never toggle it shut).
+   */
+  goToIssuePanel(): Promise<void> {
+    return this._router.navigate(['/active/tasks']).then(() => {
+      if (!this._layoutService.isShowIssuePanel()) {
+        this._layoutService.toggleAddTaskPanel();
+      }
+    });
+  }
+
+  openPluginConfig(plugin: PluginInstance): void {
+    this._pluginBridge.invokeConfigHandler(plugin.manifest.id);
+  }
+
+  async openConfigDialog(plugin: PluginInstance): Promise<void> {
+    try {
+      // Get the plugin path
+      const pluginPath = this._pluginService.getPluginPath(plugin.manifest.id);
+      if (!pluginPath) {
+        throw new Error(`Plugin path not found for ${plugin.manifest.id}`);
+      }
+
+      // Load the JSON schema
+      const schema = await this._pluginConfigService.loadPluginConfigSchema(
+        plugin.manifest,
+        pluginPath,
+      );
+
+      // Open the config dialog
+      const dialogRef = this._dialog.open(PluginConfigDialogComponent, {
+        data: {
+          manifest: plugin.manifest,
+          schema,
+        },
+        width: '600px',
+        maxHeight: '80vh',
+      });
+
+      const result = await dialogRef.afterClosed().toPromise();
+      if (result) {
+        PluginLog.log(`Configuration saved for plugin ${plugin.manifest.id}`);
+      }
+    } catch (error) {
+      PluginLog.err('Failed to open config dialog:', error);
+      // A snack, not `uploadError`: that one renders in the "Install Plugin" card,
+      // far from the plugin whose settings button was clicked. The thrown messages
+      // are untranslated developer text, so they stay in the log above.
+      this._snackService.open({ type: 'ERROR', msg: T.PLUGINS.FAILED_TO_LOAD_CONFIG });
+    }
+  }
+
+  /**
+   * Comma-separated names of the plugin's languages, in the UI language.
+   * Plugins without `i18n.languages` are English-only.
+   */
+  getPluginLanguages(plugin: PluginInstance): string {
+    const languages = plugin.manifest.i18n?.languages;
+    const codes = languages?.length ? languages : [LanguageCode.en];
+    const displayNames = this._languageDisplayNames();
+
+    return codes.map((code) => getLanguageName(displayNames, code)).join(', ');
+  }
+
+  /**
+   * Check if plugin supports the current app language
+   */
+  supportsCurrentLanguage(plugin: PluginInstance): boolean {
+    const currentLang = this._globalConfigService.localization()?.lng;
+    if (!currentLang) {
+      return false;
+    }
+
+    const languages = plugin.manifest.i18n?.languages;
+    if (!languages || languages.length === 0) {
+      // English-only plugins support English
+      return currentLang === LanguageCode.en;
+    }
+
+    return languages.includes(currentLang);
+  }
+}
+
+/**
+ * Whether the plugins page lists `plugin`. Dev-only bundled plugins are listed only when
+ * `isShowDevPlugins` is set or once seen enabled; `shownDevPluginIds` remembers the latter.
+ */
+export const isPluginListed = (
+  plugin: PluginInstance,
+  isShowDevPlugins: boolean,
+  shownDevPluginIds: Set<string>,
+): boolean => {
+  const id = plugin.manifest.id;
+  if (isShowDevPlugins || !DEV_ONLY_BUNDLED_PLUGIN_IDS.has(id)) {
+    return true;
+  }
+  if (plugin.isEnabled) {
+    shownDevPluginIds.add(id);
+  }
+  return shownDevPluginIds.has(id);
+};

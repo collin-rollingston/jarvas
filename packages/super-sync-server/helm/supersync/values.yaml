@@ -1,0 +1,277 @@
+# -- Number of SuperSync replicas.
+# Running more than 1 replica requires a shared store (e.g., Redis) for in-memory caches and WebSocket connection state (not yet supported).
+replicaCount: 1
+
+image:
+  # -- SuperSync container image repository
+  repository: ghcr.io/super-productivity/supersync
+  # -- Image pull policy
+  pullPolicy: IfNotPresent
+  # -- Image tag to deploy. Defaults to "latest" because the chart appVersion has
+  # never been published as a tag, so falling back to it produced ImagePullBackOff
+  # on a default install. CI publishes `latest`, `master-<sha>` and, for published
+  # releases, `vX.Y.Z`. Pin this to a release tag for reproducible deploys.
+  tag: "latest"
+
+# -- Docker registry pull secrets
+imagePullSecrets: []
+# -- Override the release name prefix
+nameOverride: ""
+# -- Override the full release name
+fullnameOverride: ""
+
+serviceAccount:
+  # -- Whether to create a ServiceAccount
+  create: true
+  # -- Automount the service account token (not needed by this app)
+  automount: false
+  # -- Annotations to add to the ServiceAccount
+  annotations: {}
+  # -- The name of the ServiceAccount to use. If not set and create is true, a name is generated.
+  name: ""
+
+# -- SuperSync application configuration
+supersync:
+  # -- Application listening port
+  port: 1900
+  # -- Application bind address. Use "::" for IPv6-only deployments.
+  host: "0.0.0.0"
+  # -- Node.js environment
+  nodeEnv: production
+  # -- REQUIRED: Public URL of the sync server (e.g. https://sync.example.com)
+  publicUrl: ""
+  cors:
+    # -- Comma-separated list of allowed CORS origins
+    origins: "https://app.super-productivity.com"
+  # -- Peers whose X-Forwarded-* headers are trusted (proxy-addr keywords, IPs or
+  # CIDR ranges). Empty keeps the server default of "loopback,uniquelocal".
+  trustProxy: ""
+  cleanup:
+    # -- Max old operation ids selected/deleted for one user in a cleanup pass.
+    oldOpsDeleteBatchSize: 5000
+    # -- Max old operations deleted across all users in one cleanup pass.
+    oldOpsMaxDeletedPerRun: 25000
+    # -- UTC hour (0-23) to run the daily cleanup job at.
+    # Empty runs it 10s after start, then every 24h.
+    hourUtc: ""
+  webauthn:
+    # -- WebAuthn relying party display name, shown in your users' OS passkey prompt.
+    # Defaults to the relying-party ID when empty — do not ship someone else's brand here.
+    rpName: ""
+    # -- WebAuthn relying party ID (e.g. sync.example.com)
+    rpId: ""
+    # -- WebAuthn origin (e.g. https://sync.example.com)
+    origin: ""
+  smtp:
+    # -- Enable SMTP email sending
+    enabled: false
+    # -- SMTP server hostname
+    host: ""
+    # -- SMTP server port
+    port: 587
+    # -- Use TLS for SMTP
+    secure: false
+    # -- Sender email address
+    from: ""
+    # -- SMTP username
+    user: ""
+    # -- SMTP password
+    password: ""
+    # -- Use an existing Kubernetes secret for SMTP credentials.
+    # The secret must contain SMTP_USER and SMTP_PASS keys.
+    existingSecret: ""
+  privacy:
+    # -- Contact name for privacy policy
+    contactName: ""
+    # -- Street address for privacy policy
+    addressStreet: ""
+    # -- City for privacy policy
+    addressCity: ""
+    # -- Country for privacy policy
+    addressCountry: ""
+    # -- Contact email for privacy policy
+    contactEmail: ""
+    # -- Optional: your hosting provider, if a third party processes data on your behalf.
+    # The hosting section is omitted from the policy entirely when this is empty.
+    hostingProvider: ""
+    # -- Optional: the data-protection supervisory authority competent for you.
+    # When empty, the policy points users to the authority for their own residence.
+    supervisoryAuthority: ""
+  # -- Optional region label. "EU" or "EEA" shows the EU-hosting badge on the landing
+  # page; any other value shows no badge.
+  dataRegion: ""
+  # -- Restrict who may register: comma-separated exact addresses and/or *@domain rules.
+  # Empty means anyone who can reach the server may register.
+  allowedEmails: ""
+  # -- Per-user storage quota in bytes for accounts created from now on.
+  # Empty uses the built-in default (104857600 = 100 MB).
+  defaultStorageQuotaBytes: ""
+  # -- Agent task capture: the /mcp endpoint and /api/capture. Keep false on a
+  # multi-replica deployment; the retry window and per-grant limit are in-process.
+  captureConnectorEnabled: false
+  persistence:
+    # -- Enable persistent storage for /app/data
+    enabled: true
+    # -- Size of the persistent volume
+    size: 1Gi
+    # -- Storage class for the PVC. Empty string uses the default storage class.
+    storageClass: ""
+    # -- Access modes for the PVC
+    accessModes:
+      - ReadWriteOnce
+  secret:
+    # -- REQUIRED: JWT signing secret (minimum 32 characters)
+    jwtSecret: ""
+  # -- Use a pre-existing Kubernetes secret instead of creating one.
+  # The secret must contain a JWT_SECRET key.
+  existingSecret: ""
+
+# -- Built-in PostgreSQL configuration
+postgresql:
+  # -- Deploy a PostgreSQL instance alongside SuperSync.
+  # Set to false and configure externalDatabase to use an external PostgreSQL.
+  enabled: true
+  # -- Maximum Prisma connections when using the bundled 512Mi PostgreSQL.
+  connectionLimit: 20
+  image:
+    # -- PostgreSQL image repository
+    repository: postgres
+    # -- PostgreSQL image tag
+    tag: "16-alpine"
+    # -- PostgreSQL image pull policy
+    pullPolicy: IfNotPresent
+  # -- PostgreSQL database name
+  database: supersync
+  # -- PostgreSQL username
+  username: supersync
+  # -- PostgreSQL password (REQUIRED when postgresql.enabled is true)
+  password: ""
+  # -- Use an existing Kubernetes secret for the PostgreSQL password.
+  # The secret must contain a POSTGRES_PASSWORD key.
+  existingSecret: ""
+  persistence:
+    # -- Enable persistent storage for PostgreSQL data
+    enabled: true
+    # -- Size of the PostgreSQL persistent volume
+    size: 5Gi
+    # -- Storage class for the PostgreSQL PVC. Empty string uses the default.
+    storageClass: ""
+    # -- Access modes for the PostgreSQL PVC
+    accessModes:
+      - ReadWriteOnce
+  # -- Resource requests and limits for PostgreSQL
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+
+# -- External database configuration (used when postgresql.enabled is false)
+externalDatabase:
+  # -- Full PostgreSQL URL. Must include exactly one positive connection_limit
+  # and pool_timeout value. A pre-upgrade hook validates both before replacing
+  # a running pod, and the migration init container rechecks them, e.g.
+  # postgresql://user:pass@host:5432/dbname?connection_limit=60&pool_timeout=10
+  # The server must be PostgreSQL 14+ on a Linux host: migrations set
+  # client_connection_check_interval, which an older or non-Linux server
+  # rejects at connect (see the server README).
+  # Rendered as a plain pod env value, so the password is visible in
+  # `helm get manifest`, `kubectl describe pod` and release-history Secrets.
+  # Prefer existingSecret below for anything but a throwaway cluster.
+  url: ""
+  # -- Use an existing Kubernetes secret for the database URL.
+  # The secret must contain a DATABASE_URL key with the same pool parameters.
+  existingSecret: ""
+
+# -- Ingress configuration
+ingress:
+  # -- Enable ingress
+  enabled: false
+  # -- Ingress class name
+  className: ""
+  # -- Ingress annotations
+  # WebSocket support requires extended timeouts. Example for nginx-ingress:
+  #   nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+  #   nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+  # For Traefik:
+  #   traefik.ingress.kubernetes.io/router.middlewares: ...
+  annotations: {}
+  # -- Ingress host rules
+  hosts:
+    - host: sync.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  # -- Ingress TLS configuration
+  tls: []
+  #  - secretName: supersync-tls
+  #    hosts:
+  #      - sync.example.com
+
+# -- Service configuration
+service:
+  # -- Service type
+  type: ClusterIP
+  # -- Service port
+  port: 80
+
+# -- Resource requests and limits for the SuperSync container
+# Snapshot upload/replay can hold decompressed request data plus replay state
+# near MAX_SNAPSHOT_DECOMPRESSED_BYTES and MAX_REPLAY_STATE_SIZE_BYTES; the
+# image sets NODE_OPTIONS=--max-old-space-size=896 for a 1Gi memory limit.
+resources:
+  requests:
+    cpu: 100m
+    memory: 512Mi
+  limits:
+    memory: 1Gi
+
+# -- Horizontal Pod Autoscaler configuration
+autoscaling:
+  # -- Enable HPA
+  enabled: false
+  # -- Minimum number of replicas
+  minReplicas: 1
+  # -- Maximum number of replicas (must be 1 until shared WS state is implemented)
+  maxReplicas: 1
+  # -- Target CPU utilization percentage
+  targetCPUUtilizationPercentage: 80
+
+# -- Pod Disruption Budget configuration
+podDisruptionBudget:
+  # -- Enable PDB
+  enabled: false
+  # -- Maximum number of unavailable pods (use this instead of minAvailable for single-replica)
+  maxUnavailable: 1
+
+# -- Network Policy configuration
+networkPolicy:
+  # -- Enable NetworkPolicy
+  enabled: false
+  # -- Namespace of the ingress controller (for ingress from: selector)
+  ingressNamespace: "ingress-nginx"
+
+# -- Node selector for pod scheduling
+nodeSelector: {}
+# -- Tolerations for pod scheduling
+tolerations: []
+# -- Affinity rules for pod scheduling
+affinity: {}
+# -- Annotations to add to pods
+podAnnotations: {}
+# -- Labels to add to pods
+podLabels: {}
+# -- Pod-level security context
+podSecurityContext:
+  fsGroup: 1001
+# -- Container-level security context
+securityContext:
+  runAsUser: 1001
+  runAsGroup: 1001
+  runAsNonRoot: true
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL

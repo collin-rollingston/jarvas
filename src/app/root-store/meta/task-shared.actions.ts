@@ -1,0 +1,602 @@
+import { createActionGroup } from '@ngrx/store';
+import { SUPER_SYNC_MAX_ENTITY_IDS_PER_OP } from '@sp/shared-schema';
+import { Update } from '@ngrx/entity';
+import { Task, TaskWithSubTasks } from '../../features/tasks/task.model';
+import { IssueDataReduced } from '../../features/issue/issue.model';
+import { WorkContextType } from '../../features/work-context/work-context.model';
+import { BatchOperation } from '@super-productivity/plugin-api';
+import { PersistentActionMeta } from '../../op-log/core/persistent-action.interface';
+import { OpType } from '../../op-log/core/operation.types';
+import { shouldClearDueTimeForToday } from '../../util/is-today.util';
+
+/**
+ * Payload marker stamped on every new `deleteProject` operation so the LWW
+ * conflict planner can give it delete-wins precedence. Shared with the sync
+ * classifier (`conflict-resolution.service.ts`) so a rename is compiler-checked
+ * on both ends — dropping/renaming it silently would regress to resurrecting an
+ * empty project (see ARCHITECTURE-DECISIONS.md #7).
+ */
+export const PROJECT_DELETE_WINS_MARKER = 'projectDeleteWins';
+
+export interface CalendarAutoImportDismissal {
+  issueProviderId: string;
+  issueId: string;
+}
+
+export const getCalendarAutoImportDismissals = (
+  tasks: readonly Task[],
+): CalendarAutoImportDismissal[] =>
+  tasks.flatMap((task) =>
+    task.issueType === 'ICAL' && task.issueProviderId && task.issueId
+      ? [{ issueProviderId: task.issueProviderId, issueId: task.issueId }]
+      : [],
+  );
+
+interface ArchivedTaskLike {
+  id?: unknown;
+  subTaskIds?: unknown;
+  subTasks?: unknown;
+}
+
+const asArchivedTaskLike = (value: unknown): ArchivedTaskLike | undefined =>
+  value && typeof value === 'object' ? (value as ArchivedTaskLike) : undefined;
+
+const asArray = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
+
+/**
+ * Every task entity a `moveToArchive` removes from active state: the tasks it
+ * names PLUS the subtasks its reducer cascades to.
+ *
+ * `meta.entityIds` is the footprint conflict detection works on — client-side
+ * (`getOpEntityIds` → one conflict row per id) and server-side (the upload
+ * conflict probe). Declaring only the top-level ids meant a concurrent edit to
+ * a SUBTASK of an archived parent never got "archive wins" precedence: its
+ * LWW-resolved snapshot was accepted after the archive and recreated the
+ * subtask next to its archived copy.
+ *
+ * Parents come first so `entityId` (= `entityIds[0]`, assigned in
+ * `operation-log.effects.ts`) stays a top-level task id. Deduped, and
+ * non-string entries are dropped because this array goes on the wire.
+ *
+ * Old ops in existing logs carry top-level ids only; every consumer re-derives
+ * the cascade from the payload/state, so both shapes stay valid.
+ */
+export const collectArchivedTaskEntityIds = (tasks: readonly unknown[]): string[] => {
+  const topLevelIds = tasks.flatMap((task) => {
+    const id = asArchivedTaskLike(task)?.id;
+    return typeof id === 'string' && id !== '' ? [id] : [];
+  });
+  const ids = new Set<string>(topLevelIds);
+  for (const task of tasks) {
+    const taskLike = asArchivedTaskLike(task);
+    if (!taskLike) continue;
+    for (const id of asArray(taskLike.subTaskIds)) {
+      if (typeof id === 'string' && id !== '') ids.add(id);
+    }
+    for (const subTask of asArray(taskLike.subTasks)) {
+      const id = asArchivedTaskLike(subTask)?.id;
+      if (typeof id === 'string' && id !== '') ids.add(id);
+    }
+  }
+  // The server rejects an op declaring more ids than this (INVALID_ENTITY_ID),
+  // which would strand that archive unsynced forever. Degrading to the
+  // pre-cascade footprint keeps a mass archive syncing: receivers still derive
+  // the cascade from the payload.
+  return ids.size > SUPER_SYNC_MAX_ENTITY_IDS_PER_OP ? topLevelIds : [...ids];
+};
+
+/**
+ * Shared actions that affect multiple reducers (tasks, projects, tags)
+ * These actions are handled by the task-shared meta-reducer
+ */
+export const TaskSharedActions = createActionGroup({
+  source: 'Task Shared',
+  events: {
+    // Task Management
+    addTask: (taskProps: {
+      task: Task;
+      issue?: IssueDataReduced;
+      workContextId: string;
+      workContextType: WorkContextType;
+      isAddToBacklog: boolean;
+      isAddToBottom: boolean;
+      isIgnoreShortSyntax?: boolean;
+      autoPlanToday?: string;
+      autoPlanStartOfNextDayDiffMs?: number;
+      isExampleTask?: boolean;
+    }) => ({
+      ...taskProps,
+      meta: {
+        isPersistent: true,
+        entityType: 'TASK',
+        entityId: taskProps.task.id,
+        opType: OpType.Create,
+      } satisfies PersistentActionMeta,
+    }),
+
+    convertToMainTask: (taskProps: {
+      task: Task;
+      parentTagIds?: string[];
+      isPlanForToday?: boolean;
+      afterTaskId?: string | null;
+      isDone?: boolean;
+      today?: string;
+      doneOn?: number;
+      modified?: number;
+    }) => ({
+      ...taskProps,
+      meta: {
+        isPersistent: true,
+        entityType: 'TASK',
+        entityId: taskProps.task.id,
+        opType: OpType.Update,
+      } satisfies PersistentActionMeta,
+    }),
+
+    convertToSubTask: (taskProps: {
+      taskId: string;
+      targetParentId: string;
+      afterTaskId: string | null;
+    }) => ({
+      ...taskProps,
+      meta: {
+        isPersistent: true,
+        entityType: 'TASK',
+        entityId: taskProps.taskId,
+        opType: OpType.Update,
+      } satisfies PersistentActionMeta,
+    }),
+
+    deleteTask: (taskProps: { task: TaskWithSubTasks }) => ({
+      ...taskProps,
+      meta: {
+        isPersistent: true,
+        entityType: 'TASK',
+        entityId: taskProps.task.id,
+        opType: OpType.Delete,
+      } satisfies PersistentActionMeta,
+    }),
+
+    // Issue metadata for remote issue deletion still travels through
+    // DeletedTaskIssueSidecarService. Task snapshots are persisted separately
+    // so a concurrent winning update can recreate an entity after this delete.
+    deleteTasks: (taskProps: { taskIds: string[]; tasks?: Task[] }) => {
+      const calendarAutoImportDismissals = getCalendarAutoImportDismissals(
+        taskProps.tasks ?? [],
+      );
+      return {
+        ...taskProps,
+        ...(calendarAutoImportDismissals.length > 0 && {
+          calendarAutoImportDismissals,
+        }),
+        meta: {
+          isPersistent: true,
+          entityType: 'TASK',
+          entityIds: taskProps.taskIds,
+          opType: OpType.Delete,
+          isBulk: true,
+        } satisfies PersistentActionMeta,
+      };
+    },
+
+    // TODO rename to `moveTaskToArchive__` to indicate it should not be called directly
+    // Note: Full task payload is required for sync reliability.
+    // Remote clients need task data to write to their local archive.
+    // See docs/sync-and-op-log/operation-log-architecture.md for detailed analysis.
+    moveToArchive: (taskProps: { tasks: TaskWithSubTasks[] }) => ({
+      ...taskProps,
+      meta: {
+        isPersistent: true,
+        entityType: 'TASK',
+        // Includes the subtasks the reducer cascades to — see
+        // collectArchivedTaskEntityIds for why the footprint must be complete.
+        entityIds: collectArchivedTaskEntityIds(taskProps.tasks),
+        opType: OpType.Update,
+        isBulk: true,
+      } satisfies PersistentActionMeta,
+    }),
+
+    restoreTask: (taskProps: {
+      task: Task | TaskWithSubTasks;
+      subTasks: Task[];
+      restoreToToday?: {
+        today: string;
+        startOfNextDayDiffMs: number;
+      };
+    }) => {
+      const { restoreToToday } = taskProps;
+      // Materialize Today placement into the snapshot fields so a released
+      // conflict converter degrades to visible-but-unordered Today membership
+      // instead of losing the restore. Clearing rules match handlePlanTasksForToday.
+      const shouldClearTime =
+        !!restoreToToday &&
+        shouldClearDueTimeForToday(
+          taskProps.task.dueWithTime,
+          restoreToToday.today,
+          restoreToToday.startOfNextDayDiffMs,
+        );
+      const task = restoreToToday
+        ? {
+            ...taskProps.task,
+            dueDay: restoreToToday.today,
+            remindAt: undefined,
+            ...(shouldClearTime ? { dueWithTime: undefined } : {}),
+          }
+        : taskProps.task;
+      const subTasks = restoreToToday
+        ? taskProps.subTasks.map((subTask) => ({
+            ...subTask,
+            dueDay: undefined,
+            dueWithTime: undefined,
+            remindAt: undefined,
+          }))
+        : taskProps.subTasks;
+      return {
+        ...taskProps,
+        task,
+        subTasks,
+        meta: {
+          isPersistent: true,
+          entityType: 'TASK',
+          entityId: task.id,
+          opType: OpType.Update,
+        } satisfies PersistentActionMeta,
+      };
+    },
+
+    // Restore a deleted task (undo delete) - syncs across devices
+    restoreDeletedTask: (payload: {
+      task: TaskWithSubTasks;
+      projectContext?: {
+        projectId: string;
+        taskIdsForProject: string[];
+        taskIdsForProjectBacklog: string[];
+      };
+      parentContext?: {
+        parentTaskId: string;
+        subTaskIds: string[];
+      };
+      tagTaskIdMap: Record<string, string[]>;
+      deletedTaskEntities: Record<string, Task | undefined>;
+    }) => ({
+      ...payload,
+      meta: {
+        isPersistent: true,
+        entityType: 'TASK',
+        entityId: payload.task.id,
+        opType: OpType.Update,
+      } satisfies PersistentActionMeta,
+    }),
+
+    // Task Scheduling
+    scheduleTaskWithTime: (taskProps: {
+      task: Task;
+      dueWithTime: number;
+      remindAt?: number;
+      isMoveToBacklog: boolean;
+      isSkipAutoRemoveFromToday?: boolean;
+    }) => ({
+      ...taskProps,
+      meta: {
+        isPersistent: true,
+        entityType: 'TASK',
+        entityId: taskProps.task.id,
+        opType: OpType.Update,
+      } satisfies PersistentActionMeta,
+    }),
+
+    reScheduleTaskWithTime: (taskProps: {
+      task: Task;
+      dueWithTime: number;
+      remindAt?: number;
+      isMoveToBacklog: boolean;
+      isSkipAutoRemoveFromToday?: boolean;
+    }) => ({
+      ...taskProps,
+      meta: {
+        isPersistent: true,
+        entityType: 'TASK',
+        entityId: taskProps.task.id,
+        opType: OpType.Update,
+      } satisfies PersistentActionMeta,
+    }),
+
+    unscheduleTask: (taskProps: {
+      id: string;
+      isSkipToast?: boolean;
+      isLeaveInToday?: boolean;
+      today?: string;
+    }) => ({
+      ...taskProps,
+      meta: {
+        isPersistent: true,
+        entityType: 'TASK',
+        entityId: taskProps.id,
+        opType: OpType.Update,
+      } satisfies PersistentActionMeta,
+    }),
+
+    dismissReminderOnly: (taskProps: { id: string; isSkipSnack?: boolean }) => ({
+      ...taskProps,
+      meta: {
+        isPersistent: true,
+        entityType: 'TASK',
+        entityId: taskProps.id,
+        opType: OpType.Update,
+      } satisfies PersistentActionMeta,
+    }),
+
+    // Task Deadlines
+    setDeadline: (taskProps: {
+      taskId: string;
+      deadlineDay?: string;
+      deadlineWithTime?: number;
+      deadlineRemindAt?: number;
+      autoPlanToday?: string;
+      autoPlanStartOfNextDayDiffMs?: number;
+      isSkipSnack?: boolean;
+    }) => ({
+      ...taskProps,
+      meta: {
+        isPersistent: true,
+        entityType: 'TASK',
+        entityId: taskProps.taskId,
+        opType: OpType.Update,
+      } satisfies PersistentActionMeta,
+    }),
+
+    planDeadlineTasksForToday: (taskProps: {
+      taskIds: string[];
+      today: string;
+      startOfNextDayDiffMs: number;
+    }) => ({
+      ...taskProps,
+      meta: {
+        isPersistent: true,
+        entityType: 'TASK',
+        entityIds: taskProps.taskIds,
+        opType: OpType.Update,
+        isBulk: true,
+      } satisfies PersistentActionMeta,
+    }),
+
+    removeDeadline: (taskProps: { taskId: string; isSkipSnack?: boolean }) => ({
+      ...taskProps,
+      meta: {
+        isPersistent: true,
+        entityType: 'TASK',
+        entityId: taskProps.taskId,
+        opType: OpType.Update,
+      } satisfies PersistentActionMeta,
+    }),
+
+    clearDeadlineReminder: (taskProps: { taskId: string }) => ({
+      ...taskProps,
+      meta: {
+        isPersistent: true,
+        entityType: 'TASK',
+        entityId: taskProps.taskId,
+        opType: OpType.Update,
+      } satisfies PersistentActionMeta,
+    }),
+
+    // Task Updates
+    updateTask: (taskProps: {
+      task: Update<Task>;
+      isIgnoreShortSyntax?: boolean;
+      projectMoveSubTaskIds?: string[];
+    }) => {
+      const entityId = taskProps.task.id as string;
+
+      return {
+        ...taskProps,
+        meta: {
+          isPersistent: true,
+          entityType: 'TASK',
+          entityId,
+          ...(taskProps.projectMoveSubTaskIds !== undefined && {
+            entityIds: Array.from(
+              new Set([entityId, ...taskProps.projectMoveSubTaskIds]),
+            ),
+          }),
+          opType: OpType.Update,
+        } satisfies PersistentActionMeta,
+      };
+    },
+
+    // Bulk task update - creates single operation instead of N operations
+    // Critical for repeating task config updates that affect many archived instances
+    updateTasks: (taskProps: { tasks: Update<Task>[] }) => ({
+      ...taskProps,
+      meta: {
+        isPersistent: true,
+        entityType: 'TASK',
+        entityIds: taskProps.tasks.map((t) => t.id as string),
+        opType: OpType.Update,
+        isBulk: true,
+      } satisfies PersistentActionMeta,
+    }),
+
+    // Project Management
+    moveToOtherProject: (taskProps: {
+      task: TaskWithSubTasks;
+      targetProjectId: string;
+    }) => ({
+      ...taskProps,
+      meta: {
+        isPersistent: true,
+        entityType: 'TASK',
+        entityId: taskProps.task.id,
+        opType: OpType.Update,
+      } satisfies PersistentActionMeta,
+    }),
+
+    deleteProject: (taskProps: {
+      projectId: string;
+      noteIds: string[];
+      allTaskIds: string[];
+    }) => ({
+      ...taskProps,
+      [PROJECT_DELETE_WINS_MARKER]: true as const,
+      meta: {
+        isPersistent: true,
+        entityType: 'PROJECT',
+        entityId: taskProps.projectId,
+        opType: OpType.Delete,
+      } satisfies PersistentActionMeta,
+    }),
+
+    // Today Tag Management
+    planTasksForToday: (taskProps: {
+      taskIds: string[];
+      // The logical day "today" referred to when the action was created.
+      // Optional only for legacy operation replay and older tests.
+      today?: string;
+      startOfNextDayDiffMs?: number;
+      parentTaskMap?: { [taskId: string]: string | undefined };
+      isShowSnack?: boolean;
+      isSkipRemoveReminder?: boolean;
+      isClearScheduledTime?: boolean;
+    }) => ({
+      ...taskProps,
+      meta: {
+        isPersistent: true,
+        entityType: 'TASK',
+        entityIds: taskProps.taskIds,
+        opType: OpType.Update,
+        isBulk: true,
+      } satisfies PersistentActionMeta,
+    }),
+
+    removeTasksFromTodayTag: (taskProps: { taskIds: string[] }) => ({
+      ...taskProps,
+      meta: {
+        isPersistent: true,
+        entityType: 'TASK',
+        entityIds: taskProps.taskIds,
+        opType: OpType.Update,
+        isBulk: true,
+      } satisfies PersistentActionMeta,
+    }),
+
+    // Non-persistent variant for automated day-change overdue removal.
+    // Every device runs removeOverdueFormToday$ independently, so syncing this
+    // operation is redundant and causes LWW conflicts with user actions on other
+    // devices (see #6992). The meta-reducer handles it identically to
+    // removeTasksFromTodayTag but the operation log ignores it.
+    localRemoveOverdueFromToday: (taskProps: { taskIds: string[] }) => ({
+      ...taskProps,
+    }),
+
+    // Tag Management
+    addTagToTask: (props: { tagId: string; taskId: string }) => ({
+      ...props,
+      meta: {
+        isPersistent: true,
+        entityType: 'TASK',
+        entityIds: [props.taskId, props.tagId],
+        opType: OpType.Update,
+      } satisfies PersistentActionMeta,
+    }),
+
+    removeTagsForAllTasks: (taskProps: { tagIdsToRemove: string[] }) => ({
+      ...taskProps,
+      meta: {
+        isPersistent: true,
+        entityType: 'TAG',
+        entityIds: taskProps.tagIdsToRemove,
+        opType: OpType.Update,
+        isBulk: true,
+      } satisfies PersistentActionMeta,
+    }),
+
+    moveTaskInTodayTagList: (taskProps: { toTaskId: string; fromTaskId: string }) => ({
+      ...taskProps,
+      meta: {
+        isPersistent: true,
+        entityType: 'TASK',
+        entityIds: [taskProps.toTaskId, taskProps.fromTaskId],
+        opType: OpType.Move,
+        isBulk: true,
+      } satisfies PersistentActionMeta,
+    }),
+
+    // Batch Operations
+    batchUpdateForProject: (taskProps: {
+      projectId: string;
+      operations: BatchOperation[];
+      createdTaskIds: { [tempId: string]: string };
+      /** Captured before dispatch so replay creates identical task state. */
+      createdTaskTimestamp?: number;
+    }) => ({
+      ...taskProps,
+      meta: {
+        isPersistent: true,
+        entityType: 'PROJECT',
+        entityId: taskProps.projectId,
+        opType: OpType.Batch,
+      } satisfies PersistentActionMeta,
+    }),
+
+    // Issue Provider Management
+    deleteIssueProvider: (props: {
+      issueProviderId: string;
+      taskIdsToUnlink: string[];
+    }) => ({
+      ...props,
+      meta: {
+        isPersistent: true,
+        entityType: 'ISSUE_PROVIDER',
+        entityId: props.issueProviderId,
+        opType: OpType.Delete,
+      } satisfies PersistentActionMeta,
+    }),
+
+    deleteIssueProviders: (props: { ids: string[]; taskIdsToUnlink: string[] }) => ({
+      ...props,
+      meta: {
+        isPersistent: true,
+        entityType: 'ISSUE_PROVIDER',
+        entityIds: props.ids,
+        opType: OpType.Delete,
+        isBulk: true,
+      } satisfies PersistentActionMeta,
+    }),
+
+    // Task Repeat Config Management
+    deleteTaskRepeatCfg: (props: { taskRepeatCfgId: string }) => ({
+      ...props,
+      meta: {
+        isPersistent: true,
+        entityType: 'TASK_REPEAT_CFG',
+        entityId: props.taskRepeatCfgId,
+        opType: OpType.Delete,
+      } satisfies PersistentActionMeta,
+    }),
+
+    // Short Syntax - Atomic compound action
+    // Combines task updates, project moves, and scheduling into one atomic operation
+    applyShortSyntax: (props: {
+      task: Task;
+      taskChanges: Partial<Task>;
+      targetProjectId?: string;
+      schedulingInfo?: {
+        day?: string;
+        isAddToTop?: boolean;
+        dueWithTime?: number;
+        remindAt?: number | null;
+        isMoveToBacklog?: boolean;
+      };
+      autoPlanToday?: string;
+      autoPlanStartOfNextDayDiffMs?: number;
+    }) => ({
+      ...props,
+      meta: {
+        isPersistent: true,
+        entityType: 'TASK',
+        entityId: props.task.id,
+        opType: OpType.Update,
+      } satisfies PersistentActionMeta,
+    }),
+  },
+});

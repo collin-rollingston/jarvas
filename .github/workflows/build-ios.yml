@@ -1,0 +1,206 @@
+name: iOS App Store Release on Release
+on:
+  push:
+    tags:
+      - v*
+  workflow_dispatch:
+    inputs:
+      build_only:
+        description: 'Build and export IPA without uploading to App Store Connect'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  ios-app-store-release:
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      UNSPLASH_KEY: ${{ secrets.UNSPLASH_KEY }}
+      UNSPLASH_CLIENT_ID: ${{ secrets.UNSPLASH_CLIENT_ID }}
+
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
+        with:
+          node-version: 22
+      - name: Check out Git repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      # work around for npm installs from git+https://github.com/johannesjo/J2M.git
+      - name: Reconfigure git to use HTTP authentication
+        run: >
+          git config --global url."https://github.com/".insteadOf
+          ssh://git@github.com/
+
+      - name: Configure iOS signing
+        uses: ./.github/actions/setup-ios-signing
+        with:
+          mac_certs: ${{ secrets.apple_distribution_cert }}
+          mac_certs_password: ${{ secrets.apple_distribution_cert_password }}
+          ios_provision_profile: ${{ secrets.IOS_APP_STORE_PROFILE }}
+          ios_share_provision_profile: ${{ secrets.IOS_SHARE_APP_STORE_PROFILE }}
+          ios_widget_provision_profile: ${{ secrets.IOS_WIDGET_APP_STORE_PROFILE }}
+
+      - name: Get npm cache directory
+        id: npm-cache-dir
+        run: |
+          echo "dir=$(npm config get cache)" >> $GITHUB_OUTPUT
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v5
+        id: npm-cache
+        with:
+          path: ${{ steps.npm-cache-dir.outputs.dir }}
+          key: ${{ runner.os }}-node22-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node22-
+
+      - name: Install npm Packages
+        run: npm i
+
+      - name: Generate environment
+        run: npm run env
+
+      - name: Set iOS version from package.json
+        run: |
+          FULL_VERSION=$(node -p "require('./package.json').version")
+          # Strip pre-release suffix (e.g., "17.0.0-RC.3" -> "17.0.0")
+          # App Store requires X.Y.Z format; build number differentiates uploads
+          VERSION=$(echo "$FULL_VERSION" | sed 's/-.*//')
+          BUILD_NUMBER=$(date +%Y%m%d%H%M)
+          echo "Setting iOS version to $VERSION (build $BUILD_NUMBER) [from $FULL_VERSION]"
+          # Passed to xcodebuild as build settings instead of rewriting plists
+          # with agvtool, which silently skipped ShareExtension/Info.plist's
+          # one-line <key>/<string> layout and left it at 1.0.
+          echo "IOS_MARKETING_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "IOS_BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+
+      - name: Build Angular frontend
+        run: npm run buildFrontend:prodWeb
+
+      - name: Sync Capacitor iOS
+        run: npm run sync:ios
+
+      - name: Install CocoaPods
+        run: |
+          cd ios/App
+          pod install
+
+      - name: Archive iOS app
+        run: |
+          cd ios/App
+          # Archive without code signing - signing is handled during export
+          # This avoids conflicts with CocoaPods frameworks
+          xcodebuild archive \
+            -workspace App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -destination 'generic/platform=iOS' \
+            MARKETING_VERSION="$IOS_MARKETING_VERSION" \
+            CURRENT_PROJECT_VERSION="$IOS_BUILD_NUMBER" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Create ExportOptions.plist
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>method</key>
+              <string>app-store-connect</string>
+              <key>teamID</key>
+              <string>${{ secrets.APPLE_TEAM_ID }}</string>
+              <key>uploadSymbols</key>
+              <true/>
+              <key>signingStyle</key>
+              <string>manual</string>
+              <key>provisioningProfiles</key>
+              <dict>
+                  <key>com.super-productivity.app</key>
+                  <string>${{ env.PROVISIONING_PROFILE_UUID }}</string>
+              </dict>
+          </dict>
+          </plist>
+          EOF
+
+          if [ -f ios/App/ShareExtension/Info.plist ]; then
+            if [ -z "${SHARE_PROVISIONING_PROFILE_UUID:-}" ]; then
+              echo "ERROR: ShareExtension target requires IOS_SHARE_PROVISION_PROFILE"
+              exit 1
+            fi
+            /usr/libexec/PlistBuddy -c \
+              "Add :provisioningProfiles:com.super-productivity.app.ShareExtension string $SHARE_PROVISIONING_PROFILE_UUID" \
+              "$RUNNER_TEMP/ExportOptions.plist"
+          fi
+
+          if [ -f ios/App/SupWidget/Info.plist ]; then
+            if [ -z "${WIDGET_PROVISIONING_PROFILE_UUID:-}" ]; then
+              echo "ERROR: SupWidget target requires the IOS_WIDGET_PROVISION_PROFILE secret"
+              echo "(an App Store profile for com.super-productivity.app.widget; the app"
+              echo "profile must also carry the App Group). Setup steps:"
+              echo "ios/App/SupWidget/README.md"
+              exit 1
+            fi
+            /usr/libexec/PlistBuddy -c \
+              "Add :provisioningProfiles:com.super-productivity.app.widget string $WIDGET_PROVISIONING_PROFILE_UUID" \
+              "$RUNNER_TEMP/ExportOptions.plist"
+          fi
+
+      - name: Export IPA
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -exportPath "$RUNNER_TEMP/ipa-output" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist"
+
+      - name: List exported files
+        run: ls -la "$RUNNER_TEMP/ipa-output"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sup-ios-release
+          path: ${{ runner.temp }}/ipa-output/*.ipa
+
+      - name: Set up Ruby and fastlane
+        # Pinned by SHA per repo policy. ruby-version is required: with no
+        # .ruby-version file in the repo the action errors out rather than
+        # using system Ruby. bundler-cache runs `bundle install` and caches the
+        # ~210-gem fastlane tree so it isn't reinstalled each run.
+        uses: ruby/setup-ruby@e81a8fa391b11a595c1b7ed84177cc0fe02faf83 # v1.328.0
+        with:
+          ruby-version: '3.3'
+          bundler-cache: true
+
+      - name: Prepare App Store release notes
+        run: node tools/prepare-appstore-release-notes.js
+
+      # Upload the IPA to App Store Connect and (for final release tags) submit
+      # it for review with automatic release on approval. Pre-release tags (any
+      # tag containing "-", e.g. -rc.0/-beta.1) and manual runs only upload the
+      # build (TestFlight). The "-" check is case-insensitive by construction,
+      # unlike contains(...,'RC'); the repo's RC tags are mostly lowercase.
+      - name: Upload to App Store Connect and submit for review
+        if: ${{ !inputs.build_only }}
+        env:
+          ASC_KEY_ID: ${{ secrets.mac_api_key_id }}
+          ASC_ISSUER_ID: ${{ secrets.mac_api_key_issuer_id }}
+          ASC_KEY_CONTENT: ${{ secrets.mac_api_key }}
+          SUBMIT_FOR_REVIEW: ${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-') }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          ipas=("$RUNNER_TEMP"/ipa-output/*.ipa)
+          if [ ${#ipas[@]} -ne 1 ]; then
+            echo "Expected exactly 1 .ipa, found ${#ipas[@]}: ${ipas[*]:-none}"
+            exit 1
+          fi
+          export IPA_PATH="${ipas[0]}"
+          echo "Submitting $IPA_PATH (submit_for_review=$SUBMIT_FOR_REVIEW)"
+          bundle exec fastlane ios release

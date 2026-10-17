@@ -1,0 +1,38 @@
+:host {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  width: 100%;
+  height: 100%;
+}
+
+.breathing-dot-inner {
+  width: var(--breathing-dot-size, 144px);
+  height: var(--breathing-dot-size, 144px);
+  max-width: 100%;
+  max-height: 100%;
+  background-color: var(--c-primary);
+  border-radius: 50%;
+  // Rest on the last keyframe once the breaths are done.
+  opacity: 0.4;
+  // A few breaths, then stillness: an infinite animation redraws every frame
+  // for the whole session, keeping the GPU awake on battery.
+  animation: breathe 8s ease-in-out 3;
+  box-shadow: 0 0 40px var(--c-primary);
+
+  &.is-paused {
+    animation-play-state: paused;
+  }
+}
+
+@keyframes breathe {
+  50% {
+    transform: scale(0.4);
+    opacity: 0.1;
+  }
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.4;
+  }
+}

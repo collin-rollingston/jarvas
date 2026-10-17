@@ -1,0 +1,185 @@
+import { NgModule } from '@angular/core';
+import { CommonModule } from '@angular/common';
+import { MarkdownModule } from 'ngx-markdown';
+import { FormsModule, ReactiveFormsModule } from '@angular/forms';
+import { FORMLY_CONFIG, FormlyModule } from '@ngx-formly/core';
+import { InputDurationFormlyComponent } from './duration/input-duration-formly/input-duration-formly.component';
+import { InputTimeFormlyComponent } from './input-time/input-time-formly/input-time-formly.component';
+import { ValidationModule } from './validation/validation.module';
+import { TranslateService } from '@ngx-translate/core';
+import { FormlyMaterialModule } from '@ngx-formly/material';
+import { FormlyJsonschema } from '@ngx-formly/core/json-schema';
+import { registerTranslateExtension } from './formly-translate-extension/formly-translate-extension';
+import { FormlyTranslatedTemplateComponent } from './formly-translated-template/formly-translated-template.component';
+import { FormlyMatToggleModule } from '@ngx-formly/material/toggle';
+import { FormlyLinkWidgetComponent } from './formly-link-widget/formly-link-widget.component';
+
+import { FormlyCollapsibleComponent } from './formly-collapsible/formly-collapsible.component';
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
+import { KeyboardInputComponent } from '../features/config/keyboard-input/keyboard-input.component';
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
+import { IconInputComponent } from '../features/config/icon-input/icon-input.component';
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
+import { SelectProjectComponent } from '../features/config/select-project/select-project.component';
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
+import { RepeatSectionTypeComponent } from '../features/config/repeat-section-type/repeat-section-type.component';
+import { FormlySliderComponent } from './formly-slider/formly-slider.component';
+import { FormlyTagSelectionComponent } from './formly-tag-selection/formly-tag-selection.component';
+import { FormlyBtnComponent } from './formly-button/formly-btn.component';
+import { FormlyLocalRestApiSettingsComponent } from './formly-local-rest-api-settings/formly-local-rest-api-settings.component';
+import { FormlyAssistantAccessSettingsComponent } from './formly-assistant-access-settings/formly-assistant-access-settings.component';
+import { FormlyImageInputComponent } from './formly-image-input/formly-image-input.component';
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
+import { ColorInputComponent } from '../features/config/color-input/color-input.component';
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
+import { StartPageSelectComponent } from '../features/config/start-page-select/start-page-select.component';
+import { FormlySlideToggleComponent } from './formly-slide-toggle/formly-slide-toggle.component';
+import { FormlyDatePickerComponent } from './formly-date-picker/formly-date-picker.component';
+
+/**
+ * Root-only module. Import ONLY in main.ts via importProvidersFrom().
+ * Components should import FormlyModule from '@ngx-formly/core' directly.
+ */
+@NgModule({
+  imports: [
+    CommonModule,
+    FormsModule,
+    FormlySliderComponent,
+    ReactiveFormsModule,
+    FormlyModule.forRoot({
+      validationMessages: [
+        { name: 'pattern', message: 'Invalid input' },
+        { name: 'required', message: 'This field is required' },
+        { name: 'min', message: 'Value is too low' },
+        { name: 'max', message: 'Value is too high' },
+        { name: 'minLength', message: 'Value is too short' },
+        { name: 'maxLength', message: 'Value is too long' },
+      ],
+      types: [
+        // Formly's material checkbox defaults `indeterminate` to true and renders
+        // that state whenever the value is null — so any checkbox nobody has
+        // touched yet shows "[-]" instead of unticked. A boolean setting has no
+        // third state; every consumer here reads a missing value as false. Set
+        // once centrally rather than per field, because the fields come from three
+        // different places (static form configs, the sync form, and plugin config
+        // fields mapped at runtime).
+        { name: 'checkbox', defaultOptions: { props: { indeterminate: false } } },
+        { name: 'slider', component: FormlySliderComponent },
+        { name: 'link', component: FormlyLinkWidgetComponent },
+        { name: 'slide-toggle', component: FormlySlideToggleComponent },
+        {
+          name: 'duration',
+          component: InputDurationFormlyComponent,
+          extends: 'input',
+          wrappers: ['form-field'],
+        },
+        {
+          name: 'time',
+          component: InputTimeFormlyComponent,
+          extends: 'input',
+          wrappers: ['form-field'],
+        },
+        {
+          name: 'tpl',
+          component: FormlyTranslatedTemplateComponent,
+        },
+        { name: 'collapsible', component: FormlyCollapsibleComponent, wrappers: [] },
+        { name: 'btn', component: FormlyBtnComponent, wrappers: [] },
+        {
+          name: 'local-rest-api-settings',
+          component: FormlyLocalRestApiSettingsComponent,
+          wrappers: [],
+        },
+        {
+          name: 'assistant-access-settings',
+          component: FormlyAssistantAccessSettingsComponent,
+          wrappers: [],
+        },
+        {
+          name: 'keyboard',
+          component: KeyboardInputComponent,
+          extends: 'input',
+          wrappers: ['form-field'],
+        },
+        {
+          name: 'icon',
+          component: IconInputComponent,
+          extends: 'input',
+          wrappers: ['form-field'],
+        },
+        {
+          name: 'color',
+          component: ColorInputComponent,
+        },
+        {
+          name: 'project-select',
+          component: SelectProjectComponent,
+          // technically no input, but as the properties get us what we need...
+          extends: 'input',
+          wrappers: ['form-field'],
+        },
+        {
+          name: 'start-page-select',
+          component: StartPageSelectComponent,
+          extends: 'input',
+          wrappers: ['form-field'],
+        },
+        {
+          name: 'tag-select',
+          component: FormlyTagSelectionComponent,
+          // technically no input, but as the properties get us what we need...
+          extends: 'input',
+          wrappers: ['form-field'],
+        },
+        {
+          name: 'repeat',
+          component: RepeatSectionTypeComponent,
+        },
+        {
+          name: 'image-input',
+          component: FormlyImageInputComponent,
+          extends: 'input',
+          wrappers: ['form-field'],
+        },
+        {
+          name: 'date',
+          component: FormlyDatePickerComponent,
+        },
+      ],
+      extras: {
+        immutable: true,
+        // Show errors when field is touched or form is submitted
+        showError: (field) => {
+          return !!(
+            field.formControl &&
+            field.formControl.invalid &&
+            (field.formControl.touched || field.options?.parentForm?.submitted)
+          );
+        },
+      },
+    }),
+    FormlyMatToggleModule,
+    FormlyMaterialModule,
+    // my modules
+    // might be needed for formly to pick up on directives
+    ValidationModule,
+    FormlyLinkWidgetComponent,
+  ],
+  exports: [
+    FormlyMaterialModule,
+    FormlyModule,
+    MarkdownModule,
+    ReactiveFormsModule,
+    ValidationModule,
+  ],
+  providers: [
+    {
+      provide: FORMLY_CONFIG,
+      multi: true,
+      useFactory: registerTranslateExtension,
+      deps: [TranslateService],
+    },
+    FormlyJsonschema,
+  ],
+})
+export class FormlyConfigModule {}

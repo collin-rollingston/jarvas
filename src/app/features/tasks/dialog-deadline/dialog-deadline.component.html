@@ -1,0 +1,58 @@
+<mat-dialog-content>
+  @if (isConfigReady()) {
+    <datetime-picker
+      [selectedDate]="selectedDate"
+      [selectedTime]="selectedTime"
+      [selectedReminderCfgId]="selectedReminderCfgId"
+      [reminderOptions]="reminderOptions"
+      [minDate]="minDate"
+      [timeLabel]="T.F.TASK.D_DEADLINE.ADD_TIME | translate"
+      [reminderLabel]="T.F.TASK.D_DEADLINE.REMIND_AT"
+      (dateSelected)="dateSelected($event)"
+      (timeChanged)="selectedTime = $event"
+      (reminderChanged)="selectedReminderCfgId = $event"
+      (quickAccessClick)="onQuickAccessClick($event)"
+      (enterSubmit)="submit()"
+    ></datetime-picker>
+    @if (selectedTime && selectedReminderCfgId !== DO_NOT_REMIND) {
+      <exact-alarm-hint />
+    }
+  }
+
+  <div class="dialog-actions-and-warnings">
+    <mat-dialog-actions align="end">
+      <button
+        mat-button
+        (click)="close()"
+        type="button"
+      >
+        <span class="action-label">{{ T.G.CANCEL | translate }}</span>
+      </button>
+      @if (hasExistingDeadline && !data.isSelectDeadlineOnly) {
+        <button
+          (click)="remove()"
+          color="warn"
+          mat-stroked-button
+          type="button"
+        >
+          <mat-icon>event_busy</mat-icon>
+          <span class="action-label">
+            {{ T.F.TASK.D_DEADLINE.REMOVE_DEADLINE | translate }}
+          </span>
+        </button>
+      }
+      <button
+        color="primary"
+        mat-flat-button
+        [disabled]="!selectedDate"
+        (click)="submit()"
+        type="button"
+      >
+        <mat-icon>event_available</mat-icon>
+        <span class="action-label">
+          {{ T.F.TASK.D_DEADLINE.SET_DEADLINE | translate }}
+        </span>
+      </button>
+    </mat-dialog-actions>
+  </div>
+</mat-dialog-content>

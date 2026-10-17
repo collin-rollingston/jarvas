@@ -1,0 +1,149 @@
+import { createFeatureSelector, createSelector } from '@ngrx/store';
+import { FOCUS_MODE_FEATURE_KEY } from './focus-mode.reducer';
+import { FocusModeState } from '../focus-mode.model';
+
+// Base selectors
+export const selectFocusModeState =
+  createFeatureSelector<FocusModeState>(FOCUS_MODE_FEATURE_KEY);
+
+export const selectTimer = createSelector(selectFocusModeState, (state) => state.timer);
+
+export const selectCurrentScreen = createSelector(
+  selectFocusModeState,
+  (state) => state.currentScreen,
+);
+
+export const selectMainState = createSelector(
+  selectFocusModeState,
+  (state) => state.mainState,
+);
+
+export const selectMode = createSelector(selectFocusModeState, (state) => state.mode);
+
+export const selectIsOverlayShown = createSelector(
+  selectFocusModeState,
+  (state) => state.isOverlayShown,
+);
+
+export const selectCurrentCycle = createSelector(
+  selectFocusModeState,
+  (state) => state.currentCycle,
+);
+
+export const selectLastSessionDuration = createSelector(
+  selectFocusModeState,
+  (state) => state.lastCompletedDuration,
+);
+
+// Session selectors
+export const selectIsSessionRunning = createSelector(
+  selectTimer,
+  (timer) => timer.isRunning && timer.purpose === 'work',
+);
+
+export const selectIsSessionPaused = createSelector(
+  selectTimer,
+  // Bug #5995 fix: Detect pause for both work sessions AND breaks
+  (timer) => !timer.isRunning && (timer.purpose === 'work' || timer.purpose === 'break'),
+);
+
+// Break selectors
+export const selectIsBreakActive = createSelector(
+  selectTimer,
+  (timer) => timer.purpose === 'break',
+);
+
+export const selectIsLongBreak = createSelector(
+  selectTimer,
+  (timer) => timer.purpose === 'break' && timer.isLongBreak === true,
+);
+
+export const selectIsBreakTimeUp = createSelector(
+  selectTimer,
+  (timer) =>
+    timer.purpose === 'break' &&
+    !timer.isRunning &&
+    timer.startedAt !== null &&
+    timer.elapsed >= timer.duration,
+);
+
+// Timer selectors - much simpler!
+export const selectTimeElapsed = createSelector(selectTimer, (timer) => timer.elapsed);
+
+export const selectTimeDuration = createSelector(selectTimer, (timer) => timer.duration);
+
+export const selectTimeRemaining = createSelector(
+  selectTimeElapsed,
+  selectTimeDuration,
+  (elapsed, duration) => Math.max(0, duration - elapsed),
+);
+
+export const selectProgress = createSelector(
+  selectTimeElapsed,
+  selectTimeDuration,
+  (elapsed, duration) => (duration > 0 ? (elapsed / duration) * 100 : 0),
+);
+
+export const selectIsRunning = createSelector(
+  selectTimer,
+  (timer) => timer.isRunning && timer.purpose !== null,
+);
+
+/**
+ * Whether the running focus session owns the OS progress bar (taskbar/dock).
+ * Exactly one writer may own that surface, so `task-electron.effects` stands
+ * down on this same flag — when both wrote, the bar cycled between the two
+ * values every second (#9944). An open-ended (Flowtime) session has no target
+ * duration and therefore no progress of its own, so it leaves the bar to the
+ * task writer rather than publishing a meaningless 0.
+ */
+export const selectIsOsProgressBarOwnedBySession = createSelector(
+  selectIsRunning,
+  selectTimeDuration,
+  (isRunning, duration) => isRunning && duration > 0,
+);
+
+/** What the focus session should publish, or `null` when it owns nothing. */
+export const selectOsProgressBar = createSelector(
+  selectIsOsProgressBarOwnedBySession,
+  selectProgress,
+  (isOwnedBySession, progress): { progress: number; progressBarMode: 'normal' } | null =>
+    isOwnedBySession ? { progress: progress / 100, progressBarMode: 'normal' } : null,
+);
+
+// Session completed selector
+export const selectIsSessionCompleted = createSelector(
+  selectCurrentScreen,
+  (currentScreen) => currentScreen === 'SessionDone',
+);
+
+// Paused task during breaks
+export const selectPausedTaskId = createSelector(
+  selectFocusModeState,
+  (state) => state.pausedTaskId,
+);
+
+// Internal flag for break resume tracking
+export const selectIsResumingBreak = createSelector(
+  selectFocusModeState,
+  (state) => state._isResumingBreak,
+);
+
+// Overtime selectors
+export const selectIsOvertimeEnabled = createSelector(
+  selectFocusModeState,
+  (state) => state._isOvertimeEnabled,
+);
+
+// Bug #7715: stays true while paused so the display keeps showing
+// the overtime value (`timeElapsed`) instead of falling back to
+// `timeRemaining`, which clamps to 0:00 once elapsed >= duration.
+export const selectIsInOvertime = createSelector(
+  selectTimer,
+  selectIsOvertimeEnabled,
+  (timer, _isOvertimeEnabled) =>
+    _isOvertimeEnabled &&
+    timer.purpose === 'work' &&
+    timer.duration > 0 &&
+    timer.elapsed >= timer.duration,
+);

@@ -1,0 +1,988 @@
+import { TestBed } from '@angular/core/testing';
+import { signal } from '@angular/core';
+import { ScheduleService } from './schedule.service';
+import { DateService } from '../../core/date/date.service';
+import { getDbDateStr } from '../../util/get-db-date-str';
+import { findSpringForwardSunday } from '../tasks/dst.test-helper';
+import { MockStore, provideMockStore } from '@ngrx/store/testing';
+import { selectStartOfNextDayDiffMs } from '../../root-store/app-state/app-state.selectors';
+import {
+  DEFAULT_TASK_REPEAT_CFG,
+  TaskRepeatCfg,
+} from '../task-repeat-cfg/task-repeat-cfg.model';
+import { selectTimelineTasks } from '../work-context/store/work-context.selectors';
+import { selectTaskRepeatCfgsWithAndWithoutStartTime } from '../task-repeat-cfg/store/task-repeat-cfg.selectors';
+import { selectTimelineConfig } from '../config/store/global-config.reducer';
+import { selectPlannerDayMap } from '../planner/store/planner.selectors';
+import { BehaviorSubject, of } from 'rxjs';
+import { CalendarIntegrationService } from '../calendar-integration/calendar-integration.service';
+import { HiddenCalendarProvidersService } from '../calendar-integration/hidden-calendar-providers.service';
+import { TaskService } from '../tasks/task.service';
+import { ScheduleCalendarMapEntry, ScheduleEvent } from './schedule.model';
+import { SVEType } from './schedule.const';
+
+describe('ScheduleService', () => {
+  let service: ScheduleService;
+  let dateService: DateService;
+
+  beforeEach(() => {
+    TestBed.configureTestingModule({
+      providers: [
+        ScheduleService,
+        DateService,
+        provideMockStore({
+          selectors: [
+            { selector: selectTimelineTasks, value: { unPlanned: [], planned: [] } },
+            {
+              selector: selectTaskRepeatCfgsWithAndWithoutStartTime,
+              value: { withStartTime: [], withoutStartTime: [] },
+            },
+            {
+              selector: selectTimelineConfig,
+              value: { isWorkStartEndEnabled: false, isLunchBreakEnabled: false },
+            },
+            { selector: selectPlannerDayMap, value: {} },
+          ],
+        }),
+        {
+          provide: CalendarIntegrationService,
+          useValue: { calendarEvents$: of([]) },
+        },
+        {
+          provide: TaskService,
+          useValue: { currentTaskId: () => null },
+        },
+      ],
+    });
+    service = TestBed.inject(ScheduleService);
+    dateService = TestBed.inject(DateService);
+  });
+
+  describe('getDaysToShow', () => {
+    it('should return correct number of days when referenceDate is null', () => {
+      const result = service.getDaysToShow(5, null);
+      expect(result.length).toBe(5);
+    });
+
+    it('should return days starting from today when referenceDate is null', () => {
+      const result = service.getDaysToShow(3, null);
+      expect(result[0]).toBe(dateService.todayStr());
+    });
+
+    it('should return days starting from referenceDate (rolling)', () => {
+      const referenceDate = new Date(2028, 5, 15); // Thu Jun 15, 2028
+      const result = service.getDaysToShow(7, referenceDate);
+      expect(result[0]).toBe(dateService.todayStr(referenceDate.getTime()));
+      expect(result.length).toBe(7);
+    });
+
+    it('should return consecutive days', () => {
+      const result = service.getDaysToShow(7, new Date(2028, 0, 20));
+      for (let i = 0; i < result.length - 1; i++) {
+        const currentDay = new Date(result[i]);
+        const nextDay = new Date(result[i + 1]);
+        const dayDiff =
+          (nextDay.getTime() - currentDay.getTime()) / (1000 * 60 * 60 * 24);
+        expect(dayDiff).toBe(1);
+      }
+    });
+
+    it('should handle transition across months', () => {
+      const referenceDate = new Date(2028, 0, 30); // Jan 30, 2028
+      const result = service.getDaysToShow(5, referenceDate);
+      expect(result.length).toBe(5);
+      const lastDay = new Date(result[4]);
+      expect(lastDay.getMonth()).toBe(1); // February
+    });
+
+    it('should keep the window consecutive across a spring-forward day', () => {
+      // Same hazard as the planner window: +24h ms stepping from a
+      // late-evening anchor skips the 23h transition day.
+      const gap = findSpringForwardSunday(2026);
+      if (!gap) {
+        return;
+      }
+      jasmine.clock().install();
+      try {
+        const saturday = new Date(gap.sunday);
+        saturday.setDate(saturday.getDate() - 1);
+        saturday.setHours(23, 30, 0, 0);
+        jasmine.clock().mockDate(saturday);
+        const result = service.getDaysToShow(3, null);
+        expect(result[0]).toBe(getDbDateStr(saturday));
+        expect(result[1]).toBe(getDbDateStr(gap.sunday));
+      } finally {
+        jasmine.clock().uninstall();
+      }
+    });
+
+    it('should not mutate a provided reference date', () => {
+      const referenceDate = new Date(2028, 5, 15, 10, 0);
+      const before = referenceDate.getTime();
+      service.getDaysToShow(7, referenceDate);
+      expect(referenceDate.getTime()).toBe(before);
+    });
+
+    it('should start on the logical today between midnight and the start-of-next-day offset', () => {
+      // 00:30 on Jan 15 with a 04:00 start-of-next-day is logically still Jan
+      // 14; a window anchored on the raw clock would drop (logical) today's
+      // column right after midnight while todayStr() still names it.
+      jasmine.clock().install();
+      try {
+        jasmine.clock().mockDate(new Date(2026, 0, 15, 0, 30));
+        dateService.setStartOfNextDayDiff('04:00');
+        const result = service.getDaysToShow(3, null);
+        expect(result[0]).toBe('2026-01-14');
+        expect(result[1]).toBe('2026-01-15');
+      } finally {
+        jasmine.clock().uninstall();
+      }
+    });
+  });
+
+  describe('getDayClass', () => {
+    it('should ring the logical today between midnight and the start-of-next-day offset', () => {
+      // Same clock setup as the window specs: at 00:30 with a 04:00 offset the
+      // ring must sit on Jan 14, the column todayStr() names and the window
+      // anchor produces, not on calendar-today.
+      jasmine.clock().install();
+      try {
+        jasmine.clock().mockDate(new Date(2026, 0, 15, 0, 30));
+        dateService.setStartOfNextDayDiff('04:00');
+        expect(service.getDayClass('2026-01-14')).toContain('today');
+        expect(service.getDayClass('2026-01-15')).not.toContain('today');
+      } finally {
+        jasmine.clock().uninstall();
+      }
+    });
+  });
+
+  describe('getMonthDaysToShow', () => {
+    it('should return correct number of days', () => {
+      const numberOfWeeks = 5;
+      const firstDayOfWeek = 1; // Monday
+      const result = service.getMonthDaysToShow(numberOfWeeks, firstDayOfWeek);
+      expect(result.length).toBe(numberOfWeeks * 7);
+    });
+
+    it('should show the logical month between midnight and the start-of-next-day offset', () => {
+      // 00:30 on Feb 1 with a 04:00 start-of-next-day is logically still Jan
+      // 31, so the grid must be January's (starting Mon Dec 29), not
+      // February's (starting Mon Jan 26).
+      jasmine.clock().install();
+      try {
+        jasmine.clock().mockDate(new Date(2026, 1, 1, 0, 30));
+        dateService.setStartOfNextDayDiff('04:00');
+        const result = service.getMonthDaysToShow(5, 1, null);
+        expect(result[0]).toBe('2025-12-29');
+      } finally {
+        jasmine.clock().uninstall();
+      }
+    });
+
+    it('should start with the configured first day of week when firstDayOfWeek is Monday (1)', () => {
+      const numberOfWeeks = 5;
+      const firstDayOfWeek = 1; // Monday
+
+      // Mock the current date to a known value for testing
+      const testDate = new Date(2025, 0, 15); // January 15, 2025 (Wednesday)
+      jasmine.clock().install();
+      jasmine.clock().mockDate(testDate);
+
+      const result = service.getMonthDaysToShow(numberOfWeeks, firstDayOfWeek);
+
+      // January 2025 starts on Wednesday (day 3)
+      // With Monday as first day of week, the calendar should start from Dec 30, 2024 (Monday)
+      // Parse the date string in local timezone by using the Date constructor with year, month, day
+      const [year, month, day] = result[0].split('-').map(Number);
+      const firstDayDate = new Date(year, month - 1, day);
+      expect(firstDayDate.getDay()).toBe(1); // Monday
+
+      jasmine.clock().uninstall();
+    });
+
+    it('should start with the configured first day of week when firstDayOfWeek is Sunday (0)', () => {
+      const numberOfWeeks = 5;
+      const firstDayOfWeek = 0; // Sunday
+
+      // Mock the current date to a known value for testing
+      const testDate = new Date(2025, 0, 15); // January 15, 2025 (Wednesday)
+      jasmine.clock().install();
+      jasmine.clock().mockDate(testDate);
+
+      const result = service.getMonthDaysToShow(numberOfWeeks, firstDayOfWeek);
+
+      // January 2025 starts on Wednesday (day 3)
+      // With Sunday as first day of week, the calendar should start from Dec 29, 2024 (Sunday)
+      // Parse the date string in local timezone by using the Date constructor with year, month, day
+      const [year, month, day] = result[0].split('-').map(Number);
+      const firstDayDate = new Date(year, month - 1, day);
+      expect(firstDayDate.getDay()).toBe(0); // Sunday
+
+      jasmine.clock().uninstall();
+    });
+
+    it('should start with the configured first day of week when firstDayOfWeek is Saturday (6)', () => {
+      const numberOfWeeks = 5;
+      const firstDayOfWeek = 6; // Saturday
+
+      // Mock the current date to a known value for testing
+      const testDate = new Date(2025, 0, 15); // January 15, 2025 (Wednesday)
+      jasmine.clock().install();
+      jasmine.clock().mockDate(testDate);
+
+      const result = service.getMonthDaysToShow(numberOfWeeks, firstDayOfWeek);
+
+      // January 2025 starts on Wednesday (day 3)
+      // With Saturday as first day of week, the calendar should start from Dec 28, 2024 (Saturday)
+      // Parse the date string in local timezone by using the Date constructor with year, month, day
+      const [year, month, day] = result[0].split('-').map(Number);
+      const firstDayDate = new Date(year, month - 1, day);
+      expect(firstDayDate.getDay()).toBe(6); // Saturday
+
+      jasmine.clock().uninstall();
+    });
+
+    it('should default to Sunday (0) when no firstDayOfWeek is provided', () => {
+      const numberOfWeeks = 5;
+
+      // Mock the current date to a known value for testing
+      const testDate = new Date(2025, 0, 15); // January 15, 2025 (Wednesday)
+      jasmine.clock().install();
+      jasmine.clock().mockDate(testDate);
+
+      const result = service.getMonthDaysToShow(numberOfWeeks);
+
+      // Should default to Sunday as first day
+      // Parse the date string in local timezone by using the Date constructor with year, month, day
+      const [year, month, day] = result[0].split('-').map(Number);
+      const firstDayDate = new Date(year, month - 1, day);
+      expect(firstDayDate.getDay()).toBe(0); // Sunday
+
+      jasmine.clock().uninstall();
+    });
+
+    it('should use referenceDate to determine the month to display', () => {
+      // Arrange
+      const numberOfWeeks = 4;
+      const firstDayOfWeek = 1; // Monday
+      const referenceDate = new Date(2026, 5, 15); // June 15, 2026
+
+      // Act
+      const result = service.getMonthDaysToShow(
+        numberOfWeeks,
+        firstDayOfWeek,
+        referenceDate,
+      );
+
+      // Assert
+      expect(result.length).toBe(28); // 4 weeks
+      // The month view should include days from June 2026
+      const juneFirst = new Date(2026, 5, 1); // June 1, 2026
+      const juneFirstStr = dateService.todayStr(juneFirst.getTime());
+      expect(result).toContain(juneFirstStr);
+    });
+
+    it('should include padding days from previous and next month', () => {
+      // Arrange
+      const numberOfWeeks = 5;
+      const firstDayOfWeek = 0; // Sunday
+      const referenceDate = new Date(2026, 0, 15); // Jan 15, 2026
+
+      // Act
+      const result = service.getMonthDaysToShow(
+        numberOfWeeks,
+        firstDayOfWeek,
+        referenceDate,
+      );
+
+      // Assert
+      // January 2026 starts on a Thursday, so with Sunday start,
+      // we should have padding days from December 2025
+      const firstDay = new Date(result[0]);
+      // December 2025 would be month 11 (previous year)
+      expect(firstDay.getMonth()).toBe(11);
+      expect(firstDay.getFullYear()).toBe(2025);
+
+      // Should also have some days from February if weeks extend past January
+      const lastDay = new Date(result[result.length - 1]);
+      // With 5 weeks starting from late December, we should reach into February
+      expect(lastDay.getMonth()).toBeGreaterThanOrEqual(0);
+    });
+
+    describe('full-month coverage (#9449)', () => {
+      const dayStr = (date: Date): string => dateService.todayStr(date.getTime());
+      const lastDayOfMonth = (year: number, month: number): Date =>
+        new Date(year, month + 1, 0);
+
+      // The derivation itself. Pinning at 6 spanned every month but left an
+      // empty row on most of them; deriving from available height is what
+      // #9449 was filed for. The month is the right input.
+      it('should derive 4 to 6 weeks, and never fewer than the month needs', () => {
+        // Feb 2027 is 28 days starting on a Monday, the only shape that fits
+        // in four rows under a Monday-first week.
+        expect(service.getMonthWeeksToShow(1, new Date(2027, 1, 15))).toBe(4);
+        // Aug 2026 starts on a Saturday: 5 leading days + 31 needs six rows.
+        expect(service.getMonthWeeksToShow(1, new Date(2026, 7, 15))).toBe(6);
+        // Sep 2026 is 30 days from a Tuesday: five rows is exact.
+        expect(service.getMonthWeeksToShow(1, new Date(2026, 8, 15))).toBe(5);
+      });
+
+      it('should never return a count that drops a day of the month', () => {
+        // The count and the grid it feeds have to agree for every pair, or a
+        // day gets no cell and therefore no events at all.
+        for (let monthOffset = 0; monthOffset < 24; monthOffset++) {
+          const reference = new Date(2027, monthOffset, 15);
+          const year = reference.getFullYear();
+          const month = reference.getMonth();
+          const last = dayStr(lastDayOfMonth(year, month));
+
+          for (let firstDayOfWeek = 0; firstDayOfWeek < 7; firstDayOfWeek++) {
+            const weeks = service.getMonthWeeksToShow(firstDayOfWeek, reference);
+            const context = `${year}-${month + 1}, firstDayOfWeek ${firstDayOfWeek}`;
+            expect(weeks).withContext(context).toBeGreaterThanOrEqual(4);
+            expect(weeks).withContext(context).toBeLessThanOrEqual(6);
+            expect(service.getMonthDaysToShow(weeks, firstDayOfWeek, reference))
+              .withContext(context)
+              .toContain(last);
+            // And not a row more than it needs.
+            expect(service.getMonthDaysToShow(weeks - 1, firstDayOfWeek, reference))
+              .withContext(context)
+              .not.toContain(last);
+          }
+        }
+      });
+
+      it('should include Mon 31 Aug 2026 for every first day of week', () => {
+        const aug31 = dayStr(new Date(2026, 7, 31));
+
+        for (let firstDayOfWeek = 0; firstDayOfWeek < 7; firstDayOfWeek++) {
+          const reference = new Date(2026, 7, 15);
+          const result = service.getMonthDaysToShow(
+            service.getMonthWeeksToShow(firstDayOfWeek, reference),
+            firstDayOfWeek,
+            reference,
+          );
+          expect(result).withContext(`firstDayOfWeek ${firstDayOfWeek}`).toContain(aug31);
+        }
+      });
+
+      it('should not reach 31 Aug 2026 with only 5 weeks — why August derives 6', () => {
+        // August 2026 starts on a Saturday, so the padded grid needs 6 rows.
+        // This is the shape the reported bug had: a shorter window silently
+        // stopped before the end of the month.
+        const result = service.getMonthDaysToShow(5, 1, new Date(2026, 7, 15));
+        expect(result).not.toContain(dayStr(new Date(2026, 7, 31)));
+      });
+
+      it('should span the whole month for every month/firstDayOfWeek combination', () => {
+        // 24 consecutive months from Jan 2027 covers every start-weekday and
+        // both a non-leap February (2027) and a leap one (2028).
+        for (let monthOffset = 0; monthOffset < 24; monthOffset++) {
+          const reference = new Date(2027, monthOffset, 15);
+          const year = reference.getFullYear();
+          const month = reference.getMonth();
+          const first = dayStr(new Date(year, month, 1));
+          const last = dayStr(lastDayOfMonth(year, month));
+
+          for (let firstDayOfWeek = 0; firstDayOfWeek < 7; firstDayOfWeek++) {
+            const result = service.getMonthDaysToShow(
+              service.getMonthWeeksToShow(firstDayOfWeek, reference),
+              firstDayOfWeek,
+              reference,
+            );
+            const context = `${year}-${month + 1}, firstDayOfWeek ${firstDayOfWeek}`;
+            expect(result).withContext(context).toContain(first);
+            expect(result).withContext(context).toContain(last);
+          }
+        }
+      });
+    });
+  });
+
+  describe('createScheduleDaysComputed', () => {
+    it('anchors now into the displayed day when the wall clock has passed it', () => {
+      // The day panel shows logical today, which respects the start-of-next-day
+      // offset. Between midnight and that offset the wall clock is already past
+      // that day's end, and an unanchored now pushes every entry out of the only
+      // rendered day.
+      const dayStr = '2026-01-20';
+      const clock = new Date(2026, 0, 21, 3, 0).getTime();
+      spyOn(Date, 'now').and.callFake(() => clock);
+      const buildSpy = spyOn(service, 'buildScheduleDays').and.returnValue([]);
+
+      service.createScheduleDaysComputed(signal([dayStr]))();
+
+      const params = buildSpy.calls.mostRecent().args[0];
+      expect(params.now).toBe(new Date(2026, 0, 20, 0, 0, 0, 0).getTime());
+      expect(params.realNow).toBe(clock);
+    });
+
+    it('keeps the live clock while it still sits inside the displayed day', () => {
+      const dayStr = '2026-01-20';
+      const clock = new Date(2026, 0, 20, 9, 30).getTime();
+      spyOn(Date, 'now').and.callFake(() => clock);
+      const buildSpy = spyOn(service, 'buildScheduleDays').and.returnValue([]);
+
+      service.createScheduleDaysComputed(signal([dayStr]))();
+
+      expect(buildSpy.calls.mostRecent().args[0].now).toBe(clock);
+    });
+
+    it('projects a repeat time before the day start into the night and follows offset changes (#3378)', () => {
+      const store = TestBed.inject(MockStore);
+      const cfg: TaskRepeatCfg = {
+        ...DEFAULT_TASK_REPEAT_CFG,
+        id: 'late-night',
+        title: 'Late night',
+        repeatCycle: 'DAILY',
+        repeatEvery: 1,
+        startDate: '2026-01-01',
+        startTime: '02:00',
+        lastTaskCreationDay: '2026-01-19',
+      };
+      store.overrideSelector(selectTaskRepeatCfgsWithAndWithoutStartTime, {
+        withStartTime: [cfg],
+        withoutStartTime: [],
+      });
+      store.overrideSelector(selectStartOfNextDayDiffMs, 0);
+      store.refreshState();
+      // 01:00 on the 21st is still logical day 20 with a 05:00 day start
+      const clock = new Date(2026, 0, 21, 1, 0).getTime();
+      spyOn(Date, 'now').and.callFake(() => clock);
+      const days = service.createScheduleDaysComputed(
+        signal(['2026-01-20', '2026-01-21']),
+      );
+      const repeatStarts = (): number[] =>
+        days()
+          .flatMap((day) => day.entries)
+          .filter((e) => e.id.includes(cfg.id))
+          .map((e) => e.start);
+
+      expect(repeatStarts()).toEqual([
+        new Date(2026, 0, 20, 2, 0).getTime(),
+        new Date(2026, 0, 21, 2, 0).getTime(),
+      ]);
+
+      store.overrideSelector(selectStartOfNextDayDiffMs, 5 * 60 * 60 * 1000);
+      store.refreshState();
+
+      // day 20's night is calendar day 21; day 21's night is out of view
+      expect(repeatStarts()).toEqual([new Date(2026, 0, 21, 2, 0).getTime()]);
+    });
+
+    it('falls back to the wall clock when no day is displayed', () => {
+      const clock = new Date(2026, 0, 20, 9, 30).getTime();
+      spyOn(Date, 'now').and.callFake(() => clock);
+      const buildSpy = spyOn(service, 'buildScheduleDays').and.returnValue([]);
+
+      service.createScheduleDaysComputed(signal([]))();
+
+      expect(buildSpy.calls.mostRecent().args[0].now).toBe(clock);
+    });
+  });
+
+  describe('buildScheduleDays', () => {
+    it('should return empty array when timelineTasks is null', () => {
+      // Arrange
+      const params = {
+        daysToShow: ['2026-01-20', '2026-01-21'],
+        timelineTasks: null,
+        taskRepeatCfgs: { withStartTime: [], withoutStartTime: [] },
+        calendarEvents: [],
+        plannerDayMap: {},
+        timelineCfg: null,
+        currentTaskId: null,
+      };
+
+      // Act
+      const result = service.buildScheduleDays(params);
+
+      // Assert
+      expect(result).toEqual([]);
+    });
+
+    it('should return empty array when taskRepeatCfgs is null', () => {
+      // Arrange
+      const params = {
+        daysToShow: ['2026-01-20', '2026-01-21'],
+        timelineTasks: { unPlanned: [], planned: [] },
+        taskRepeatCfgs: null,
+        calendarEvents: [],
+        plannerDayMap: {},
+        timelineCfg: null,
+        currentTaskId: null,
+      };
+
+      // Act
+      const result = service.buildScheduleDays(params);
+
+      // Assert
+      expect(result).toEqual([]);
+    });
+
+    it('should return empty array when plannerDayMap is null', () => {
+      // Arrange
+      const params = {
+        daysToShow: ['2026-01-20', '2026-01-21'],
+        timelineTasks: { unPlanned: [], planned: [] },
+        taskRepeatCfgs: { withStartTime: [], withoutStartTime: [] },
+        calendarEvents: [],
+        plannerDayMap: null,
+        timelineCfg: null,
+        currentTaskId: null,
+      };
+
+      // Act
+      const result = service.buildScheduleDays(params);
+
+      // Assert
+      expect(result).toEqual([]);
+    });
+
+    it('should pass realNow parameter through to mapToScheduleDays', () => {
+      // Arrange
+      const realNow = Date.now();
+      const params = {
+        now: Date.now(),
+        realNow,
+        daysToShow: ['2026-01-20'],
+        timelineTasks: { unPlanned: [], planned: [] },
+        taskRepeatCfgs: { withStartTime: [], withoutStartTime: [] },
+        calendarEvents: [],
+        plannerDayMap: {},
+        timelineCfg: null,
+        currentTaskId: null,
+      };
+
+      // Act
+      const result = service.buildScheduleDays(params);
+
+      // Assert
+      // The function should not throw and should process with realNow
+      expect(result).toBeDefined();
+      expect(Array.isArray(result)).toBe(true);
+    });
+
+    it('should default now to Date.now() when not provided', () => {
+      // Arrange
+      const params = {
+        daysToShow: ['2026-01-20'],
+        timelineTasks: { unPlanned: [], planned: [] },
+        taskRepeatCfgs: { withStartTime: [], withoutStartTime: [] },
+        calendarEvents: [],
+        plannerDayMap: {},
+        timelineCfg: null,
+      };
+
+      // Act
+      const result = service.buildScheduleDays(params);
+
+      // Assert
+      // Should work without throwing
+      expect(result).toBeDefined();
+    });
+  });
+
+  describe('getDayClass', () => {
+    it('should return empty string for a day in current month when no referenceMonth provided', () => {
+      // Arrange
+      const today = new Date();
+      const dayInCurrentMonth = new Date(today.getFullYear(), today.getMonth(), 15);
+      const dayStr = dateService.todayStr(dayInCurrentMonth.getTime());
+
+      // Act
+      const result = service.getDayClass(dayStr);
+
+      // Assert
+      // Should not have 'other-month' class
+      expect(result).not.toContain('other-month');
+    });
+
+    it('should return "today" class for today without referenceMonth', () => {
+      // Arrange
+      const today = new Date();
+      const todayStr = dateService.todayStr(today.getTime());
+
+      // Act
+      const result = service.getDayClass(todayStr);
+
+      // Assert
+      expect(result).toContain('today');
+    });
+
+    it('should return "other-month" class for a day in a different month when referenceMonth provided', () => {
+      // Arrange
+      const referenceMonth = new Date(2026, 5, 15); // June 2026
+      const dayInMay = new Date(2026, 4, 31); // May 31, 2026
+      const dayStr = dateService.todayStr(dayInMay.getTime());
+
+      // Act
+      const result = service.getDayClass(dayStr, referenceMonth);
+
+      // Assert
+      expect(result).toContain('other-month');
+    });
+
+    it('should not return "other-month" class for a day in the reference month', () => {
+      // Arrange
+      const referenceMonth = new Date(2026, 5, 15); // June 2026
+      const dayInJune = new Date(2026, 5, 20); // June 20, 2026
+      const dayStr = dateService.todayStr(dayInJune.getTime());
+
+      // Act
+      const result = service.getDayClass(dayStr, referenceMonth);
+
+      // Assert
+      expect(result).not.toContain('other-month');
+    });
+
+    it('should return "today" class even when using referenceMonth', () => {
+      // Arrange
+      const today = new Date();
+      const todayStr = dateService.todayStr(today.getTime());
+      const referenceMonth = new Date(today.getFullYear(), today.getMonth(), 15);
+
+      // Act
+      const result = service.getDayClass(todayStr, referenceMonth);
+
+      // Assert
+      expect(result).toContain('today');
+    });
+
+    it('should handle year boundaries correctly', () => {
+      // Arrange
+      const referenceMonth = new Date(2026, 0, 15); // January 2026
+      const dayInDecember2025 = new Date(2025, 11, 31); // Dec 31, 2025
+      const dayStr = dateService.todayStr(dayInDecember2025.getTime());
+
+      // Act
+      const result = service.getDayClass(dayStr, referenceMonth);
+
+      // Assert
+      expect(result).toContain('other-month');
+    });
+
+    it('should combine "today" and "other-month" classes when applicable', () => {
+      // Arrange - This is an edge case where today is in a different month than reference
+      const today = new Date(2026, 0, 20); // Jan 20, 2026
+      jasmine.clock().install();
+      jasmine.clock().mockDate(today);
+
+      const todayStr = dateService.todayStr(today.getTime());
+      const referenceMonth = new Date(2025, 11, 15); // December 2025
+
+      // Act
+      const result = service.getDayClass(todayStr, referenceMonth);
+
+      // Assert
+      expect(result).toContain('today');
+      expect(result).toContain('other-month');
+
+      jasmine.clock().uninstall();
+    });
+  });
+
+  describe('getEventDayStr', () => {
+    const createMockEvent = (
+      type: SVEType,
+      plannedForDay?: string,
+      data?: ScheduleEvent['data'],
+    ): ScheduleEvent => ({
+      id: 'test-id',
+      type,
+      style: '',
+      startHours: 9,
+      timeLeftInHours: 1,
+      plannedForDay,
+      data,
+    });
+
+    it('should return plannedForDay for RepeatProjection events', () => {
+      const event = createMockEvent(SVEType.RepeatProjection, '2026-02-15');
+      const result = service.getEventDayStr(event);
+      expect(result).toBe('2026-02-15');
+    });
+
+    it('should return plannedForDay for ScheduledRepeatProjection events', () => {
+      const event = createMockEvent(SVEType.ScheduledRepeatProjection, '2026-03-20');
+      const result = service.getEventDayStr(event);
+      expect(result).toBe('2026-03-20');
+    });
+
+    it('should return null for RepeatProjection without plannedForDay', () => {
+      const event = createMockEvent(SVEType.RepeatProjection, undefined, {
+        id: 'repeat-cfg-id',
+        defaultEstimate: 3600000,
+      } as ScheduleEvent['data']);
+      const result = service.getEventDayStr(event);
+      expect(result).toBeNull();
+    });
+
+    it('should return plannedForDay from data for RepeatProjection if ev.plannedForDay is missing', () => {
+      const event = createMockEvent(SVEType.RepeatProjection, undefined, {
+        plannedForDay: '2026-04-10',
+      } as unknown as ScheduleEvent['data']);
+      const result = service.getEventDayStr(event);
+      expect(result).toBe('2026-04-10');
+    });
+
+    it('should return plannedForDay for RepeatProjectionSplit events', () => {
+      const event = createMockEvent(SVEType.RepeatProjectionSplit, '2026-02-15');
+      const result = service.getEventDayStr(event);
+      expect(result).toBe('2026-02-15');
+    });
+
+    it('should return plannedForDay for RepeatProjectionSplitContinued events', () => {
+      const event = createMockEvent(SVEType.RepeatProjectionSplitContinued, '2026-02-16');
+      const result = service.getEventDayStr(event);
+      expect(result).toBe('2026-02-16');
+    });
+
+    it('should return plannedForDay for RepeatProjectionSplitContinuedLast events', () => {
+      const event = createMockEvent(
+        SVEType.RepeatProjectionSplitContinuedLast,
+        '2026-02-17',
+      );
+      const result = service.getEventDayStr(event);
+      expect(result).toBe('2026-02-17');
+    });
+
+    it('should prioritize plannedForDay over remindAt for ScheduledTask', () => {
+      const event = createMockEvent(SVEType.ScheduledTask, undefined, {
+        plannedForDay: '2026-03-01',
+        remindAt: new Date(2026, 2, 5).getTime(),
+      } as unknown as ScheduleEvent['data']);
+      const result = service.getEventDayStr(event);
+      expect(result).toBe('2026-03-01');
+    });
+
+    it('should return event plannedForDay for planned task entries when task data lacks it', () => {
+      const event = createMockEvent(SVEType.TaskPlannedForDay, '2026-05-07', {
+        id: 'task-1',
+        title: 'Due day task',
+        dueDay: '2026-05-07',
+      } as unknown as ScheduleEvent['data']);
+      const result = service.getEventDayStr(event);
+      expect(result).toBe('2026-05-07');
+    });
+  });
+
+  describe('getEventsForDay', () => {
+    it('should filter events by plannedForDay for repeat projections', () => {
+      const events: ScheduleEvent[] = [
+        {
+          id: 'repeat-1',
+          type: SVEType.RepeatProjection,
+          style: '',
+          startHours: 9,
+          timeLeftInHours: 1,
+          plannedForDay: '2026-02-15',
+        },
+        {
+          id: 'repeat-2',
+          type: SVEType.ScheduledRepeatProjection,
+          style: '',
+          startHours: 10,
+          timeLeftInHours: 0.5,
+          plannedForDay: '2026-02-16',
+        },
+        {
+          id: 'repeat-3',
+          type: SVEType.RepeatProjection,
+          style: '',
+          startHours: 11,
+          timeLeftInHours: 2,
+          plannedForDay: '2026-02-15',
+        },
+      ];
+
+      const result = service.getEventsForDay('2026-02-15', events);
+
+      expect(result.length).toBe(2);
+      expect(result[0].id).toBe('repeat-1');
+      expect(result[1].id).toBe('repeat-3');
+    });
+
+    it('should return empty array when no events match the day', () => {
+      const events: ScheduleEvent[] = [
+        {
+          id: 'repeat-1',
+          type: SVEType.RepeatProjection,
+          style: '',
+          startHours: 9,
+          timeLeftInHours: 1,
+          plannedForDay: '2026-02-15',
+        },
+      ];
+
+      const result = service.getEventsForDay('2026-02-20', events);
+
+      expect(result.length).toBe(0);
+    });
+  });
+
+  describe('hasEventsForDay', () => {
+    it('should return true when repeat projections exist for the day', () => {
+      const events: ScheduleEvent[] = [
+        {
+          id: 'repeat-1',
+          type: SVEType.RepeatProjection,
+          style: '',
+          startHours: 9,
+          timeLeftInHours: 1,
+          plannedForDay: '2026-02-15',
+        },
+      ];
+
+      const result = service.hasEventsForDay('2026-02-15', events);
+
+      expect(result).toBe(true);
+    });
+
+    it('should return false when no repeat projections exist for the day', () => {
+      const events: ScheduleEvent[] = [
+        {
+          id: 'repeat-1',
+          type: SVEType.RepeatProjection,
+          style: '',
+          startHours: 9,
+          timeLeftInHours: 1,
+          plannedForDay: '2026-02-15',
+        },
+      ];
+
+      const result = service.hasEventsForDay('2026-02-20', events);
+
+      expect(result).toBe(false);
+    });
+  });
+});
+
+describe('ScheduleService – calendar visibility filter', () => {
+  let service: ScheduleService;
+  let dateService: DateService;
+
+  const hiddenProviderIds = signal<string[]>([]);
+  const calendarEvents$ = new BehaviorSubject<ScheduleCalendarMapEntry[]>([]);
+
+  const makeEntry = (calProviderId: string): ScheduleCalendarMapEntry => ({
+    items: [
+      {
+        id: 'ev-' + calProviderId,
+        calProviderId,
+        issueProviderKey: 'ICAL',
+        title: 'Event',
+        start: Date.now() + 60_000,
+        duration: 3_600_000,
+      },
+    ],
+  });
+
+  beforeEach(() => {
+    hiddenProviderIds.set([]);
+    calendarEvents$.next([]);
+
+    TestBed.configureTestingModule({
+      providers: [
+        ScheduleService,
+        DateService,
+        provideMockStore({
+          selectors: [
+            { selector: selectTimelineTasks, value: { unPlanned: [], planned: [] } },
+            {
+              selector: selectTaskRepeatCfgsWithAndWithoutStartTime,
+              value: { withStartTime: [], withoutStartTime: [] },
+            },
+            {
+              selector: selectTimelineConfig,
+              value: { isWorkStartEndEnabled: false, isLunchBreakEnabled: false },
+            },
+            { selector: selectPlannerDayMap, value: {} },
+          ],
+        }),
+        { provide: CalendarIntegrationService, useValue: { calendarEvents$ } },
+        { provide: TaskService, useValue: { currentTaskId: () => null } },
+        {
+          provide: HiddenCalendarProvidersService,
+          useValue: { hiddenProviderIds },
+        },
+      ],
+    });
+
+    service = TestBed.inject(ScheduleService);
+    dateService = TestBed.inject(DateService);
+  });
+
+  const callCreate = (): ScheduleCalendarMapEntry[] => {
+    const spy = spyOn(service, 'buildScheduleDays').and.callThrough();
+    service.createScheduleDaysWithContext({
+      daysToShow: [dateService.todayStr()],
+      contextNow: Date.now(),
+      realNow: Date.now(),
+      currentTaskId: null,
+    });
+    return (spy.calls.mostRecent().args[0].calendarEvents ??
+      []) as ScheduleCalendarMapEntry[];
+  };
+
+  it('should pass all entries through when no providers are hidden', () => {
+    calendarEvents$.next([makeEntry('provider-A'), makeEntry('provider-B')]);
+    hiddenProviderIds.set([]);
+
+    expect(callCreate().length).toBe(2);
+  });
+
+  it('should exclude the entry for a hidden provider', () => {
+    calendarEvents$.next([makeEntry('provider-A'), makeEntry('provider-B')]);
+    hiddenProviderIds.set(['provider-A']);
+
+    const passed = callCreate();
+    expect(passed.length).toBe(1);
+    expect(passed[0].items[0].calProviderId).toBe('provider-B');
+  });
+
+  it('should exclude all entries when all providers are hidden', () => {
+    calendarEvents$.next([makeEntry('provider-A'), makeEntry('provider-B')]);
+    hiddenProviderIds.set(['provider-A', 'provider-B']);
+
+    expect(callCreate().length).toBe(0);
+  });
+
+  it('should drop entries whose items array becomes empty after filtering', () => {
+    calendarEvents$.next([{ items: [] }, makeEntry('provider-A')]);
+    hiddenProviderIds.set(['provider-A']);
+
+    expect(callCreate().length).toBe(0);
+  });
+
+  it('should filter hidden items inside a mixed-provider entry', () => {
+    const mixedEntry: ScheduleCalendarMapEntry = {
+      items: [
+        {
+          id: 'ev-A',
+          calProviderId: 'provider-A',
+          issueProviderKey: 'ICAL',
+          title: 'A',
+          start: Date.now() + 60_000,
+          duration: 3_600_000,
+        },
+        {
+          id: 'ev-B',
+          calProviderId: 'provider-B',
+          issueProviderKey: 'ICAL',
+          title: 'B',
+          start: Date.now() + 60_000,
+          duration: 3_600_000,
+        },
+      ],
+    };
+    calendarEvents$.next([mixedEntry]);
+    hiddenProviderIds.set(['provider-A']);
+
+    const passed = callCreate();
+    expect(passed.length).toBe(1);
+    expect(passed[0].items.length).toBe(1);
+    expect(passed[0].items[0].calProviderId).toBe('provider-B');
+  });
+});

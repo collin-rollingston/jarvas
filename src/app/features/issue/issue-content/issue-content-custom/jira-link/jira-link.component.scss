@@ -1,0 +1,8 @@
+.jira-issue-link {
+  text-decoration: none;
+  color: var(--c-primary);
+
+  &:hover {
+    text-decoration: underline;
+  }
+}
