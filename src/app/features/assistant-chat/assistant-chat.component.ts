@@ -13,7 +13,9 @@ import { DOCUMENT } from '@angular/common';
 import { RouterLink } from '@angular/router';
 import { TranslatePipe, TranslateService } from '@ngx-translate/core';
 import { T } from '../../t.const';
-import { AssistantChatAdapter } from './assistant-chat.model';
+import { CloudflareAssistantChatAdapter } from './cloudflare-assistant-chat-adapter.service';
+import { getEnvOptional } from '../../util/env';
+import type { AssistantChatAdapter } from './assistant-chat.model';
 
 interface AssistantChatLabels {
   connected: string;
@@ -54,6 +56,15 @@ export const ASSISTANT_CHAT_ADAPTER = new InjectionToken<AssistantChatAdapter | 
   changeDetection: ChangeDetectionStrategy.OnPush,
   schemas: [CUSTOM_ELEMENTS_SCHEMA],
   imports: [RouterLink, TranslatePipe],
+  providers: [
+    {
+      provide: ASSISTANT_CHAT_ADAPTER,
+      useFactory: (): AssistantChatAdapter | null =>
+        getEnvOptional('ASSISTANT_CHAT_CONFIGURED') === 'true'
+          ? inject(CloudflareAssistantChatAdapter)
+          : null,
+    },
+  ],
   standalone: true,
 })
 export class AssistantChatComponent implements AfterViewInit {

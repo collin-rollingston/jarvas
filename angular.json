@@ -216,7 +216,8 @@
           "builder": "@angular-devkit/build-angular:dev-server",
           "options": {
             "open": false,
-            "buildTarget": "sp2:build"
+            "buildTarget": "sp2:build",
+            "proxyConfig": "proxy.conf.js"
           },
           "configurations": {
             "production": {

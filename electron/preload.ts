@@ -21,6 +21,11 @@ import {
   AssistantAccessScope,
   AssistantAccessState,
 } from './shared-with-frontend/assistant-access.model';
+import type {
+  AssistantChatCompletion,
+  AssistantChatRequestMessage,
+  AssistantChatTool,
+} from '../src/app/features/assistant-chat/assistant-chat.model';
 import {
   createJiraPreloadApiConsumer,
   toPayloadOnlyIpcListener,
@@ -316,6 +321,15 @@ const ea: ElectronAPI = {
     _invoke(
       IPC.ASSISTANT_ACCESS_ROTATE_CREDENTIAL,
     ) as Promise<AssistantAccessCredentialResult>,
+  assistantChatCompletion: (
+    messages: AssistantChatRequestMessage[],
+    tools: AssistantChatTool[],
+  ) =>
+    _invoke(
+      IPC.ASSISTANT_CHAT_COMPLETION,
+      messages,
+      tools,
+    ) as Promise<AssistantChatCompletion>,
 };
 
 // Expose ea to window for ipc-event.ts using contextBridge for context isolation

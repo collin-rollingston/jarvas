@@ -1,6 +1,15 @@
 import { app } from 'electron';
+import { createRequire } from 'module';
+import { resolve } from 'path';
 import { PROTOCOL_PREFIX } from './protocol-handler';
 import { startApp } from './start-app';
+
+if (!app.isPackaged) {
+  const loadMainModule = createRequire(__filename);
+  const dotenv = loadMainModule('dotenv') as typeof import('dotenv');
+  dotenv.config({ path: resolve(__dirname, '../.env.local'), quiet: true });
+  dotenv.config({ path: resolve(__dirname, '../.env'), quiet: true });
+}
 
 const IS_MAC = process.platform === 'darwin';
 
