@@ -1,0 +1,239 @@
+import { getSyncService } from './sync.service';
+import { Logger } from '../logger';
+import { DEFAULT_SYNC_CONFIG, MS_PER_DAY } from './sync.types';
+import { MIN_CHECKPOINT_SAFE_APP_VERSION } from './checkpoint-gate';
+import {
+  deleteDeadCaptureGrants,
+  deleteExpiredCaptures,
+  pruneRetryWindow,
+} from '../capture';
+
+let cleanupTimer: NodeJS.Timeout | null = null;
+let initialCleanupTimer: NodeJS.Timeout | null = null;
+const reconcileTimers: Set<NodeJS.Timeout> = new Set();
+
+// Spread post-cleanup reconciles so we never run more than one
+// calculateStorageUsage scan per RECONCILE_INTERVAL_MS across the whole pool.
+// Bounded by 1h total budget — beyond that, drift is left for the next day.
+const RECONCILE_INTERVAL_MS = 5_000;
+const RECONCILE_BUDGET_MS = 60 * 60 * 1000;
+const INITIAL_CLEANUP_DELAY_MS = 10_000;
+// Grace window before an abandoned (never-verified, nothing in flight) account is
+// deleted — reuses the unified retention period rather than adding a second knob.
+const UNVERIFIED_USER_GRACE_MS = DEFAULT_SYNC_CONFIG.retentionMs;
+
+/**
+ * Runs all cleanup tasks in a single daily job.
+ * Uses the unified retentionMs for all time-based cleanup.
+ */
+const runDailyCleanup = async (): Promise<void> => {
+  const syncService = getSyncService();
+  const cutoffTime = Date.now() - DEFAULT_SYNC_CONFIG.retentionMs;
+
+  // 1. Delete old operations (covered by snapshots)
+  try {
+    const { totalDeleted, affectedUserIds } =
+      await syncService.deleteOldSyncedOpsForAllUsers(cutoffTime);
+    // Logged unconditionally, INCLUDING zero. The 2026-08 fleet-wide retention outage was
+    // diagnosable only as an absence — an ERROR line with no accompanying "removed N" line
+    // — because this was gated on `totalDeleted > 0`, which makes "the sweep ran and had
+    // nothing to do" indistinguishable from "the sweep never got that far" in the log.
+    Logger.info(
+      `Cleanup [old-ops]: removed ${totalDeleted} entries (affected ${affectedUserIds.length} users)`,
+    );
+    // Storage counter is maintained incrementally on uploads. Doing one full
+    // pg_column_size scan per affected user inside this loop was a DoS — but
+    // skipping reconcile entirely lets counters drift stale-high forever, so
+    // every active user eventually hits the quota-miss reconcile path at the
+    // same time. Spread reconciles over RECONCILE_BUDGET_MS instead: at most
+    // one scan per RECONCILE_INTERVAL_MS, fire-and-forget.
+    scheduleDeferredReconciles(affectedUserIds);
+  } catch (error) {
+    Logger.error(`Cleanup [old-ops] failed: ${error}`);
+  }
+
+  // 2. Delete stale devices (not seen within retention period)
+  try {
+    const deleted = await syncService.deleteStaleDevices(cutoffTime);
+    if (deleted > 0) {
+      Logger.info(`Cleanup [stale-devices]: removed ${deleted} entries`);
+    }
+  } catch (error) {
+    Logger.error(`Cleanup [stale-devices] failed: ${error}`);
+  }
+
+  // 2b. Checkpoint diagnostics (#9962), read-only. Aged-out devices and clients
+  // arriving during checkpoint acceptance need a separate compatibility design.
+  try {
+    const gate = await syncService.summarizeCheckpointGate(cutoffTime);
+    Logger.info(
+      `Cleanup [checkpoint-gate]: ${gate.safeAccounts} of ${gate.totalAccounts} account(s) ` +
+        `with devices inside retention report only versions >= ${MIN_CHECKPOINT_SAFE_APP_VERSION}; ` +
+        `${gate.unversionedDevices} device(s) report no version; diagnostic only.`,
+    );
+  } catch (error) {
+    Logger.error(`Cleanup [checkpoint-gate] failed: ${error}`);
+  }
+
+  // 3. Clean up expired rate limit counters
+  try {
+    const deleted = syncService.cleanupExpiredRateLimitCounters();
+    if (deleted > 0) {
+      Logger.info(`Cleanup [rate-limits]: removed ${deleted} entries`);
+    }
+  } catch (error) {
+    Logger.error(`Cleanup [rate-limits] failed: ${error}`);
+  }
+
+  // 4. Clean up expired request deduplication entries
+  try {
+    const deleted = syncService.cleanupExpiredRequestDedupEntries();
+    if (deleted > 0) {
+      Logger.info(`Cleanup [request-dedup]: removed ${deleted} entries`);
+    }
+  } catch (error) {
+    Logger.error(`Cleanup [request-dedup] failed: ${error}`);
+  }
+
+  // 5. Delete expired pending passkey registrations (expiry is otherwise only
+  // checked at read time, so abandoned rows would be retained forever)
+  try {
+    const deleted = await syncService.deleteExpiredPendingPasskeyRegistrations(
+      Date.now(),
+    );
+    if (deleted > 0) {
+      Logger.info(`Cleanup [pending-passkeys]: removed ${deleted} entries`);
+    }
+  } catch (error) {
+    Logger.error(`Cleanup [pending-passkeys] failed: ${error}`);
+  }
+
+  // 6. Delete abandoned unverified users (never verified, no registration still
+  // in flight, older than the grace window; verified users can never match)
+  try {
+    const deleted = await syncService.deleteAbandonedUnverifiedUsers(
+      Date.now() - UNVERIFIED_USER_GRACE_MS,
+    );
+    if (deleted > 0) {
+      Logger.info(`Cleanup [unverified-users]: removed ${deleted} entries`);
+    }
+  } catch (error) {
+    Logger.error(`Cleanup [unverified-users] failed: ${error}`);
+  }
+
+  // 7. Agent task capture: items no device claimed within retention, grants
+  // that can never authenticate again, and stale retry-window entries. The
+  // tables are empty unless CAPTURE_CONNECTOR_ENABLED, so this is a no-op then.
+  try {
+    const items = await deleteExpiredCaptures(cutoffTime);
+    const grants = await deleteDeadCaptureGrants(Date.now());
+    pruneRetryWindow();
+    if (items > 0 || grants > 0) {
+      Logger.info(`Cleanup [capture]: removed ${items} items, ${grants} grants`);
+    }
+  } catch (error) {
+    Logger.error(`Cleanup [capture] failed: ${error}`);
+  }
+};
+
+// Own parser: parsePositiveIntegerEnv rejects 0, a valid hour.
+const getCleanupHourUtc = (): number | null => {
+  const rawValue = process.env.OLD_OPS_CLEANUP_HOUR_UTC;
+  if (rawValue === undefined || rawValue === '') return null;
+
+  const hour = Number(rawValue);
+  if (!/^\d{1,2}$/.test(rawValue) || hour > 23) {
+    Logger.warn(
+      `Invalid OLD_OPS_CLEANUP_HOUR_UTC="${rawValue}" (expected 0-23). ` +
+        `Falling back to running ${INITIAL_CLEANUP_DELAY_MS / 1000}s after start.`,
+    );
+    return null;
+  }
+  return hour;
+};
+
+const msUntilNextUtcHour = (hourUtc: number, now: number): number => {
+  const next = new Date(now);
+  next.setUTCHours(hourUtc, 0, 0, 0);
+  if (next.getTime() <= now) next.setUTCDate(next.getUTCDate() + 1);
+  return next.getTime() - now;
+};
+
+export const startCleanupJobs = (): void => {
+  Logger.info('Starting daily cleanup job...');
+
+  const hourUtc = getCleanupHourUtc();
+  // Brief warmup before the first pass; the per-batch/per-run throttles in
+  // deleteOldSyncedOpsForAllUsers keep the work bounded so this delay only
+  // needs to cover startup tasks, not the cleanup itself.
+  const firstRunDelayMs =
+    hourUtc === null ? INITIAL_CLEANUP_DELAY_MS : msUntilNextUtcHour(hourUtc, Date.now());
+  initialCleanupTimer = setTimeout(() => {
+    initialCleanupTimer = null;
+    void runDailyCleanup();
+
+    // Schedule recurring daily cleanup from the first run, so it keeps that time of day
+    cleanupTimer = setInterval(() => {
+      void runDailyCleanup();
+    }, MS_PER_DAY);
+    cleanupTimer.unref();
+  }, firstRunDelayMs);
+  initialCleanupTimer.unref();
+
+  Logger.info(
+    hourUtc === null
+      ? 'Daily cleanup job scheduled'
+      : `Daily cleanup job scheduled for ${hourUtc}:00 UTC`,
+  );
+};
+
+export const stopCleanupJobs = (): void => {
+  if (initialCleanupTimer) {
+    clearTimeout(initialCleanupTimer);
+    initialCleanupTimer = null;
+  }
+  if (cleanupTimer) {
+    clearInterval(cleanupTimer);
+    cleanupTimer = null;
+  }
+  for (const t of reconcileTimers) clearTimeout(t);
+  reconcileTimers.clear();
+  Logger.info('Cleanup jobs stopped');
+};
+
+const scheduleDeferredReconciles = (userIds: number[]): void => {
+  if (userIds.length === 0) return;
+  const maxScheduled = Math.min(
+    userIds.length,
+    Math.floor(RECONCILE_BUDGET_MS / RECONCILE_INTERVAL_MS),
+  );
+  // S1: `userIds` arrives in a deterministic order (no Math.random), so the
+  // tail rolls over to the next pass rather than being reshuffled. It is NOT
+  // stalest-first any more: since #9688 the sweep only reads snapshotAt for
+  // users still holding a cached snapshot blob, and under the mandatory-E2EE
+  // gate that is almost nobody — everyone else ties and drains in userId
+  // order. See StorageQuotaService.deleteOldSyncedOpsForAllUsers.
+  if (maxScheduled < userIds.length) {
+    Logger.warn(
+      `Cleanup [reconcile]: budget covers ${maxScheduled}/${userIds.length} users; ` +
+        `the remainder rolls over to the next pass`,
+    );
+  }
+  const syncService = getSyncService();
+  for (let i = 0; i < maxScheduled; i++) {
+    const userId = userIds[i];
+    let timer!: NodeJS.Timeout;
+    timer = setTimeout(() => {
+      reconcileTimers.delete(timer);
+      void syncService.updateStorageUsage(userId).catch((err) => {
+        Logger.warn(
+          `Cleanup [reconcile] user=${userId} failed: ${
+            err instanceof Error ? err.message : err
+          }`,
+        );
+      });
+    }, i * RECONCILE_INTERVAL_MS);
+    timer.unref();
+    reconcileTimers.add(timer);
+  }
+};

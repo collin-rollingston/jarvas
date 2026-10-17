@@ -1,0 +1,2079 @@
+import { DestroyRef, inject, Injectable, Injector } from '@angular/core';
+import { BehaviorSubject, combineLatest, firstValueFrom, Observable, of } from 'rxjs';
+import { GlobalConfigService } from '../../features/config/global-config.service';
+import {
+  distinctUntilChanged,
+  filter,
+  first,
+  map,
+  shareReplay,
+  switchMap,
+  timeout,
+} from 'rxjs/operators';
+import { takeUntilDestroyed, toObservable } from '@angular/core/rxjs-interop';
+import {
+  SyncAlreadyInProgressError,
+  LockAcquisitionTimeoutError,
+  LocalDataConflictError,
+  WebCryptoNotAvailableError,
+  MissingRefreshTokenAPIError,
+  HttpNotOkAPIError,
+  EmptyRemoteBodySPError,
+  InvalidFilePrefixError,
+  JsonParseError,
+  LegacySyncFormatDetectedError,
+  IncompleteRemoteOperationsError,
+  PlaintextWhenEncryptionExpectedError,
+  UploadRevToMatchMismatchAPIError,
+  ForceUploadFailedError,
+  ForceUploadPendingOpsError,
+  FileSyncTargetChangedError,
+  SyncEpochChangedError,
+  UnsupportedMultiEntityConflictError,
+} from '../../op-log/core/errors/sync-errors';
+import { MAX_LWW_REUPLOAD_RETRIES } from '../../op-log/core/operation-log.const';
+import { countTransientRejections } from '../../op-log/sync/upload-outcome.util';
+import { SyncConfig } from '../../features/config/global-config.model';
+import { TranslateService } from '@ngx-translate/core';
+import { MatDialog, MatDialogRef } from '@angular/material/dialog';
+import { SnackService } from '../../core/snack/snack.service';
+import {
+  AuthFailSPError,
+  CanNotMigrateMajorDownError,
+  ConflictData,
+  ConflictReason,
+  DecryptError,
+  DecryptNoPasswordError,
+  OperationIntegrityError,
+  EncryptNoPasswordError,
+  MissingCredentialsSPError,
+  NetworkUnavailableSPError,
+  PotentialCorsError,
+  SyncProviderId,
+  SyncStatus,
+  toSyncProviderId,
+} from '../../op-log/sync-exports';
+import { SyncProviderManager } from '../../op-log/sync-providers/provider-manager.service';
+import { LegacyPfDbService } from '../../core/persistence/legacy-pf-db.service';
+import { T } from '../../t.const';
+import { getSyncErrorStr } from './get-sync-error-str';
+import { getErrorTxt } from '../../util/get-error-text';
+import { escapeHtml } from '../../util/escape-html';
+import { DialogGetAndEnterAuthCodeComponent } from './dialog-get-and-enter-auth-code/dialog-get-and-enter-auth-code.component';
+import { DialogConflictResolutionResult } from './sync.model';
+import { DialogSyncConflictComponent } from './dialog-sync-conflict/dialog-sync-conflict.component';
+import { ReminderService } from '../../features/reminder/reminder.service';
+
+import { DialogHandleDecryptErrorComponent } from './dialog-handle-decrypt-error/dialog-handle-decrypt-error.component';
+import { DialogEnterEncryptionPasswordComponent } from './dialog-enter-encryption-password/dialog-enter-encryption-password.component';
+import { SyncLog } from '../../core/log';
+import { SyncUploadRejectionNoticeService } from './sync-upload-rejection-notice.service';
+import { promiseTimeout } from '../../util/promise-timeout';
+import { devError } from '../../util/dev-error';
+import { alertDialog, confirmDialog } from '../../util/native-dialogs';
+import { UserInputWaitStateService } from './user-input-wait-state.service';
+import { SYNC_WAIT_TIMEOUT_MS } from './sync.const';
+import {
+  isSyncIncompatibleVersionError,
+  SyncIncompatibleVersionNoticeService,
+} from './sync-incompatible-version-notice.service';
+import { SuperSyncStatusService } from '../../op-log/sync/super-sync-status.service';
+import { SuperSyncWebSocketService } from '../../op-log/sync/super-sync-websocket.service';
+import { WsTriggeredDownloadService } from '../../op-log/sync/ws-triggered-download.service';
+import { TrackingPresenceService } from '../../features/tracking-presence/tracking-presence.service';
+import { RemoteTrackingAndroidNotifierService } from '../../features/tracking-presence/remote-tracking-android-notifier.service';
+import { IS_ELECTRON } from '../../app.constants';
+import { OperationLogStoreService } from '../../op-log/persistence/operation-log-store.service';
+import { OperationLogSyncService } from '../../op-log/sync/operation-log-sync.service';
+import { SyncSessionValidationService } from '../../op-log/sync/sync-session-validation.service';
+import { SyncCycleGuardService } from '../../op-log/sync/sync-cycle-guard.service';
+import { WrappedProviderService } from '../../op-log/sync-providers/wrapped-provider.service';
+import { isSuperSyncWebSocketAccess } from '@sp/sync-providers/super-sync';
+import { isTransientNetworkError } from '@sp/sync-providers/http';
+import { HydrationStateService } from '../../op-log/apply/hydration-state.service';
+import type { UploadOutcome } from '../../op-log/core/types/sync-results.types';
+
+type CompletedUploadOutcome = Extract<UploadOutcome, { kind: 'completed' }>;
+
+/**
+ * Identifies which error or UI path triggered a destructive forceUpload.
+ * Logged on every invocation so a future sync-stuck incident can be traced
+ * back to its origin without diff-archaeology.
+ */
+export type ForceUploadTriggerSource =
+  | 'EmptyRemoteBodySPError'
+  | 'InvalidFilePrefixError'
+  | 'JsonParseError'
+  | 'LegacySyncFormatDetectedError'
+  | 'unknown';
+
+/**
+ * When the post-sync SuperSync encryption prompt fires while another dialog is
+ * still open (typically the sync-config dialog still playing its close animation
+ * right after first-time setup), defer rather than drop the prompt: poll until
+ * dialogs clear, up to this bound, then re-check state.
+ * See `_promptSuperSyncEncryptionIfNeeded` (#8670 regression).
+ */
+const ENCRYPTION_PROMPT_DIALOG_WAIT_MS = 8000;
+const ENCRYPTION_PROMPT_DIALOG_POLL_MS = 100;
+
+@Injectable({
+  providedIn: 'root',
+})
+export class SyncWrapperService {
+  private _providerManager = inject(SyncProviderManager);
+  private _legacyPfDb = inject(LegacyPfDbService);
+  private _globalConfigService = inject(GlobalConfigService);
+  private _translateService = inject(TranslateService);
+  private _snackService = inject(SnackService);
+  private _matDialog = inject(MatDialog);
+
+  private _reminderService = inject(ReminderService);
+  private _userInputWaitState = inject(UserInputWaitStateService);
+  private _incompatibleVersionNotice = inject(SyncIncompatibleVersionNoticeService);
+  private _uploadRejectionNotice = inject(SyncUploadRejectionNoticeService);
+  private _superSyncStatusService = inject(SuperSyncStatusService);
+  private _superSyncWsService = inject(SuperSyncWebSocketService);
+  private _wsDownloadService = inject(WsTriggeredDownloadService);
+  private _trackingPresenceService = inject(TrackingPresenceService);
+  private _remoteTrackingNotifier = inject(RemoteTrackingAndroidNotifierService);
+  private _opLogStore = inject(OperationLogStoreService);
+  private _opLogSyncService = inject(OperationLogSyncService);
+  private _sessionValidation = inject(SyncSessionValidationService);
+  private _syncCycleGuard = inject(SyncCycleGuardService);
+  private _wrappedProvider = inject(WrappedProviderService);
+  private _hydrationState = inject(HydrationStateService);
+  // For click-time resolution of SuperSyncEncryptionSetupService only — it
+  // injects this service, so a constructor-time inject would be circular.
+  private _injector = inject(Injector);
+
+  syncState$ = this._providerManager.syncStatus$;
+
+  syncCfg$: Observable<SyncConfig> = this._globalConfigService.cfg$.pipe(
+    map((cfg) => cfg?.sync),
+  );
+  syncProviderId$: Observable<SyncProviderId | null> = this.syncCfg$.pipe(
+    map((cfg) => toSyncProviderId(cfg.syncProvider)),
+  );
+
+  private _destroyRef = inject(DestroyRef);
+
+  // Disconnect WebSocket when sync provider changes away from SuperSync or sync is disabled
+  private _wsProviderCleanup = this.syncProviderId$
+    .pipe(distinctUntilChanged(), takeUntilDestroyed(this._destroyRef))
+    .subscribe((providerId) => {
+      if (providerId !== SyncProviderId.SuperSync) {
+        this.disconnectWebSocket();
+      }
+    });
+
+  /**
+   * Sync interval in milliseconds.
+   * - When WebSocket is connected: 5 minutes (health check only)
+   * - When WebSocket is disconnected: 1 minute for SuperSync
+   * - Other providers: user-configured value
+   * - Return 0 when manual sync only is enabled to disable automatic triggers
+   */
+  syncInterval$: Observable<number> = combineLatest([
+    this.syncCfg$,
+    toObservable(this._superSyncWsService.isConnected),
+  ]).pipe(
+    map(([cfg, wsConnected]) => {
+      if (cfg.isManualSyncOnly) return 0;
+      if (cfg.syncProvider === SyncProviderId.SuperSync) {
+        return wsConnected ? 300_000 : 60_000;
+      }
+      return cfg.syncInterval;
+    }),
+    distinctUntilChanged(),
+  );
+
+  isEnabledAndReady$: Observable<boolean> = this._providerManager.isProviderReady$;
+
+  // NOTE we don't use this._pfapiService.isSyncInProgress$ since it does not include handling and re-init view model
+  private _isSyncInProgress$ = new BehaviorSubject(false);
+  isSyncInProgress$ = this._isSyncInProgress$.asObservable();
+
+  /**
+   * Flag to block sync during critical encryption operations (password change, enable/disable).
+   * When true, sync() will skip and return immediately. This prevents race conditions where
+   * sync could read partial encryption state during password change.
+   */
+  private _isEncryptionOperationInProgress$ = new BehaviorSubject(false);
+
+  /** Serializes runWithSyncBlocked invocations — see its doc (#9074). */
+  private _syncBlockedChain: Promise<unknown> = Promise.resolve();
+
+  /**
+   * Observable form of {@link isEncryptionOperationInProgress}, for consumers
+   * that need an edge rather than a point-in-time read (the getter cannot tell
+   * a waiter when the operation ends). Same coverage as the getter: everything
+   * routed through `runWithSyncBlocked()` — password change, enable/disable
+   * encryption, and `forceUpload()`, which `isSyncInProgress$` does NOT span.
+   */
+  readonly isEncryptionOperationInProgress$: Observable<boolean> =
+    this._isEncryptionOperationInProgress$.asObservable();
+
+  /**
+   * When true, encryption-related dialogs (missing password, decrypt error) are suppressed.
+   * Set after the user cancels a dialog so they can navigate to settings to change the password
+   * without being blocked by recurring auto-sync dialogs. Cleared when encryption config changes.
+   */
+  private _suppressEncryptionDialogs = false;
+
+  /**
+   * Tracks consecutive SuperSync AuthFailSPError occurrences.
+   * Tolerates up to 2 transient 401s (e.g. infrastructure errors);
+   * on the 3rd consecutive failure, clears the token so re-auth dialog opens.
+   * Reset to 0 on any successful sync or any non-auth error.
+   */
+  private _consecutiveSuperSyncAuthFailures = 0;
+
+  /**
+   * Observable for UI: true when all local changes have been uploaded.
+   * Used for all sync providers to show the single checkmark indicator.
+   */
+  hasNoPendingOps$: Observable<boolean> = toObservable(
+    this._superSyncStatusService.hasNoPendingOps,
+  ).pipe(distinctUntilChanged(), shareReplay(1));
+
+  /**
+   * Observable for UI: true when sync is confirmed fully in sync
+   * (no pending ops AND remote recently checked within 1 minute).
+   * Used for all sync providers to show the double checkmark indicator.
+   */
+  superSyncIsConfirmedInSync$: Observable<boolean> = toObservable(
+    this._superSyncStatusService.isConfirmedInSync,
+  ).pipe(distinctUntilChanged(), shareReplay(1));
+
+  isSyncInProgressSync(): boolean {
+    return this._isSyncInProgress$.getValue();
+  }
+
+  /**
+   * Returns true if an encryption operation (password change, enable/disable) is in progress.
+   * Used by ImmediateUploadService to avoid uploading during critical encryption operations.
+   */
+  get isEncryptionOperationInProgress(): boolean {
+    return this._isEncryptionOperationInProgress$.getValue();
+  }
+
+  /**
+   * Clears the suppression flag so encryption dialogs can appear again.
+   * Called after the user changes the encryption password via settings.
+   */
+  clearEncryptionDialogSuppression(): void {
+    this._suppressEncryptionDialogs = false;
+  }
+
+  // Expose shared user input wait state for other services (e.g., SyncTriggerService)
+  isWaitingForUserInput$ = this._userInputWaitState.isWaitingForUserInput$;
+
+  afterCurrentSyncDoneOrSyncDisabled$: Observable<unknown> = this.isEnabledAndReady$.pipe(
+    switchMap((isEnabled) =>
+      isEnabled
+        ? this._isSyncInProgress$.pipe(
+            filter((isInProgress) => !isInProgress),
+            timeout({
+              each: SYNC_WAIT_TIMEOUT_MS,
+              with: () =>
+                // If waiting for user input, don't error - just wait indefinitely
+                this._userInputWaitState.isWaitingForUserInput$.pipe(
+                  switchMap((isWaiting) => {
+                    if (isWaiting) {
+                      // Continue waiting for sync to complete (no timeout)
+                      return this._isSyncInProgress$.pipe(
+                        filter((isInProgress) => !isInProgress),
+                      );
+                    }
+                    devError('Sync wait timeout exceeded');
+                    return of(undefined);
+                  }),
+                ),
+            }),
+          )
+        : of(undefined),
+    ),
+    first(),
+  );
+
+  /**
+   * @param isUserTriggered  `true` when the sync was explicitly requested by the
+   *   user (sync button, saving sync config). Automatic syncs (app resume/focus,
+   *   interval, internal retries) pass `false` so that transient network failures
+   *   — common right after Android wakes from Doze, before sockets/DNS recover —
+   *   stay silent instead of flashing a self-healing "temporary network problem"
+   *   snackbar the user never asked about. The next sync cycle retries anyway.
+   * @param opts.suppressEncryptionRequiredSnack  Skips ONLY the persistent
+   *   "encryption required" snack for this run (all other user-facing errors
+   *   still surface). Passed by SuperSyncEncryptionSetupService's preflight,
+   *   which already owns the encryption-setup interaction — without it, the
+   *   preflight would re-arm the very snack whose click started the flow.
+   */
+  async sync(
+    isUserTriggered = false,
+    opts?: { suppressEncryptionRequiredSnack?: boolean },
+  ): Promise<SyncStatus | 'HANDLED_ERROR'> {
+    // Block sync if encryption operation is in progress (password change, enable/disable)
+    if (this._isEncryptionOperationInProgress$.getValue()) {
+      SyncLog.log('Sync blocked: encryption operation in progress');
+      return 'HANDLED_ERROR';
+    }
+
+    // Clear suppression so encryption dialogs can appear again on each sync attempt
+    this._suppressEncryptionDialogs = false;
+
+    // Race condition fix: Check-and-set atomically before starting sync
+    if (this._isSyncInProgress$.getValue()) {
+      SyncLog.log('Sync already in progress, skipping concurrent sync attempt');
+      return 'HANDLED_ERROR';
+    }
+    this._isSyncInProgress$.next(true);
+
+    // #8309: claim the in-tab sync cycle so the conflict-gate decision,
+    // setLastServerSeq, and the session-validation latch are serialized against
+    // the side channels (immediate upload / WS download). Both this claim and
+    // the re-entry check above are synchronous (no await between), so the
+    // check-and-set stays atomic. If a (short-lived) side channel is mid-cycle
+    // we skip rather than block — the next trigger retries. Released in the
+    // finally below.
+    if (!this._syncCycleGuard.tryBegin()) {
+      this._isSyncInProgress$.next(false);
+      SyncLog.log('Sync skipped: another sync cycle is in progress');
+      return 'HANDLED_ERROR';
+    }
+    // Open before any async work — see `HydrationStateService.isInSyncWindow`.
+    // Pass 0 to disable the failsafe: the `finally` block below is the
+    // authoritative close, and a slow sync (provider I/O > 2s) would
+    // otherwise expire the timer mid-sync and leave a stale-state gap.
+    this._hydrationState.openSyncWindow(0);
+    // Set SYNCING status so ImmediateUploadService knows not to interfere
+    this._providerManager.setSyncStatus('SYNCING');
+    const result = await this._sync(
+      isUserTriggered,
+      opts?.suppressEncryptionRequiredSnack === true,
+    ).finally(() => {
+      this._isSyncInProgress$.next(false);
+      this._hydrationState.closeSyncWindow();
+      this._syncCycleGuard.end();
+      // Safeguard: if _sync() threw or completed without setting a final status,
+      // reset from SYNCING to UNKNOWN_OR_CHANGED to avoid getting stuck in SYNCING state
+      if (this._providerManager.isSyncInProgress) {
+        this._providerManager.setSyncStatus('UNKNOWN_OR_CHANGED');
+      }
+    });
+
+    // After any successful sync, prompt for encryption if SuperSync is active
+    // without it. This ensures data is downloaded and merged first, preventing
+    // data loss. Note: a successful sync now returns UpdateRemote when data
+    // changed and InSync only when nothing changed (discussion #7196), so this
+    // gate must accept both — only HANDLED_ERROR skips the prompt.
+    if (result !== 'HANDLED_ERROR') {
+      this._promptSuperSyncEncryptionIfNeeded().catch((err) => {
+        SyncLog.err('Error prompting for encryption:', err);
+      });
+    }
+
+    return result;
+  }
+
+  /**
+   * Runs a destructive config operation (encryption password change,
+   * enable/disable, force upload) with sync excluded (#9074):
+   *
+   * 1. Serializes concurrent invocations — two destructive ops must not fence
+   *    each other via the epoch bump or clear the block flag while the other
+   *    still runs.
+   * 2. Blocks NEW cycles first (all three cycle entry points gate on the flag
+   *    synchronously before claiming the cycle guard).
+   * 3. Bumps the sync epoch, so an ALREADY-RUNNING cycle aborts at its next
+   *    fenced write even if the drain below times out.
+   * 4. Drains the main sync AND any side-channel cycle holding the
+   *    SyncCycleGuardService (bounded; throws on timeout). The drain is
+   *    load-bearing on top of the fence: the fence cannot recall request
+   *    bytes already on the wire, so the destructive remote write must not
+   *    start until the stale cycle has settled.
+   * 5. Runs the operation, then unblocks.
+   *
+   * @param operation - The async operation to run with sync blocked
+   * @returns The result of the operation
+   */
+  async runWithSyncBlocked<T>(operation: () => Promise<T>): Promise<T> {
+    const run = (): Promise<T> => this._runWithSyncBlockedExclusive(operation);
+    const result = this._syncBlockedChain.then(run, run);
+    // Chain regardless of outcome; errors surface to this invocation's caller.
+    this._syncBlockedChain = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  private async _runWithSyncBlockedExclusive<T>(operation: () => Promise<T>): Promise<T> {
+    // Block new cycles BEFORE draining — a drain-first order would be stale
+    // the moment it resolves (the pre-#9074 TOCTOU).
+    this._isEncryptionOperationInProgress$.next(true);
+    SyncLog.log('Sync blocked for destructive config operation');
+
+    try {
+      this._providerManager.bumpSyncEpoch('destructive config operation');
+
+      // Wait for any ongoing main sync to complete (with timeout)
+      if (this._isSyncInProgress$.getValue()) {
+        SyncLog.log(
+          'Waiting for ongoing sync to complete before destructive operation...',
+        );
+        try {
+          // Race between sync completing and timeout
+          await Promise.race([
+            firstValueFrom(
+              this._isSyncInProgress$.pipe(filter((inProgress) => !inProgress)),
+            ),
+            promiseTimeout(SYNC_WAIT_TIMEOUT_MS).then(() => {
+              throw new Error('Timeout waiting for sync');
+            }),
+          ]);
+        } catch (e) {
+          throw new Error(
+            'Cannot change encryption settings: sync timed out. Please try again.',
+          );
+        }
+      }
+
+      // Also drain the side channels (immediate upload / WS download): they
+      // never set _isSyncInProgress$ but do hold the cycle guard — the exact
+      // gap behind #9074. Bounded because a cycle can legitimately hold the
+      // guard across a user conflict dialog.
+      const isGuardFree = await this._syncCycleGuard.waitUntilFree(SYNC_WAIT_TIMEOUT_MS);
+      if (!isGuardFree) {
+        throw new Error(
+          'Cannot change sync settings: an active sync cycle did not finish in time. Please try again.',
+        );
+      }
+
+      return await operation();
+    } finally {
+      // Unblock sync
+      this._isEncryptionOperationInProgress$.next(false);
+      SyncLog.log('Sync unblocked after destructive config operation');
+    }
+  }
+
+  /**
+   * Connects the WebSocket for real-time sync notifications.
+   * Called after a successful SuperSync sync cycle.
+   */
+  async connectWebSocket(): Promise<void> {
+    const providerId = await firstValueFrom(this.syncProviderId$);
+    if (providerId !== SyncProviderId.SuperSync) {
+      return;
+    }
+
+    const provider = await this._providerManager.getProviderById(
+      SyncProviderId.SuperSync,
+    );
+    if (!provider) {
+      SyncLog.warn(
+        'SyncWrapperService: No SuperSync provider found for WebSocket connection',
+      );
+      return;
+    }
+
+    if (!isSuperSyncWebSocketAccess(provider)) {
+      SyncLog.warn(
+        'SyncWrapperService: SuperSync provider does not expose WebSocket access',
+      );
+      return;
+    }
+    const wsParams = await provider.getWebSocketParams();
+    if (!wsParams) {
+      SyncLog.warn(
+        'SyncWrapperService: No WebSocket params available from SuperSync provider',
+      );
+      return;
+    }
+
+    await this._superSyncWsService.connect(wsParams.baseUrl, wsParams.accessToken);
+    this._wsDownloadService.start();
+  }
+
+  /**
+   * Starts/stops tracking presence per the experimental opt-in. Runs after
+   * EVERY SuperSync sync cycle (not just on connect — the socket stays up for
+   * days), so toggling the setting takes effect on the next sync. Both
+   * start() and stop() are idempotent.
+   *
+   * The opt-in lives in the SuperSync provider's private config (the same
+   * per-device store the checkbox reads/writes, never uploaded), NOT the
+   * global config: it is a per-device choice — a device syncing global config
+   * from a device that opted in must not silently start broadcasting too.
+   */
+  private async _applyTrackingPresenceGate(): Promise<void> {
+    let isEnabled = false;
+    try {
+      const provider = await this._providerManager.getProviderById(
+        SyncProviderId.SuperSync,
+      );
+      const privateCfg = provider ? await provider.privateCfg.load() : null;
+      isEnabled = !!(privateCfg as { isTrackingPresenceEnabled?: boolean } | null)
+        ?.isTrackingPresenceEnabled;
+    } catch (err) {
+      SyncLog.warn('SyncWrapperService: Failed to read presence opt-in', err);
+    }
+    if (isEnabled) {
+      this._trackingPresenceService.start();
+      this._remoteTrackingNotifier.start();
+    } else {
+      this._remoteTrackingNotifier.stop();
+      // Opt-out path: the socket stays up, so the final frame goes out on its
+      // own — nothing to wait for here.
+      void this._trackingPresenceService.stop();
+    }
+  }
+
+  /**
+   * Disconnects the WebSocket and stops WS-triggered downloads.
+   */
+  disconnectWebSocket(): void {
+    this._remoteTrackingNotifier.stop();
+    const presenceFlushed = this._trackingPresenceService.stop();
+    this._wsDownloadService.stop();
+    // The producer's final `stopped` frame cannot be sent synchronously (key
+    // resolution + WebCrypto encryption are async) and needs the socket alive
+    // to reach the wire. Closing in the same tick drops it and leaves the
+    // user's other devices on a phantom session for up to 30min, so close only
+    // once the frame has been handed to the WebSocket. The handle always
+    // settles (see TrackingPresenceService.stop).
+    void presenceFlushed.finally(() => this._superSyncWsService.disconnect());
+  }
+
+  private async _sync(
+    isUserTriggered: boolean,
+    isEncryptionRequiredSnackSuppressed: boolean,
+  ): Promise<SyncStatus | 'HANDLED_ERROR'> {
+    const providerId = await firstValueFrom(this.syncProviderId$);
+    if (!providerId) {
+      throw new Error('No Sync Provider for sync()');
+    }
+
+    // Open a session-validation scope for this sync. Any post-sync
+    // validation failure during the session (download, upload, piggyback,
+    // retry, USE_REMOTE force-download) flips the latch; the wrapper reads
+    // it once before claiming IN_SYNC. (#7330)
+    return this._sessionValidation.withSession(() =>
+      this._syncBody(providerId, isUserTriggered, isEncryptionRequiredSnackSuppressed),
+    );
+  }
+
+  private async _syncBody(
+    providerId: SyncProviderId,
+    isUserTriggered: boolean,
+    isEncryptionRequiredSnackSuppressed: boolean,
+  ): Promise<SyncStatus | 'HANDLED_ERROR'> {
+    try {
+      // PERF: For legacy sync providers (WebDAV, Dropbox, LocalFile), sync the vector clock
+      // from SUP_OPS to pf.META_MODEL before sync. This bridges the gap between the new
+      // atomic write system (vector clock in SUP_OPS) and legacy sync which reads from pf.
+      // SuperSync uses operation log directly, so it doesn't need this bridge.
+      if (providerId !== SyncProviderId.SuperSync) {
+        await this._syncVectorClockToPfapi();
+      }
+
+      // Get the sync-capable version of the provider
+      // - SuperSync: returned as-is (already implements OperationSyncCapable)
+      // - File-based (Dropbox, WebDAV, LocalFile): wrapped with FileBasedSyncAdapterService
+      //
+      // #9074: the (provider, epoch) pair MUST be read in one synchronous block
+      // — a provider switch swaps the object and bumps the epoch in one
+      // synchronous block on its side, so a same-block read is always
+      // consistent. Capturing the epoch earlier (at the cycle claim) let a
+      // switch complete in the awaits between, handing this cycle the NEW
+      // provider with a STALE epoch — a spurious fence abort on the first
+      // post-switch sync.
+      const rawProvider = this._providerManager.getActiveProvider();
+      const fenceEpoch = this._providerManager.syncEpoch;
+      const syncCapableProvider = await this._wrappedProvider.getOperationSyncCapable(
+        rawProvider,
+        { fenceEpoch },
+      );
+
+      if (!syncCapableProvider) {
+        SyncLog.warn('SyncWrapperService: Provider does not support operation sync');
+        return SyncStatus.InSync;
+      }
+
+      // Perform actual sync: download first, then upload
+      SyncLog.log('SyncWrapperService: Starting op-log sync...');
+
+      // Detect provider switch: force fresh download to trigger conflict dialog
+      const lastSyncedProvider = this._providerManager.getLastSyncedProviderId();
+      const isProviderSwitch =
+        lastSyncedProvider !== null && lastSyncedProvider !== providerId;
+      if (isProviderSwitch) {
+        SyncLog.warn(
+          `SyncWrapperService: Provider switch detected (${lastSyncedProvider} → ${providerId}). ` +
+            'Forcing download from seq 0 for fresh state comparison.',
+        );
+      }
+
+      // Capture sync history BEFORE download. The SYNC_IMPORT conflict gate (both the
+      // download and piggyback-upload paths) uses this to decide whether a USE_LOCAL
+      // choice would overwrite a populated remote with throwaway pre-first-sync state.
+      // It MUST be read here, before this sync persists any synced ops, or the
+      // never-synced guard reads its own just-written state and disarms itself.
+      const isNeverSyncedAtSyncStart = !(await this._opLogSyncService.hasSyncedOps());
+
+      // 1. Download remote ops first (important for fresh clients to receive data)
+      const downloadResult = await this._opLogSyncService.downloadRemoteOps(
+        syncCapableProvider,
+        {
+          forceFromSeq0: isProviderSwitch || undefined,
+          isNeverSynced: isNeverSyncedAtSyncStart,
+          fenceEpoch,
+          keepDecryptedPrefix: true,
+        },
+      );
+      // Auth is confirmed working if download didn't throw AuthFailSPError.
+      // Reset here rather than only at InSync so early returns (cancelled,
+      // LWW pending, payload rejected) also break the consecutive-failure chain.
+      this._consecutiveSuperSyncAuthFailures = 0;
+      SyncLog.log(`SyncWrapperService: Download complete. kind=${downloadResult.kind}`);
+
+      // Skip the upload entirely when the user cancelled the sync import conflict
+      // dialog, or when empty-server seeding created no SYNC_IMPORT (#9921, an
+      // upload would strand the pre-op-log / genesis state). Local state stays
+      // unchanged and lastSyncedProvider is not updated, so the next sync retries.
+      if (
+        downloadResult.kind === 'cancelled' ||
+        downloadResult.kind === 'server_migration_skipped'
+      ) {
+        SyncLog.log(
+          `SyncWrapperService: Download ended with ${downloadResult.kind}. Skipping upload phase.`,
+        );
+        this._providerManager.setSyncStatus('UNKNOWN_OR_CHANGED');
+        return 'HANDLED_ERROR';
+      }
+      if (downloadResult.kind === 'blocked_incompatible') {
+        SyncLog.warn(
+          'SyncWrapperService: Download blocked by an incompatible operation.',
+        );
+        this._providerManager.setSyncStatus('ERROR');
+        return 'HANDLED_ERROR';
+      }
+
+      // Track the successfully synced provider for switch detection on next sync
+      this._providerManager.setLastSyncedProviderId(providerId);
+
+      // 2. Upload pending local ops
+      const uploadResult = await this._opLogSyncService.uploadPendingOps(
+        syncCapableProvider,
+        { isNeverSynced: isNeverSyncedAtSyncStart, fenceEpoch },
+      );
+      if (uploadResult.kind === 'blocked_incompatible') {
+        SyncLog.warn(
+          'SyncWrapperService: Upload piggyback blocked by an incompatible operation.',
+        );
+        this._providerManager.setSyncStatus('ERROR');
+        return 'HANDLED_ERROR';
+      }
+      const completedUploadResults: CompletedUploadOutcome[] =
+        uploadResult.kind === 'completed' ? [uploadResult] : [];
+      if (uploadResult.kind === 'completed') {
+        SyncLog.log(
+          `SyncWrapperService: Upload complete. uploaded=${uploadResult.uploadedCount}, piggybacked=${uploadResult.piggybackedOpsCount}`,
+        );
+      }
+
+      // If upload was cancelled (piggybacked SYNC_IMPORT conflict dialog), skip LWW re-upload
+      if (uploadResult.kind === 'cancelled') {
+        SyncLog.log(
+          'SyncWrapperService: Upload cancelled by user (piggybacked SYNC_IMPORT). Skipping LWW re-upload.',
+        );
+        this._providerManager.setSyncStatus('UNKNOWN_OR_CHANGED');
+        return 'HANDLED_ERROR';
+      }
+
+      // If the provider mandates encryption but no key is configured yet, the upload was
+      // skipped with pending ops still unsynced (GHSA-9v8x guard). Downloads still ran
+      // (merge-first), but nothing local can be uploaded until encryption is set up — so
+      // this is NOT in sync. Report it honestly instead of falling through to IN_SYNC.
+      // Also short-circuit the LWW loop below: its local-win ops are blocked by the same
+      // missing key and would just spin to the retry cap.
+      if (
+        uploadResult.kind === 'completed' &&
+        uploadResult.encryptionRequiredKeyMissing
+      ) {
+        SyncLog.log(
+          'SyncWrapperService: Upload skipped — encryption required but no key configured. ' +
+            'Reporting UNKNOWN_OR_CHANGED (sync paused until encryption is set up).',
+        );
+        this._providerManager.setSyncStatus('UNKNOWN_OR_CHANGED');
+        // Fresh setup already opens its dedicated modal after this sync, and the
+        // encryption-setup preflight already owns the interaction — both would
+        // otherwise get a duplicate persistent snack.
+        if (
+          isUserTriggered &&
+          !isEncryptionRequiredSnackSuppressed &&
+          !this._shouldPromptEncryptionAfterSetupSync
+        ) {
+          this._snackService.open({
+            msg: T.F.SYNC.S.ENCRYPTION_REQUIRED_FOR_SUPERSYNC,
+            type: 'WARNING',
+            actionStr: T.F.SYNC.FORM.SUPER_SYNC.SETUP_ENCRYPTION_BTN,
+            actionFn: async () => {
+              // This snack can sit for hours, and the enable dialog deletes ALL
+              // server data before re-uploading local state — a peer may have
+              // enabled encryption and uploaded newer data meanwhile. NEVER open
+              // the dialog directly from here: the setup flow re-syncs first and
+              // re-checks the key is still missing (a now-encrypted remote
+              // surfaces as DecryptNoPasswordError → enter-password flow).
+              // Resolved lazily via the injector — the flow service injects this
+              // service, so a constructor-time reference would be circular.
+              const { SuperSyncEncryptionSetupService } =
+                await import('./super-sync-encryption-setup.service');
+              await this._injector
+                .get(SuperSyncEncryptionSetupService)
+                .syncThenOfferSetup();
+            },
+            // Persistent (duration 0): must survive the header's routine
+            // "sync complete" snack that lands right after this one — the snack
+            // slot's persistent-action rule keeps it on top. Cost: it also holds
+            // back later non-persistent snacks until dismissed/actioned, which is
+            // accepted for an actionable "sync is paused" state; a stale click
+            // degrades safely via the guarded flow above.
+            config: { duration: 0 },
+          });
+        }
+        return SyncStatus.UpdateRemote;
+      }
+
+      // 3. If LWW created local-win ops, upload them (with retry limit to prevent infinite loops)
+      const downloadLwwOps =
+        downloadResult.kind === 'ops_processed' ? downloadResult.localWinOpsCreated : 0;
+      const uploadLwwOps =
+        uploadResult.kind === 'completed' ? uploadResult.localWinOpsCreated : 0;
+      // A transient server rejection (INTERNAL_ERROR, e.g. a Postgres
+      // serialization conflict) leaves the op pending with nothing scheduled to
+      // re-send it until the next sync trigger — a whole auto-sync interval, and
+      // the header keeps showing unsynced changes meanwhile. The server asked for
+      // a retry, so fold those ops into the same bounded re-upload loop.
+      const uploadTransientOps =
+        uploadResult.kind === 'completed' ? countTransientRejections(uploadResult) : 0;
+      let lwwRetries = 0;
+      let pendingLwwOps = downloadLwwOps + uploadLwwOps + uploadTransientOps;
+      while (pendingLwwOps > 0 && lwwRetries < MAX_LWW_REUPLOAD_RETRIES) {
+        lwwRetries++;
+        SyncLog.log(
+          `SyncWrapperService: Re-uploading ${pendingLwwOps} pending op(s) (LWW local-win or transiently rejected) ` +
+            `(attempt ${lwwRetries}/${MAX_LWW_REUPLOAD_RETRIES})...`,
+        );
+        // Re-thread isNeverSyncedAtSyncStart (the snapshot captured BEFORE the
+        // initial upload ran) instead of letting uploadPendingOps re-read live
+        // state — the initial batch has already flipped hasSyncedOps() to true
+        // and a live read here would mis-classify a still-fresh client. Mirrors
+        // the orchestrator-snapshot rationale at the top of uploadPendingOps.
+        const reuploadResult = await this._opLogSyncService.uploadPendingOps(
+          syncCapableProvider,
+          { isNeverSynced: isNeverSyncedAtSyncStart, fenceEpoch },
+        );
+        if (reuploadResult.kind === 'cancelled') {
+          // Mirror the initial-upload cancel path: a cancelled LWW re-upload
+          // means downloaded localWinOpsCreated stay pending in the op-log.
+          // UNKNOWN_OR_CHANGED forces a retry on the next sync tick.
+          SyncLog.log(
+            'SyncWrapperService: LWW re-upload cancelled by user. Skipping remaining sync work.',
+          );
+          this._providerManager.setSyncStatus('UNKNOWN_OR_CHANGED');
+          return 'HANDLED_ERROR';
+        }
+        if (reuploadResult.kind === 'blocked_incompatible') {
+          SyncLog.warn(
+            'SyncWrapperService: LWW re-upload blocked by an incompatible operation.',
+          );
+          this._providerManager.setSyncStatus('ERROR');
+          return 'HANDLED_ERROR';
+        }
+        if (reuploadResult.kind === 'completed') {
+          completedUploadResults.push(reuploadResult);
+        }
+        pendingLwwOps =
+          reuploadResult.kind === 'completed'
+            ? reuploadResult.localWinOpsCreated + countTransientRejections(reuploadResult)
+            : 0;
+      }
+      if (completedUploadResults.some((result) => result.blockedByRejectedFullState)) {
+        SyncLog.err(
+          'SyncWrapperService: Upload blocked because pending operations depend on a rejected full-state baseline.',
+        );
+        this._providerManager.setSyncStatus('ERROR');
+        return 'HANDLED_ERROR';
+      }
+      if (pendingLwwOps > 0) {
+        SyncLog.warn(
+          `SyncWrapperService: LWW re-upload still has ${pendingLwwOps} pending ops after ` +
+            `${MAX_LWW_REUPLOAD_RETRIES} retries. Will retry on next sync.`,
+        );
+        // Issue #7521: validation failure is more serious than unuploaded
+        // ops — prefer ERROR over UNKNOWN_OR_CHANGED if the latch was
+        // flipped at any point during the session.
+        if (this._sessionValidation.hasFailed()) {
+          SyncLog.err(
+            'SyncWrapperService: Validation failed during sync (retry exhaustion path); reporting ERROR',
+          );
+          this._providerManager.setSyncStatus('ERROR');
+          return 'HANDLED_ERROR';
+        }
+        if (this._handlePermanentUploadRejections(completedUploadResults)) {
+          return 'HANDLED_ERROR';
+        }
+        // Don't claim IN_SYNC — there are known unuploaded ops.
+        this._providerManager.setSyncStatus('UNKNOWN_OR_CHANGED');
+        return SyncStatus.UpdateRemote;
+      }
+
+      // Issue #7330: post-sync state validation failure must not be reported
+      // as IN_SYNC. The latch is flipped by every validation site; we read it
+      // once here before claiming IN_SYNC.
+      if (this._sessionValidation.hasFailed()) {
+        SyncLog.err(
+          'SyncWrapperService: Post-sync state validation failed, not marking as IN_SYNC',
+        );
+        this._providerManager.setSyncStatus('ERROR');
+        return 'HANDLED_ERROR';
+      }
+
+      // 4. Check for permanent rejection failures
+      if (this._handlePermanentUploadRejections(completedUploadResults)) {
+        return 'HANDLED_ERROR';
+      }
+
+      // A full-state op (server migration / backup restore) that hit a retryable
+      // server error leaves the WHOLE local state unsynced with no rejection to
+      // report — the one upload failure that used to fall through to IN_SYNC.
+      // Checked last so ERROR and permanent rejections keep precedence; not an
+      // ERROR itself, because the op is still pending and the next sync retries
+      // it. Mirrors the LWW-exhaustion path above, WebSocket connect included:
+      // that too is retried on the next sync.
+      if (completedUploadResults.some((result) => result.fullStateUploadDeferred)) {
+        SyncLog.warn(
+          'SyncWrapperService: Full-state upload deferred after a retryable server error. ' +
+            'Reporting UNKNOWN_OR_CHANGED (will retry on next sync).',
+        );
+        this._providerManager.setSyncStatus('UNKNOWN_OR_CHANGED');
+        return SyncStatus.UpdateRemote;
+      }
+
+      // Mark as in-sync for all providers after successful sync
+      this._providerManager.setSyncStatus('IN_SYNC');
+      SyncLog.log('SyncWrapperService: Sync complete, status=IN_SYNC');
+
+      // Did this sync actually move any data (either direction)? Used by the
+      // sync button to show "Data successfully synced" vs "Already in sync"
+      // (discussion #7196). UpdateRemote is reused here as the generic
+      // "data changed this sync" status — the only consumer that inspects the
+      // return value (main-header) treats all UpdateLocal/UpdateRemote variants
+      // identically, so no new enum value is needed.
+      const didDownloadChanges =
+        downloadResult.kind === 'snapshot_hydrated' ||
+        downloadResult.kind === 'server_migration_handled' ||
+        (downloadResult.kind === 'ops_processed' && downloadResult.newOpsCount > 0);
+      const didUploadChanges =
+        uploadResult.kind === 'completed' && uploadResult.uploadedCount > 0;
+      const didChange = didDownloadChanges || didUploadChanges;
+
+      // Connect WebSocket after first successful SuperSync sync (fire-and-forget)
+      if (
+        providerId === SyncProviderId.SuperSync &&
+        !this._superSyncWsService.isConnected()
+      ) {
+        this.connectWebSocket().catch((err) => {
+          SyncLog.warn(
+            'SyncWrapperService: WebSocket connection failed, will retry on next sync',
+            err,
+          );
+        });
+      }
+      if (providerId === SyncProviderId.SuperSync) {
+        // Must run every cycle, NOT only inside connectWebSocket(): the socket
+        // stays connected for days, so gating there would make toggling the
+        // presence setting (an opt-OUT too) silently do nothing until reconnect.
+        this._applyTrackingPresenceGate().catch((err) => {
+          SyncLog.warn('SyncWrapperService: Failed to apply presence setting', err);
+        });
+      }
+
+      return didChange ? SyncStatus.UpdateRemote : SyncStatus.InSync;
+    } catch (error) {
+      // DecryptNoPasswordError is expected control flow, not a failure: it signals the
+      // app to prompt for the encryption password (handled below). The download/upload
+      // service already logged it at the right severity — quiet for a fresh-client
+      // onboarding prompt, loud for the dropped-credential signature. Re-logging it here
+      // at error level would re-raise the very noise that scoping was meant to remove.
+      if (!(error instanceof DecryptNoPasswordError)) {
+        SyncLog.err(error);
+      }
+
+      // Reset consecutive SuperSync auth failure counter for non-auth errors.
+      // Only AuthFailSPError for SuperSync should accumulate the counter.
+      if (
+        !(error instanceof AuthFailSPError) ||
+        providerId !== SyncProviderId.SuperSync
+      ) {
+        this._consecutiveSuperSyncAuthFailures = 0;
+      }
+
+      if (error instanceof PotentialCorsError) {
+        this._snackService.open({
+          msg: T.F.SYNC.S.ERROR_CORS,
+          type: 'ERROR',
+          // a bit longer since it is a long message
+          config: { duration: 12000 },
+        });
+        return 'HANDLED_ERROR';
+      } else if (error instanceof IncompleteRemoteOperationsError) {
+        this._providerManager.setSyncStatus('ERROR');
+        if (!this._snackService.hasPendingPersistentAction()) {
+          this._snackService.open({
+            msg: T.F.SYNC.S.INCOMPLETE_REMOTE_OPERATIONS,
+            type: 'ERROR',
+            config: { duration: 0 },
+          });
+        }
+        return 'HANDLED_ERROR';
+      } else if (
+        error instanceof AuthFailSPError ||
+        error instanceof MissingRefreshTokenAPIError ||
+        error instanceof MissingCredentialsSPError
+      ) {
+        this._providerManager.setSyncStatus('ERROR');
+        this._superSyncStatusService.clearScope();
+        // Clear stale auth credentials so isReady() returns false and re-auth dialog opens.
+        // SuperSync AuthFailSPError gets special handling: tolerate up to 2 transient 401s
+        // (e.g. infrastructure errors returning 401 instead of 500), but on the 3rd
+        // consecutive failure, clear the token to break the stale-credential loop.
+        // Dropbox clears its refreshable OAuth token immediately so its re-auth flow
+        // works. WebDAV/Nextcloud intentionally do NOT clear: the credential is a
+        // user-typed (often irrecoverable) password, not a refreshable token — they
+        // expose no clearAuthCredentials hook, so clearAuthCredentials() below is a
+        // no-op for them and the actionable snackbar handles recovery without
+        // destroying the user's config. See issue #7616 — do NOT re-add a WebDAV
+        // clearAuthCredentials override.
+        let skipClear = false;
+        if (error instanceof AuthFailSPError && providerId === SyncProviderId.SuperSync) {
+          this._consecutiveSuperSyncAuthFailures++;
+          // The 401 may be another browser tab having rotated the token on
+          // the shared store ("sign out other devices"): this tab's cached
+          // cfg keeps serving the revoked token. Drop the cache so the next
+          // attempt reads the current token from disk — a genuine rotation
+          // then succeeds and resets the counter instead of striking out
+          // and wiping the fresh token via clearAuthCredentials below.
+          try {
+            await this._providerManager.invalidateCredentialCache(providerId);
+          } catch (invalidateError) {
+            SyncLog.err('Failed to invalidate credential cache:', invalidateError);
+          }
+          if (this._consecutiveSuperSyncAuthFailures < 3) {
+            skipClear = true;
+          } else {
+            this._consecutiveSuperSyncAuthFailures = 0;
+          }
+        }
+        if (providerId && !skipClear) {
+          try {
+            await this._providerManager.clearAuthCredentials(providerId);
+          } catch (clearError) {
+            SyncLog.err('Failed to clear stale auth credentials:', clearError);
+          }
+        }
+
+        // Show different messages for server rejection vs missing credentials
+        if (error instanceof AuthFailSPError) {
+          this._snackService.open({
+            msg: T.F.SYNC.S.AUTH_TOKEN_REJECTED,
+            translateParams: { reason: error.message },
+            type: 'ERROR',
+            actionFn: () => this._openSyncCfgDialog(),
+            actionStr: T.F.SYNC.S.BTN_CONFIGURE,
+          });
+        } else {
+          this._snackService.open({
+            msg: T.F.SYNC.S.INCOMPLETE_CFG,
+            type: 'ERROR',
+            actionFn: () => this._openSyncCfgDialog(),
+            actionStr: T.F.SYNC.S.BTN_CONFIGURE,
+          });
+        }
+        return 'HANDLED_ERROR';
+      } else if (error instanceof EmptyRemoteBodySPError) {
+        // Remote file returned an empty body (e.g. Koofr WebDAV corrupted file).
+        // Force overwrite is safe: local data is intact, remote is empty.
+        this._providerManager.setSyncStatus('ERROR');
+        this._snackService.open({
+          msg: T.F.SYNC.S.ERROR_REMOTE_FILE_EMPTY,
+          type: 'ERROR',
+          config: { duration: 12000 },
+          actionFn: async () => this.forceUpload('EmptyRemoteBodySPError'),
+          actionStr: T.F.SYNC.S.BTN_FORCE_OVERWRITE,
+        });
+        return 'HANDLED_ERROR';
+      } else if (
+        // InvalidFilePrefixError: the remote file's head is not `pf_[C][E]<v>__`,
+        // so it is rejected before the decrypt/decompress/JSON stages — but the
+        // user's situation is identical to JsonParseError's: remote unreadable,
+        // local intact. Without it, that error fell through to the generic
+        // handler and surfaced the raw internal message (verbatim the title of
+        // #9627) with no way forward.
+        //
+        // #9682 initially excluded this branch, arguing that if a server-side
+        // transformation strips the header, force upload just recreates the
+        // broken state. Reversed because the #9627 reporter was in fact
+        // unblocked by force upload. That PR — which would have extended .bak
+        // auto-recovery here — is parked, not declined: a head-strip is not a
+        // shape a torn write produces, so .bak recovery is a poor fit, but it
+        // has explicit merge criteria. Revisit this branch alongside it.
+        error instanceof JsonParseError ||
+        error instanceof InvalidFilePrefixError
+      ) {
+        // A markup head is a bad RESPONSE (WebDAV multistatus, proxy or
+        // captive-portal page), not a bad stored file: the remote file is
+        // likely intact, so offering force-overwrite would invite clobbering
+        // healthy remote data over a transient network/login problem. Surface
+        // the real cause without the overwrite action instead.
+        if (error instanceof InvalidFilePrefixError && error.headShape === 'markup') {
+          this._providerManager.setSyncStatus('ERROR');
+          this._snackService.open({
+            msg: T.F.SYNC.S.ERROR_REMOTE_RESPONSE_NOT_SYNC_DATA,
+            type: 'ERROR',
+            config: { duration: 12000 },
+          });
+          return 'HANDLED_ERROR';
+        }
+        // Remote JSON is unparseable (e.g. truncated write, encoding issue).
+        // Force overwrite is safe: local data is intact, remote cannot be parsed.
+        // Issues: #5574, #4616, #9627.
+        const forceUploadSource: ForceUploadTriggerSource =
+          error instanceof InvalidFilePrefixError
+            ? 'InvalidFilePrefixError'
+            : 'JsonParseError';
+        this._providerManager.setSyncStatus('ERROR');
+        this._snackService.open({
+          msg: T.F.SYNC.S.ERROR_REMOTE_FILE_CORRUPTED,
+          type: 'ERROR',
+          config: { duration: 12000 },
+          actionFn: async () => this.forceUpload(forceUploadSource),
+          actionStr: T.F.SYNC.S.BTN_FORCE_OVERWRITE,
+        });
+        return 'HANDLED_ERROR';
+      } else if (isSyncIncompatibleVersionError(error)) {
+        this._incompatibleVersionNotice.show(error);
+        return 'HANDLED_ERROR';
+      } else if (error instanceof LegacySyncFormatDetectedError) {
+        // Remote has v16.x pfapi files (__meta_) but no sync-data.json. Usual cause:
+        // an old device still writing the legacy format, which would silently diverge
+        // from this client. Force-overwrite is offered as an escape hatch for the
+        // stale-__meta_ case (successful migration but old files never cleaned up);
+        // it drops any remaining v16 data in favor of the current local state.
+        // Issues: #5964, #6174.
+        this._providerManager.setSyncStatus('ERROR');
+        this._snackService.open({
+          msg: T.F.SYNC.S.LEGACY_FORMAT_DETECTED,
+          type: 'ERROR',
+          config: { duration: 20000 },
+          actionFn: async () => this.forceUpload('LegacySyncFormatDetectedError'),
+          actionStr: T.F.SYNC.S.BTN_FORCE_OVERWRITE,
+        });
+        return 'HANDLED_ERROR';
+      } else if (error instanceof HttpNotOkAPIError && error.response.status === 423) {
+        // HTTP 423 Locked: WebDAV server holds a file lock.
+        // Do NOT offer force overwrite — the PUT will also receive 423.
+        // The lock typically resolves on the next sync attempt.
+        this._providerManager.setSyncStatus('ERROR');
+        this._snackService.open({
+          msg: T.F.SYNC.S.ERROR_REMOTE_FILE_LOCKED,
+          type: 'ERROR',
+        });
+        return 'HANDLED_ERROR';
+      } else if (
+        error instanceof DecryptNoPasswordError ||
+        // Upload-side twin (GHSA-9544-hjjr-fg8h): encryption is enabled but the
+        // key is gone (dropped credentials) — same recovery as the download
+        // case: prompt for the password instead of syncing plaintext.
+        error instanceof EncryptNoPasswordError
+      ) {
+        this._handleMissingPasswordDialog();
+        return 'HANDLED_ERROR';
+      } else if (error instanceof DecryptError) {
+        this._handleDecryptionError();
+        return 'HANDLED_ERROR';
+      } else if (error instanceof CanNotMigrateMajorDownError) {
+        // Log warning instead of alert - user can't do anything about version mismatch during import
+        SyncLog.warn(
+          'Remote model version newer than local - app update may be required',
+        );
+        return 'HANDLED_ERROR';
+      } else if (error instanceof SyncAlreadyInProgressError) {
+        // Silently ignore concurrent sync attempts (using proper error class)
+        SyncLog.log('Sync already in progress, skipping concurrent sync attempt');
+        return 'HANDLED_ERROR';
+      } else if (error instanceof LockAcquisitionTimeoutError) {
+        SyncLog.err(
+          `Lock acquisition timed out for "${error.lockName}" after ${error.timeoutMs}ms`,
+        );
+        // Self-healing like the network/timeout branches below: the lock is held
+        // by another in-flight op-log operation (compaction, a prior cycle, a
+        // queued write) and the next sync cycle retries once it frees. Since
+        // #8306 a lock timeout no longer wedges the write queue, so for automatic
+        // syncs (resume/focus/interval) the snack would just flash and vanish on
+        // its own — only surface it when the user explicitly asked to sync.
+        if (isUserTriggered) {
+          this._snackService.open({
+            msg: T.F.SYNC.S.LOCK_TIMEOUT_ERROR,
+            type: 'ERROR',
+          });
+        }
+        return 'HANDLED_ERROR';
+      } else if (
+        error instanceof LocalDataConflictError ||
+        error instanceof UnsupportedMultiEntityConflictError
+      ) {
+        if (error instanceof UnsupportedMultiEntityConflictError) {
+          this._providerManager.setSyncStatus('ERROR');
+          // Ordering matters, exactly like the OperationIntegrityError branch
+          // below: this precise instanceof MUST stay ABOVE the string-heuristic
+          // branches. The diagnostic embeds `entityCount=N`, and a bulk op
+          // covering 504 entities would otherwise match _isTimeoutError's
+          // \b504\b and be swallowed as a gateway timeout — silently, since
+          // that branch stays quiet on automatic syncs.
+          if (!isUserTriggered) {
+            // A background cycle must not steal focus with a modal, so offer
+            // the route to it instead. Deliberately NOT a sticky snack: it
+            // would block later feedback once recovery runs from the toolbar.
+            if (!this._snackService.hasPendingPersistentAction()) {
+              this._snackService.open({
+                msg: T.F.SYNC.S.UNSUPPORTED_MULTI_ENTITY_CONFLICT,
+                type: 'ERROR',
+                actionStr: T.F.SYNC.S.BTN_RESOLVE_CONFLICT,
+                actionFn: () => this.sync(true),
+                translateParams: {
+                  details: escapeHtml(getSyncErrorStr(error)),
+                },
+              });
+            }
+            return 'HANDLED_ERROR';
+          }
+        }
+        return this._handleDataConflict(error);
+      } else if (error instanceof WebCryptoNotAvailableError) {
+        // WebCrypto (crypto.subtle) is unavailable in insecure contexts
+        // (e.g., Android Capacitor serves from http://localhost)
+        this._providerManager.setSyncStatus('ERROR');
+        this._snackService.open({
+          msg: T.F.SYNC.S.WEB_CRYPTO_NOT_AVAILABLE,
+          type: 'ERROR',
+          config: { duration: 15000 },
+        });
+        return 'HANDLED_ERROR';
+      } else if (error instanceof OperationIntegrityError) {
+        // A decrypted op's unauthenticated metadata contradicted its authenticated
+        // payload, or a plaintext op arrived while encryption is mandatory
+        // (GHSA-8pxh-mgc7-gp3g). Fail closed with a calm, translated message so the
+        // generic handler below cannot surface the raw technical/GHSA string to the
+        // user. The technical details are already in the log.
+        //
+        // Ordering matters: this precise instanceof check MUST stay ABOVE the
+        // string-heuristic branches below (isTransientNetworkError / _isTimeoutError
+        // / _isPermissionError). The error message embeds the offending op's uuidv7
+        // id, and an id that happens to contain "504" would otherwise be
+        // misclassified as a gateway timeout by _isTimeoutError — showing the wrong
+        // "try again" message and skipping the ERROR status.
+        //
+        // Like the sibling PlaintextWhenEncryptionExpectedError branch, this is a
+        // persistent condition (until the user acts or tampering stops), so only
+        // surface the snack on an explicit sync to avoid spamming every auto-sync
+        // cycle; the ERROR status keeps the sync indicator honest meanwhile.
+        SyncLog.err('SyncWrapperService: operation integrity check failed', {
+          name: error.name,
+        });
+        this._providerManager.setSyncStatus('ERROR');
+        if (isUserTriggered) {
+          this._snackService.open({
+            msg: T.F.SYNC.S.INTEGRITY_TAMPER_DETECTED,
+            type: 'ERROR',
+            config: { duration: 15000 },
+          });
+        }
+        return 'HANDLED_ERROR';
+      } else if (
+        error instanceof NetworkUnavailableSPError ||
+        isTransientNetworkError(error)
+      ) {
+        // Transient + self-healing (the next sync cycle retries). SuperSync
+        // maps connectivity failures to NetworkUnavailableSPError; file-based
+        // providers (Dropbox/WebDAV) surface them as generic errors instead, so
+        // isTransientNetworkError() catches those too (e.g. UnknownHostException,
+        // "could not connect to the server") — provider-agnostic.
+        //
+        // Only surface a snack when the user explicitly asked to sync; for
+        // automatic syncs (notably the auto-sync fired on Android resume, before
+        // sockets/DNS recover from Doze) stay silent to avoid a snack that
+        // flashes and vanishes on its own.
+        this._providerManager.setSyncStatus('UNKNOWN_OR_CHANGED');
+        if (isUserTriggered) {
+          this._snackService.open({
+            msg: T.F.SYNC.S.NETWORK_ERROR,
+            type: 'WARNING',
+          });
+        }
+        return 'HANDLED_ERROR';
+      } else if (this._isTimeoutError(error)) {
+        // Like transient network failures, a sync timeout is self-healing (the
+        // next cycle retries) and its "Please try again" message only makes
+        // sense for someone actively waiting. Structured native transport
+        // timeouts are handled by the network branch above so status is marked
+        // UNKNOWN_OR_CHANGED consistently.
+        if (isUserTriggered) {
+          this._snackService.open({
+            msg: T.F.SYNC.S.TIMEOUT_ERROR,
+            type: 'ERROR',
+            config: { duration: 12000 },
+            translateParams: {
+              suggestion:
+                'Large sync operations may take up to 90 seconds. Please try again.',
+            },
+          });
+        }
+        return 'HANDLED_ERROR';
+      } else if (this._isPermissionError(error)) {
+        this._snackService.open({
+          msg: this._getPermissionErrorMessage(),
+          type: 'ERROR',
+          config: { duration: 12000 },
+        });
+        return 'HANDLED_ERROR';
+      } else if (error instanceof UploadRevToMatchMismatchAPIError) {
+        // Usually a concurrent upload the next cycle heals; streaks surface (#10808).
+        SyncLog.log(
+          'SyncWrapperService: Concurrent upload detected, will retry on next sync cycle',
+        );
+        this._uploadRejectionNotice.onUploadRejected();
+        return 'HANDLED_ERROR';
+      } else if (error instanceof FileSyncTargetChangedError) {
+        // The file sync target (provider/account/folder) changed while this
+        // upload was in flight; the guarded write was abandoned before it could
+        // land the previous target's data on the new one — self-healing. Do not
+        // show an error snackbar; UNKNOWN_OR_CHANGED triggers the next sync,
+        // which re-reads and re-uploads against the current target from zero.
+        SyncLog.log(
+          'SyncWrapperService: Sync target changed mid-operation, will re-sync against the current target',
+        );
+        this._providerManager.setSyncStatus('UNKNOWN_OR_CHANGED');
+        return 'HANDLED_ERROR';
+      } else if (error instanceof SyncEpochChangedError) {
+        // #9074: a destructive config change (provider/target switch,
+        // encryption op) landed mid-cycle; the fenced write was abandoned
+        // before it could hit the new epoch — self-healing like the target
+        // case above. No snackbar; the next sync runs against current config.
+        SyncLog.log(
+          'SyncWrapperService: Sync epoch changed mid-cycle, abandoning stale cycle',
+        );
+        this._providerManager.setSyncStatus('UNKNOWN_OR_CHANGED');
+        return 'HANDLED_ERROR';
+      } else if (error instanceof PlaintextWhenEncryptionExpectedError) {
+        // GHSA-vrc7-775g-ggqc: the remote is plaintext but encryption is enabled
+        // on this device, so we refused it (fail closed). This persists until the
+        // user acts (or an attacker stops tampering), so — like the transient
+        // branches above — only surface the snack on an explicit sync to avoid
+        // spamming every auto-sync cycle; the ERROR status keeps the sync
+        // indicator honest meanwhile. The message points to the only safe remedy
+        // (deliberately disabling encryption in Sync settings), never an
+        // auto-adopt action.
+        this._providerManager.setSyncStatus('ERROR');
+        if (isUserTriggered) {
+          this._snackService.open({
+            msg: T.F.SYNC.S.REMOTE_NOT_ENCRYPTED,
+            type: 'ERROR',
+            config: { duration: 15000 },
+          });
+        }
+        return 'HANDLED_ERROR';
+      } else if (error instanceof ForceUploadPendingOpsError) {
+        this._providerManager.setSyncStatus('UNKNOWN_OR_CHANGED');
+        return 'HANDLED_ERROR';
+      } else if (error instanceof ForceUploadFailedError) {
+        this._providerManager.setSyncStatus('ERROR');
+        this._snackService.open({
+          msg: T.F.SYNC.S.FORCE_UPLOAD_FAILED,
+          type: 'ERROR',
+        });
+        return 'HANDLED_ERROR';
+      } else {
+        this._providerManager.setSyncStatus('ERROR');
+        const errStr = getSyncErrorStr(error);
+        // A lower-level recovery path may already have shown a sticky action
+        // (for example Undo after an interrupted remote-state rebuild). Snack
+        // rendering is debounced, so opening the generic error here would win
+        // the race and silently remove the only recovery action.
+        if (!this._snackService.hasPendingPersistentAction()) {
+          this._snackService.open({
+            // msg: T.F.SYNC.S.UNKNOWN_ERROR,
+            msg: errStr,
+            type: 'ERROR',
+            translateParams: {
+              err: errStr,
+            },
+          });
+        }
+        return 'HANDLED_ERROR';
+      }
+    }
+  }
+
+  private _handlePermanentUploadRejections(
+    uploadResults: readonly CompletedUploadOutcome[],
+  ): boolean {
+    const rejectedResult = uploadResults.find((r) => r.permanentRejectionCount > 0);
+    if (!rejectedResult) {
+      return false;
+    }
+
+    const hasPayloadError = rejectedResult.rejectedOps.some(
+      (r) =>
+        r.errorCode === 'PAYLOAD_TOO_LARGE' ||
+        r.error?.includes('Payload too complex') ||
+        r.error?.includes('Payload too large'),
+    );
+
+    if (hasPayloadError) {
+      SyncLog.err(
+        'SyncWrapperService: Upload rejected - payload too large/complex',
+        rejectedResult.rejectedOps,
+      );
+      this._providerManager.setSyncStatus('ERROR');
+      alertDialog(this._translateService.instant(T.F.SYNC.S.ERROR_PAYLOAD_TOO_LARGE));
+      return true;
+    }
+
+    SyncLog.err(
+      `SyncWrapperService: Upload had ${rejectedResult.permanentRejectionCount} permanent rejection(s), not marking as IN_SYNC`,
+      rejectedResult.rejectedOps,
+    );
+    this._providerManager.setSyncStatus('ERROR');
+    return true;
+  }
+
+  async forceUpload(triggerSource: ForceUploadTriggerSource = 'unknown'): Promise<void> {
+    if (!this._c(this._translateService.instant(T.F.SYNC.C.FORCE_UPLOAD))) {
+      return;
+    }
+
+    // Diagnostic: stamp the originating error/dialog so we can correlate
+    // "what stuck the user" with "what they recovered with" in shared logs.
+    SyncLog.log('SyncWrapperService: forceUpload called - uploading local state', {
+      // eslint-disable-next-line local-rules/no-user-content-in-logs -- grandfathered log baseline (2026-09), not yet triaged
+      triggerSource,
+    });
+
+    // Block parallel syncs during force upload to prevent them from trying to
+    // download/decrypt old data with a potentially different encryption key.
+    // This is critical when forceUpload is triggered after password change.
+    await this.runWithSyncBlocked(async () => {
+      // #8309: claim the sync cycle so this flow's setLastServerSeq bookkeeping
+      // and session-validation latch are isolated from the immediate-upload /
+      // WS-download side channels. runWithSyncBlocked
+      // has already drained any main sync and set isEncryptionOperationInProgress
+      // (which the side channels honour), so the only thing that could hold the
+      // guard here is a short-lived side channel; skip-and-let-the-user-retry
+      // rather than block.
+      if (!this._syncCycleGuard.tryBegin()) {
+        SyncLog.log('Force upload skipped: another sync cycle is in progress');
+        return;
+      }
+      try {
+        // #9074: captured POST-bump (runWithSyncBlocked bumped on entry), so
+        // this flow's own writes pass the fence; only a FURTHER config change
+        // (e.g. provider switch mid-force-upload) aborts it. The delegate
+        // fences the coordinator's provider I/O; its local writes are not
+        // threaded — shortcut: flag+guard exclusion covers them, epoch
+        // threading through SyncImportConflictCoordinator is the upgrade path.
+        const fenceEpoch = this._providerManager.syncEpoch;
+        const rawProvider = this._providerManager.getActiveProvider();
+        const syncCapableProvider = await this._wrappedProvider.getOperationSyncCapable(
+          rawProvider,
+          { fenceEpoch },
+        );
+
+        if (!syncCapableProvider) {
+          SyncLog.warn(
+            'SyncWrapperService: Cannot force upload - provider not available',
+          );
+          return;
+        }
+
+        const forceUploadResult =
+          await this._opLogSyncService.forceUploadLocalState(syncCapableProvider);
+        this._providerManager.setSyncStatus(
+          forceUploadResult.hasUnresolvedOps ? 'UNKNOWN_OR_CHANGED' : 'IN_SYNC',
+        );
+        SyncLog.log('SyncWrapperService: Force upload complete');
+      } catch (error) {
+        if (error instanceof FileSyncTargetChangedError) {
+          // The file target switched during the force upload; the guarded write
+          // was abandoned before it could hit the new target. Self-healing like
+          // the main sync path — report UNKNOWN_OR_CHANGED (no error snack) so
+          // the next sync re-reads/re-uploads against the current target.
+          SyncLog.log(
+            'SyncWrapperService: target changed mid-force-upload, will re-sync against the current target',
+          );
+          this._providerManager.setSyncStatus('UNKNOWN_OR_CHANGED');
+        } else if (error instanceof SyncEpochChangedError) {
+          // #9074: a further destructive config change landed mid-force-upload;
+          // treated exactly like the target change above.
+          SyncLog.log(
+            'SyncWrapperService: sync epoch changed mid-force-upload, abandoning',
+          );
+          this._providerManager.setSyncStatus('UNKNOWN_OR_CHANGED');
+        } else if (error instanceof EncryptNoPasswordError) {
+          // GHSA-9544-hjjr-fg8h: a keyless-but-encryption-enabled provider makes
+          // force upload refuse to send plaintext. Route to the enter-password
+          // recovery dialog like the main sync path, not a dead-end error snack —
+          // otherwise "force overwrite" (offered as the lost-key recovery) loops.
+          this._handleMissingPasswordDialog();
+        } else {
+          SyncLog.err('SyncWrapperService: Force upload failed:', error);
+          this._providerManager.setSyncStatus('ERROR');
+          this._snackService.open({
+            msg: T.F.SYNC.S.FORCE_UPLOAD_FAILED,
+            type: 'ERROR',
+          });
+        }
+      } finally {
+        this._syncCycleGuard.end();
+      }
+    });
+  }
+
+  async configuredAuthForSyncProviderIfNecessary(
+    providerId: SyncProviderId,
+    force = false,
+  ): Promise<{ wasConfigured: boolean }> {
+    const provider = await this._providerManager.getProviderById(providerId);
+
+    if (!provider) {
+      return { wasConfigured: false };
+    }
+
+    if (!provider.getAuthHelper) {
+      return { wasConfigured: false };
+    }
+
+    if (!force && (await provider.isReady())) {
+      SyncLog.warn('Provider already configured');
+      return { wasConfigured: false };
+    }
+
+    try {
+      const { authUrl, codeVerifier, verifyCodeChallenge } =
+        await provider.getAuthHelper();
+      if (authUrl && codeVerifier && verifyCodeChallenge) {
+        const authCode = await this._matDialog
+          .open(DialogGetAndEnterAuthCodeComponent, {
+            restoreFocus: true,
+            data: {
+              providerName: provider.id,
+              url: authUrl,
+            },
+          })
+          .afterClosed()
+          .toPromise();
+        if (authCode) {
+          const r = await verifyCodeChallenge(authCode);
+          // Preserve existing config (especially encryptKey) when updating auth
+          const existingConfig = await provider.privateCfg.load();
+          await this._providerManager.setProviderConfig(provider.id, {
+            ...existingConfig,
+            ...r,
+          });
+          // NOTE: exec sync afterward; promise not awaited
+          setTimeout(() => {
+            this.sync();
+          }, 1000);
+          return { wasConfigured: true };
+        } else {
+          return { wasConfigured: false };
+        }
+      }
+    } catch (error) {
+      SyncLog.err(`Failed to configure auth for provider ${providerId}:`, error);
+      const httpErr = error instanceof HttpNotOkAPIError ? error : null;
+      const httpStatus = httpErr?.response.status;
+      const isTokenExchangeError = httpStatus === 400;
+      const isAuthServiceUnavailable =
+        httpStatus !== undefined && httpStatus >= 500 && httpStatus < 600;
+      // Dropbox recommends retaining this response ID for support investigations.
+      // https://developers.dropbox.com/error-handling-guide#logging
+      const providerRequestId =
+        providerId === SyncProviderId.Dropbox
+          ? httpErr?.response.headers.get('X-Dropbox-Request-Id')
+          : null;
+      // A OneDrive token-exchange 400 is almost always a misconfigured
+      // Microsoft Entra app registration (typically "Allow public client
+      // flows" disabled), not a mistyped/expired code — the authorize step
+      // already succeeded. Point the user at the registration fix and surface
+      // the Azure error detail (AADSTSxxxxx, carried on the UI-only `.detail`)
+      // so it is self-diagnosable.
+      let msg: string;
+      let translateParams: { [key: string]: string } | undefined;
+      if (isTokenExchangeError && providerId === SyncProviderId.OneDrive) {
+        msg = T.F.SYNC.S.ONEDRIVE_AUTH_FAILED;
+        translateParams = { error: httpErr?.detail || getErrorTxt(error) };
+      } else if (isTokenExchangeError) {
+        msg = T.F.SYNC.S.INVALID_AUTH_CODE;
+      } else if (isAuthServiceUnavailable) {
+        translateParams = { status: String(httpStatus) };
+        if (providerRequestId) {
+          msg = T.F.SYNC.S.AUTH_SERVICE_UNAVAILABLE_WITH_REFERENCE;
+          translateParams.reference = escapeHtml(providerRequestId);
+        } else {
+          msg = T.F.SYNC.S.AUTH_SERVICE_UNAVAILABLE;
+        }
+      } else {
+        msg = T.F.SYNC.S.AUTH_SETUP_FAILED;
+      }
+      this._snackService.open({
+        msg,
+        translateParams,
+        type: 'ERROR',
+        config: { duration: 0 },
+      });
+      return { wasConfigured: false };
+    }
+    return { wasConfigured: false };
+  }
+
+  private async _openSyncCfgDialog(): Promise<void> {
+    const { DialogSyncCfgComponent } =
+      await import('./dialog-sync-cfg/dialog-sync-cfg.component');
+    this._matDialog.open(DialogSyncCfgComponent);
+  }
+
+  /**
+   * Handles missing encryption password when receiving encrypted data.
+   * Opens a simple dialog to prompt for the password, then re-syncs.
+   */
+  private _handleMissingPasswordDialog(): void {
+    // Suppress dialog if user previously cancelled (so they can navigate to settings)
+    if (this._suppressEncryptionDialogs) {
+      this._providerManager.setSyncStatus('ERROR');
+      return;
+    }
+
+    // Prevent multiple password dialogs from opening simultaneously
+    if (this._passwordDialog) {
+      return;
+    }
+
+    // Set ERROR status so sync button shows error icon
+    this._providerManager.setSyncStatus('ERROR');
+
+    // Open dialog for password entry
+    this._passwordDialog = this._matDialog.open(DialogEnterEncryptionPasswordComponent, {
+      width: '450px',
+      disableClose: true,
+    });
+
+    firstValueFrom(this._passwordDialog.afterClosed())
+      .then((result) => {
+        this._passwordDialog = undefined;
+
+        if (result?.password) {
+          // Password was entered and saved — clear suppression and re-sync
+          this._suppressEncryptionDialogs = false;
+          this.sync();
+        } else if (result?.forceOverwrite) {
+          // Force overwrite succeeded; reflect synced status
+          this._suppressEncryptionDialogs = false;
+          this._providerManager.setSyncStatus('IN_SYNC');
+        } else {
+          // User cancelled — suppress future dialogs so they can navigate to settings
+          this._suppressEncryptionDialogs = true;
+          this._providerManager.setSyncStatus('UNKNOWN_OR_CHANGED');
+        }
+      })
+      .catch((err) => {
+        this._passwordDialog = undefined;
+        SyncLog.err('Error handling missing password dialog result:', err);
+      });
+  }
+
+  private _handleDecryptionError(): void {
+    // Suppress dialog if user previously cancelled (so they can navigate to settings)
+    if (this._suppressEncryptionDialogs) {
+      this._providerManager.setSyncStatus('ERROR');
+      return;
+    }
+
+    // Prevent multiple password dialogs from opening simultaneously
+    if (this._passwordDialog) {
+      return;
+    }
+
+    // Set ERROR status so sync button shows error icon
+    this._providerManager.setSyncStatus('ERROR');
+
+    // Show snackbar (consistent with other error handlers)
+    this._snackService.open({
+      msg: T.F.SYNC.S.DECRYPTION_FAILED,
+      type: 'ERROR',
+      config: { duration: 10000 }, // Longer duration for critical errors
+    });
+
+    // Open dialog for password correction
+    this._passwordDialog = this._matDialog.open(DialogHandleDecryptErrorComponent, {
+      disableClose: true,
+    });
+
+    firstValueFrom(this._passwordDialog.afterClosed())
+      .then((result) => {
+        this._passwordDialog = undefined;
+
+        if (result?.isReSync) {
+          this._suppressEncryptionDialogs = false;
+          this.sync();
+        } else {
+          // User cancelled — suppress future dialogs so they can navigate to settings
+          this._suppressEncryptionDialogs = true;
+          this._providerManager.setSyncStatus('UNKNOWN_OR_CHANGED');
+        }
+      })
+      .catch((err) => {
+        this._passwordDialog = undefined;
+        SyncLog.err('Error handling decrypt error dialog result:', err);
+      });
+  }
+
+  /**
+   * Offers whole-dataset replacement when automatic merging cannot proceed.
+   * Unknown remote metadata keeps the dialog's overwrite confirmation mandatory.
+   */
+  private async _handleDataConflict(
+    error: LocalDataConflictError | UnsupportedMultiEntityConflictError,
+  ): Promise<SyncStatus | 'HANDLED_ERROR'> {
+    // Signal that we're waiting for user input (prevents sync timeout)
+    const stopWaiting = this._userInputWaitState.startWaiting('data-conflict');
+
+    try {
+      const snapshotConflict =
+        error instanceof LocalDataConflictError ? error : undefined;
+      const unsyncedCount =
+        snapshotConflict?.unsyncedCount ?? (await this._opLogStore.getUnsynced()).length;
+      // #9391: LocalDataConflictError w/ 0 pending ops = fresh client w/ store data.
+      const countUnknown = !!snapshotConflict && !unsyncedCount;
+      const vcEntry = await this._opLogStore.getVectorClockEntry();
+      const localClock = vcEntry?.clock;
+      const localLastUpdate = vcEntry?.lastUpdate || Date.now();
+
+      const conflictData: ConflictData = {
+        reason: snapshotConflict
+          ? ConflictReason.NoLastSync
+          : ConflictReason.BothNewerLastSync,
+        remote: {
+          lastUpdate: snapshotConflict?.remoteLastModified ?? null,
+          // A user whose first encounter is a manual sync never sees the snack,
+          // so surface the reportable diagnostic in the dialog's Additional Info
+          // row instead. Safe to show: the message carries only an allowlisted
+          // action type and integer counts, never user content (rule 9).
+          lastUpdateAction: snapshotConflict ? 'Remote data' : error.message,
+          revMap: {},
+          crossModelVersion: 1,
+          mainModelData: snapshotConflict?.remoteSnapshotState ?? {},
+          isFullData: !!snapshotConflict?.remoteSnapshotState,
+          vectorClock: snapshotConflict?.remoteVectorClock,
+        },
+        local: {
+          lastUpdate: localLastUpdate,
+          lastUpdateAction: countUnknown ? '?' : `${unsyncedCount} local changes pending`,
+          revMap: {},
+          crossModelVersion: 1,
+          // Op-log errors lack a last-synced timestamp; the dialog shows Never.
+          lastSyncedUpdate: null,
+          metaRev: null,
+          vectorClock: localClock,
+          lastSyncedVectorClock: snapshotConflict?.lastSyncedVectorClock ?? null,
+        },
+        localUnsyncedOpsCount: countUnknown ? undefined : unsyncedCount,
+      };
+
+      SyncLog.log('SyncWrapperService: Opening data conflict dialog', {
+        errorType: error.name,
+        unsyncedCount,
+      });
+      const resolution = await firstValueFrom(this._openConflictDialog$(conflictData));
+
+      const rawProvider = this._providerManager.getActiveProvider();
+      const syncCapableProvider =
+        await this._wrappedProvider.getOperationSyncCapable(rawProvider);
+
+      if (!syncCapableProvider) {
+        SyncLog.err(
+          'SyncWrapperService: Cannot resolve conflict - provider not available',
+        );
+        return 'HANDLED_ERROR';
+      }
+
+      if (resolution === 'USE_LOCAL') {
+        SyncLog.log(
+          'SyncWrapperService: User chose USE_LOCAL - uploading local state to overwrite remote',
+        );
+        const forceUploadResult =
+          await this._opLogSyncService.forceUploadLocalState(syncCapableProvider);
+        if (forceUploadResult.hasUnresolvedOps) {
+          this._providerManager.setSyncStatus('UNKNOWN_OR_CHANGED');
+          return 'HANDLED_ERROR';
+        }
+        this._providerManager.setSyncStatus('IN_SYNC');
+        return SyncStatus.InSync;
+      } else if (resolution === 'USE_REMOTE') {
+        // Read the validation latch after the forced download (#7330).
+        SyncLog.log(
+          'SyncWrapperService: User chose USE_REMOTE - downloading remote state, discarding local',
+        );
+        this._sessionValidation.reset();
+        await this._opLogSyncService.forceDownloadRemoteState(syncCapableProvider);
+        if (this._sessionValidation.hasFailed()) {
+          SyncLog.err(
+            'SyncWrapperService: USE_REMOTE applied but post-sync validation failed; reporting ERROR',
+          );
+          this._providerManager.setSyncStatus('ERROR');
+          return 'HANDLED_ERROR';
+        }
+        this._providerManager.setSyncStatus('IN_SYNC');
+        return SyncStatus.InSync;
+      } else {
+        this._snackService.open({
+          msg: T.F.SYNC.S.LOCAL_DATA_REPLACE_CANCELLED,
+        });
+        return 'HANDLED_ERROR';
+      }
+    } catch (resolutionError) {
+      if (resolutionError instanceof FileSyncTargetChangedError) {
+        // Target switched during USE_LOCAL force upload; the guarded write was
+        // abandoned. Self-heal silently (UNKNOWN_OR_CHANGED) like the main sync
+        // path instead of a dead-end error snack.
+        SyncLog.log(
+          'SyncWrapperService: target changed mid-conflict-resolution, will re-sync against the current target',
+        );
+        this._providerManager.setSyncStatus('UNKNOWN_OR_CHANGED');
+        return 'HANDLED_ERROR';
+      }
+      // GHSA-9544-hjjr-fg8h: USE_LOCAL force-uploads, which refuses to send
+      // plaintext when the key is missing. Route to the enter-password recovery
+      // dialog instead of a dead-end error snack (mirrors the main sync path).
+      if (resolutionError instanceof EncryptNoPasswordError) {
+        this._handleMissingPasswordDialog();
+        return 'HANDLED_ERROR';
+      }
+      // GHSA-vrc7-775g-ggqc: a USE_REMOTE re-download fails closed on a
+      // plaintext remote while encryption is expected. Mirror the main sync
+      // path's dedicated branch so the user gets the translated, actionable
+      // message instead of the raw error text (conflict resolution is always
+      // user-triggered, so no auto-sync gating here).
+      if (resolutionError instanceof PlaintextWhenEncryptionExpectedError) {
+        this._providerManager.setSyncStatus('ERROR');
+        this._snackService.open({
+          msg: T.F.SYNC.S.REMOTE_NOT_ENCRYPTED,
+          type: 'ERROR',
+          config: { duration: 15000 },
+        });
+        return 'HANDLED_ERROR';
+      }
+      SyncLog.err(
+        'SyncWrapperService: Error during conflict resolution:',
+        resolutionError,
+      );
+      this._providerManager.setSyncStatus('ERROR');
+      this._snackService.open({
+        msg:
+          resolutionError instanceof ForceUploadFailedError
+            ? T.F.SYNC.S.FORCE_UPLOAD_FAILED
+            : getSyncErrorStr(resolutionError),
+        type: 'ERROR',
+      });
+      return 'HANDLED_ERROR';
+    } finally {
+      stopWaiting();
+    }
+  }
+
+  private _c(str: string): boolean {
+    return confirmDialog(this._translateService.instant(str));
+  }
+
+  private _isPermissionError(error: unknown): boolean {
+    const errStr = String(error);
+    return /EROFS|EACCES|EPERM|read-only file system|permission denied/i.test(errStr);
+  }
+
+  private _isTimeoutError(error: unknown): boolean {
+    const errStr = String(error).toLowerCase();
+    // Bound '504' to word boundaries: an HTTP 504 status ("http 504 gateway
+    // timeout", "status 504") still matches, but a '504' buried inside a longer
+    // token — e.g. a uuidv7 op id like '01920504-…' in an OperationIntegrityError
+    // message — must NOT be read as a gateway timeout and misclassify an unrelated
+    // error. (The OperationIntegrityError branch is also ordered above this guard;
+    // this hardening removes the footgun for any other error type too.)
+    // No separate 'gateway timeout' check: includes('timeout') already covers it.
+    return errStr.includes('timeout') || /\b504\b/.test(errStr);
+  }
+
+  private _getPermissionErrorMessage(): string {
+    if (IS_ELECTRON && window.ea?.isFlatpak?.()) {
+      return T.F.SYNC.S.ERROR_PERMISSION_FLATPAK;
+    }
+    if (IS_ELECTRON && window.ea?.isSnap?.()) {
+      return T.F.SYNC.S.ERROR_PERMISSION_SNAP;
+    }
+    return T.F.SYNC.S.ERROR_PERMISSION;
+  }
+
+  private lastConflictDialog?: MatDialogRef<
+    DialogSyncConflictComponent,
+    DialogConflictResolutionResult
+  >;
+
+  /**
+   * Reference to any open password-related dialog (enter password or decrypt error).
+   * Used to prevent multiple simultaneous password dialogs from opening.
+   * Uses Record<string, unknown> because dialog components are dynamically imported.
+   */
+
+  private _passwordDialog?: MatDialogRef<any, Record<string, unknown>>;
+
+  /**
+   * Reference to the encryption-required dialog to prevent multiple opens.
+   * Uses Record<string, unknown> because dialog component is dynamically imported.
+   */
+
+  private _encryptionRequiredDialog?: MatDialogRef<any, Record<string, unknown>>;
+
+  /**
+   * Synchronous guard to prevent TOCTOU race in _promptSuperSyncEncryptionIfNeeded.
+   * The async import() between checking _encryptionRequiredDialog and opening the dialog
+   * creates a window where concurrent calls can both pass the guard.
+   */
+  private _isOpeningEncryptionDialog = false;
+
+  /**
+   * One-shot flag: the legacy post-sync setup modal only fires for the fresh-setup
+   * sync (the sync triggered right after the config dialog enables SuperSync).
+   * Established/returning unencrypted accounts are nudged by the calm, dismissible
+   * SuperSyncEncryptionMigrationBannerService instead, so the per-sync modal must
+   * NOT fire for them — otherwise both would prompt at startup. Set by the config
+   * dialog via markPromptEncryptionAfterSetupSync(); consumed on the first
+   * post-sync prompt evaluation for SuperSync (see _promptSuperSyncEncryptionIfNeeded).
+   */
+  private _shouldPromptEncryptionAfterSetupSync = false;
+
+  /**
+   * Called by the sync config dialog immediately after (re)enabling SuperSync from
+   * a disabled state, so the setup encryption modal fires once for that setup sync.
+   */
+  markPromptEncryptionAfterSetupSync(): void {
+    this._shouldPromptEncryptionAfterSetupSync = true;
+  }
+
+  /**
+   * After a successful sync, checks if SuperSync is active without encryption.
+   * If so, opens the encryption dialog. Data has already been synced, so no data loss.
+   */
+  private async _promptSuperSyncEncryptionIfNeeded(): Promise<void> {
+    SyncLog.log(
+      '_promptSuperSyncEncryptionIfNeeded called, _isOpeningEncryptionDialog=',
+      this._isOpeningEncryptionDialog,
+      ', _encryptionRequiredDialog=',
+      !!this._encryptionRequiredDialog,
+      ', openDialogs=',
+      this._matDialog.openDialogs.length,
+    );
+    const providerId = await firstValueFrom(this.syncProviderId$);
+    if (providerId !== SyncProviderId.SuperSync) {
+      return;
+    }
+
+    const provider = this._providerManager.getActiveProvider();
+    if (!provider) {
+      return;
+    }
+
+    // Established/returning unencrypted accounts are owned by the calm migration
+    // banner (SuperSyncEncryptionMigrationBannerService); only the fresh-setup sync
+    // that armed the flag fires this dead-end modal, so the two never both prompt.
+    // Consume the one-shot flag HERE (not at dialog-open) so it can't leak to a
+    // later, unrelated sync via one of the early-returns below. A failed setup sync
+    // returns HANDLED_ERROR and never reaches this method, so the arming survives
+    // and retries on the next successful sync. Tradeoff: if the modal-open is later
+    // blocked (another dialog open / TOCTOU guard below), the flag is already spent
+    // and this modal won't retry — acceptable because the migration banner catches
+    // the still-unencrypted account on the next app start (seq is now > 0).
+    // TODO(#8670): once the mandatory-encryption upload guard lands, retire this
+    // modal + flag entirely and let the banner own all cohorts.
+    if (!this._shouldPromptEncryptionAfterSetupSync) {
+      SyncLog.log(
+        'Skipping legacy setup encryption modal — migration banner owns established nudge',
+      );
+      return;
+    }
+    this._shouldPromptEncryptionAfterSetupSync = false;
+
+    const cfg = (await provider.privateCfg.load()) as
+      | { isEncryptionEnabled?: boolean; encryptKey?: string }
+      | undefined;
+    if (cfg?.isEncryptionEnabled && cfg?.encryptKey) {
+      SyncLog.log('SuperSync encryption already enabled, skipping');
+      return;
+    }
+
+    SyncLog.log(
+      'SuperSync encryption not enabled — prompting user, openDialogs=',
+      this._matDialog.openDialogs.length,
+      ', _isOpeningEncryptionDialog=',
+      this._isOpeningEncryptionDialog,
+      ', _encryptionRequiredDialog=',
+      !!this._encryptionRequiredDialog,
+    );
+
+    // If our own encryption prompt is already open or being opened, there is
+    // nothing to do — and we must not wait on it below.
+    if (this._encryptionRequiredDialog || this._isOpeningEncryptionDialog) {
+      SyncLog.log('Encryption prompt already open/opening — skipping');
+      return;
+    }
+
+    // A transiently-open dialog — typically the sync-config dialog still playing
+    // its close animation right after first-time setup — must only DEFER this
+    // prompt, never drop it. With the E2EE-mandatory upload guard (GHSA-9v8x) the
+    // initial sync finishes almost instantly (upload is skipped until a key
+    // exists), so it can now beat the config dialog's close animation; a one-shot
+    // skip here then leaves SuperSync enabled with no encryption configured and no
+    // prompt shown (#8670 regression). Wait (bounded) for open dialogs to clear,
+    // then re-check state before prompting. A competing dialog that is still open
+    // after the wait (e.g. an enter-password flow the user is interacting with) is
+    // left alone — the next sync re-runs this check.
+    if (this._matDialog.openDialogs.length > 0) {
+      SyncLog.log('Dialog open — deferring encryption prompt until it closes');
+      const waitStart = Date.now();
+      while (
+        this._matDialog.openDialogs.length > 0 &&
+        Date.now() - waitStart < ENCRYPTION_PROMPT_DIALOG_WAIT_MS
+      ) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, ENCRYPTION_PROMPT_DIALOG_POLL_MS),
+        );
+      }
+      if (this._matDialog.openDialogs.length > 0) {
+        SyncLog.log('Dialog still open after wait — skipping encryption prompt');
+        return;
+      }
+      // Provider/encryption state can change during the wait: the closing dialog
+      // may switch providers, disable SuperSync, or configure encryption itself
+      // (e.g. an enter-password flow). Re-validate the active provider and its
+      // config before prompting — otherwise we could open the disableClose setup
+      // dialog for a provider that is no longer active, trapping the user.
+      const providerIdAfterWait = await firstValueFrom(this.syncProviderId$);
+      if (providerIdAfterWait !== SyncProviderId.SuperSync) {
+        SyncLog.log('Provider changed while waiting — skipping encryption prompt');
+        return;
+      }
+      const providerAfterWait = this._providerManager.getActiveProvider();
+      if (!providerAfterWait) {
+        return;
+      }
+      const cfgAfterWait = (await providerAfterWait.privateCfg.load()) as
+        | { isEncryptionEnabled?: boolean; encryptKey?: string }
+        | undefined;
+      if (cfgAfterWait?.isEncryptionEnabled && cfgAfterWait?.encryptKey) {
+        SyncLog.log('Encryption enabled while waiting — skipping prompt');
+        return;
+      }
+    }
+
+    if (!this._encryptionRequiredDialog && !this._isOpeningEncryptionDialog) {
+      this._isOpeningEncryptionDialog = true;
+      SyncLog.log('Opening encryption dialog (guard passed)');
+      try {
+        const { DialogEnableEncryptionComponent } =
+          await import('./dialog-enable-encryption/dialog-enable-encryption.component');
+
+        // Double-check after async import: another call might have opened a dialog
+        if (this._encryptionRequiredDialog || this._matDialog.openDialogs.length > 0) {
+          SyncLog.log('Dialog appeared during import — aborting');
+          return;
+        }
+
+        this._encryptionRequiredDialog = this._matDialog.open(
+          DialogEnableEncryptionComponent,
+          {
+            disableClose: true,
+            data: { providerType: 'supersync', initialSetup: true },
+          },
+        );
+
+        this._encryptionRequiredDialog.afterClosed().subscribe((result) => {
+          this._encryptionRequiredDialog = undefined;
+          if (result?.success) {
+            this.sync();
+          }
+        });
+      } finally {
+        this._isOpeningEncryptionDialog = false;
+      }
+    } else {
+      SyncLog.log(
+        'Skipping encryption dialog — guard blocked: _encryptionRequiredDialog=',
+        !!this._encryptionRequiredDialog,
+        ', _isOpeningEncryptionDialog=',
+        this._isOpeningEncryptionDialog,
+      );
+    }
+  }
+
+  private _openConflictDialog$(
+    conflictData: ConflictData,
+  ): Observable<DialogConflictResolutionResult | undefined> {
+    if (this.lastConflictDialog) {
+      this.lastConflictDialog.close();
+    }
+    this.lastConflictDialog = this._matDialog.open(DialogSyncConflictComponent, {
+      restoreFocus: true,
+      disableClose: true,
+      data: conflictData,
+    });
+    // Programmatic close emits undefined: forward cancellation instead of
+    // making firstValueFrom throw EmptyError (#7339).
+    return this.lastConflictDialog.afterClosed();
+  }
+
+  /**
+   * Syncs the current vector clock from SUP_OPS to pf.META_MODEL.
+   * Called before legacy sync providers start syncing.
+   * This ensures the legacy sync provider sees the latest vector clock.
+   */
+  private async _syncVectorClockToPfapi(): Promise<void> {
+    const vcEntry = await this._opLogStore.getVectorClockEntry();
+
+    if (vcEntry) {
+      SyncLog.log('[SyncWrapper] Syncing vector clock to pf.META_MODEL', {
+        clockSize: Object.keys(vcEntry.clock).length,
+        lastUpdate: vcEntry.lastUpdate,
+      });
+
+      const existing = await this._legacyPfDb.loadMetaModel();
+      await this._legacyPfDb.saveMetaModel({
+        ...existing,
+        vectorClock: vcEntry.clock,
+        lastUpdate: vcEntry.lastUpdate,
+      });
+    } else {
+      SyncLog.log('[SyncWrapper] No vector clock in SUP_OPS, skipping sync');
+    }
+  }
+}

@@ -1,0 +1,36 @@
+import { BuiltInIssueProviderKey } from '../issue.model';
+import {
+  IssueFieldType,
+  IssueFieldConfig,
+  IssueCommentConfig,
+  IssueContentConfig,
+} from './issue-content.model';
+import { JIRA_ISSUE_CONTENT_CONFIG } from '../providers/jira/jira-issue-content.const';
+import { GITLAB_ISSUE_CONTENT_CONFIG } from '../providers/gitlab/gitlab-issue-content.const';
+import { CALDAV_ISSUE_CONTENT_CONFIG } from '../providers/caldav/caldav-issue-content.const';
+// Gitea is now a plugin — content config lives in the plugin's issueDisplay
+// Redmine is now a plugin — content config lives in the plugin's issueDisplay
+import { OPEN_PROJECT_ISSUE_CONTENT_CONFIG } from '../providers/open-project/open-project-issue-content.const';
+// Trello is now a plugin — content config lives in the plugin's issueDisplay
+// Linear is now a plugin — content config lives in the plugin's issueDisplay
+// Azure DevOps is now a plugin — content config lives in the plugin's issueDisplay
+// Nextcloud Deck is now a plugin — content config lives in the plugin's issueDisplay
+import { PLAINSPACE_ISSUE_CONTENT_CONFIG } from '../providers/plainspace/plainspace-issue-content.const';
+
+// Re-export types for backwards compatibility
+export { IssueFieldType, IssueFieldConfig, IssueCommentConfig, IssueContentConfig };
+
+export const ISSUE_CONTENT_CONFIGS: Record<
+  BuiltInIssueProviderKey,
+  IssueContentConfig<any>
+> = {
+  GITLAB: GITLAB_ISSUE_CONTENT_CONFIG,
+  JIRA: JIRA_ISSUE_CONTENT_CONFIG,
+  CALDAV: CALDAV_ISSUE_CONTENT_CONFIG,
+  OPEN_PROJECT: OPEN_PROJECT_ISSUE_CONTENT_CONFIG,
+  PLAINSPACE: PLAINSPACE_ISSUE_CONTENT_CONFIG,
+  ICAL: {
+    issueType: 'ICAL',
+    fields: [],
+  },
+};

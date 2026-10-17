@@ -1,0 +1,819 @@
+import {
+  computed,
+  DestroyRef,
+  effect,
+  EnvironmentInjector,
+  inject,
+  Injectable,
+  runInInjectionContext,
+  signal,
+  untracked,
+} from '@angular/core';
+import { takeUntilDestroyed, toObservable, toSignal } from '@angular/core/rxjs-interop';
+import { BodyClass, IS_ELECTRON, IS_GNOME_WAYLAND } from '../../app.constants';
+import { IS_MAC } from '../../util/is-mac';
+import {
+  distinctUntilChanged,
+  filter,
+  map,
+  startWith,
+  switchMap,
+  take,
+} from 'rxjs/operators';
+import { NavigationEnd, Router } from '@angular/router';
+import { IS_TOUCH_ONLY } from '../../util/is-touch-only';
+import { MaterialCssVarsService } from 'angular-material-css-vars';
+import { DOCUMENT } from '@angular/common';
+import { MatIconRegistry } from '@angular/material/icon';
+import { DomSanitizer } from '@angular/platform-browser';
+import { ChromeExtensionInterfaceService } from '../chrome-extension-interface/chrome-extension-interface.service';
+
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
+import { GlobalConfigService } from '../../features/config/global-config.service';
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
+import { WorkContextThemeCfg } from '../../features/work-context/work-context.model';
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
+import {
+  DEFAULT_BACKGROUND_OVERLAY_OPACITY,
+  isBackgroundImageSet,
+  normalizeBackgroundImageBlur,
+} from '../../features/work-context/work-context.const';
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
+import { WorkContextService } from '../../features/work-context/work-context.service';
+import { combineLatest, fromEvent, Observable, of } from 'rxjs';
+import { IS_FIREFOX } from '../../util/is-firefox';
+import { ImexViewService } from '../../imex/imex-meta/imex-view.service';
+import {
+  IS_HYBRID_DEVICE,
+  IS_MOUSE_PRIMARY,
+  IS_TOUCH_PRIMARY,
+} from '../../util/is-mouse-primary';
+// Injected to ensure constructor runs and registers global pointer event listeners
+import { InputIntentService } from '../input-intent/input-intent.service';
+import { ipcEnterFullScreen$, ipcLeaveFullScreen$ } from '../ipc-events';
+
+import { IS_ANDROID_WEB_VIEW } from '../../util/is-android-web-view';
+// eslint-disable-next-line @typescript-eslint/no-restricted-imports -- grandfathered layer-boundary debt
+import { androidInterface } from '../../features/android/android-interface';
+import { HttpClient } from '@angular/common/http';
+import { CapacitorPlatformService } from '../platform/capacitor-platform.service';
+import { registerPlugin } from '@capacitor/core';
+import { StatusBar, Style } from '@capacitor/status-bar';
+import { SafeArea } from 'capacitor-plugin-safe-area';
+import { patchCdkViewportForSafeArea } from './cdk-safe-area-viewport.util';
+import { lockViewportZoom } from './lock-viewport-zoom.util';
+import { LS } from '../persistence/storage-keys.const';
+import { Log, PluginLog } from '../log';
+import { LayoutService } from '../../core-ui/layout/layout.service';
+import { IosKeyboardService } from './ios-keyboard.service';
+import { CSS_VAR_KEYBOARD_HEIGHT } from './keyboard-css-vars.const';
+import { OverlayContainer } from '@angular/cdk/overlay';
+import { sanitizeSvgIconContent } from '../../util/sanitize-svg-icon.util';
+import { CustomThemeService, getRequiredThemeMode } from './custom-theme.service';
+import { BUILT_IN_SVG_ICONS } from './built-in-svg-icons.const';
+
+interface NavigationBarPlugin {
+  setColor(options: { color: string; style: 'LIGHT' | 'DARK' }): Promise<void>;
+  setWebViewBackgroundColor(options: { color: string }): Promise<void>;
+}
+
+const NavigationBar = registerPlugin<NavigationBarPlugin>('NavigationBar');
+
+export type DarkModeCfg = 'dark' | 'light' | 'system';
+
+const CSS_VAR_SAFE_AREA_TOP = '--safe-area-inset-top';
+const CSS_VAR_SAFE_AREA_BOTTOM = '--safe-area-inset-bottom';
+const CSS_VAR_SAFE_AREA_LEFT = '--safe-area-inset-left';
+const CSS_VAR_SAFE_AREA_RIGHT = '--safe-area-inset-right';
+const CSS_VAR_SYSTEM_SURFACE = '--system-surface';
+const DEFAULT_LIGHT_SYSTEM_SURFACE = '#f8f8f7';
+const DEFAULT_DARK_SYSTEM_SURFACE = '#131314';
+
+/**
+ * Resolve a CSS theme surface to the opaque hex format Android's Color parser
+ * accepts. Transparent, gradient, unresolved, and otherwise invalid values
+ * fall back to the matching Default-theme surface.
+ */
+export const resolveSystemSurfaceColor = (
+  rawColor: string,
+  isDarkMode: boolean,
+): string => {
+  const color = rawColor.trim();
+  const fallback = isDarkMode
+    ? DEFAULT_DARK_SYSTEM_SURFACE
+    : DEFAULT_LIGHT_SYSTEM_SURFACE;
+
+  if (/^#[\da-f]{6}$/i.test(color)) {
+    return color;
+  }
+  if (/^#[\da-f]{3}$/i.test(color)) {
+    return `#${[...color.slice(1)].map((digit) => `${digit}${digit}`).join('')}`;
+  }
+  const rgbMatch = color.match(
+    /^rgb\(\s*(\d{1,3})(?:\s*,\s*|\s+)(\d{1,3})(?:\s*,\s*|\s+)(\d{1,3})\s*\)$/i,
+  );
+  if (rgbMatch) {
+    const channels = rgbMatch.slice(1).map(Number);
+    if (channels.every((channel) => channel <= 255)) {
+      return `#${channels
+        .map((channel) => channel.toString(16).padStart(2, '0'))
+        .join('')}`;
+    }
+  }
+  return fallback;
+};
+
+/** The four wallpaper fields of the app-level (global) background config. */
+export type GlobalWallpaperCfg = Pick<
+  WorkContextThemeCfg,
+  | 'backgroundImageDark'
+  | 'backgroundImageLight'
+  | 'backgroundOverlayOpacity'
+  | 'backgroundImageBlur'
+>;
+
+export interface ResolvedBackground {
+  /** The image to show, or null when no background applies to this URL. */
+  imageUrl: string | null;
+  /** Final CSS overlay opacity (0..0.99) of the resolved image's source. */
+  overlayOpacity: number;
+  /** Blur radius in px of the resolved image's source. */
+  blur: number;
+}
+
+const _styleOf = (
+  theme: GlobalWallpaperCfg,
+): Pick<ResolvedBackground, 'overlayOpacity' | 'blur'> => ({
+  overlayOpacity:
+    (theme.backgroundOverlayOpacity ?? DEFAULT_BACKGROUND_OVERLAY_OPACITY) * 0.01,
+  blur: normalizeBackgroundImageBlur(theme.backgroundImageBlur),
+});
+
+/**
+ * Resolve which background image and styling apply to the current route.
+ *
+ * Precedence: per-context image → global wallpaper → none. Crucially, on
+ * non-work-context routes (Planner, Schedule, Boards, Config, …) the active
+ * work context stays "Today" (the reducer default), so we must never use its
+ * image there — only the global wallpaper. The overlay-opacity and blur travel
+ * with the resolved image so a global wallpaper is never styled by the sticky
+ * context's settings.
+ */
+export const resolveBackground = (
+  contextTheme: WorkContextThemeCfg,
+  globalCfg: GlobalWallpaperCfg,
+  isDarkMode: boolean,
+  url: string,
+): ResolvedBackground => {
+  // Anchor to the path start so a query/fragment containing "/tag/" or
+  // "/project/" can't misclassify a non-context route.
+  const isWorkContextUrl = /^\/(tag|project)\//.test(url);
+  const contextImg = isDarkMode
+    ? contextTheme.backgroundImageDark
+    : contextTheme.backgroundImageLight;
+
+  if (isWorkContextUrl && isBackgroundImageSet(contextImg)) {
+    return { imageUrl: contextImg, ..._styleOf(contextTheme) };
+  }
+
+  const globalImg = isDarkMode
+    ? globalCfg.backgroundImageDark
+    : globalCfg.backgroundImageLight;
+  return {
+    imageUrl: isBackgroundImageSet(globalImg) ? globalImg : null,
+    ..._styleOf(globalCfg),
+  };
+};
+
+@Injectable({ providedIn: 'root' })
+export class GlobalThemeService {
+  private document = inject<Document>(DOCUMENT);
+  private _layoutService = inject(LayoutService);
+  private _materialCssVarsService = inject(MaterialCssVarsService);
+  private _workContextService = inject(WorkContextService);
+  private _globalConfigService = inject(GlobalConfigService);
+  private _matIconRegistry = inject(MatIconRegistry);
+  private readonly _registeredPluginIcons = new Set<string>();
+  private _domSanitizer = inject(DomSanitizer);
+  private _router = inject(Router);
+
+  private _chromeExtensionInterfaceService = inject(ChromeExtensionInterfaceService);
+  private _imexMetaService = inject(ImexViewService);
+  private _http = inject(HttpClient);
+  private _platformService = inject(CapacitorPlatformService);
+  private _customThemeService = inject(CustomThemeService);
+  private _environmentInjector = inject(EnvironmentInjector);
+  private _destroyRef = inject(DestroyRef);
+  private _inputIntentService = inject(InputIntentService);
+  private _iosKeyboardService = inject(IosKeyboardService);
+  private _overlayContainer = inject(OverlayContainer);
+  private _hasInitialized = false;
+  private _isCustomWindowTitleBarEnabled(): boolean {
+    // The main process (main-window.ts) force-disables the custom title bar on
+    // GNOME+Wayland because the Window-Controls-Overlay won't render there.
+    // Mirror that here so we never lay the custom header on top of native
+    // decorations, which would produce a doubled header.
+    if (IS_GNOME_WAYLAND) {
+      return false;
+    }
+    // Default ON to match main-window's `?? !IS_GNOME_WAYLAND` default.
+    // KNOWN RESIDUAL: main-window also honors the legacy `isUseObsidianStyleHeader`
+    // SimpleStore field, which is never mirrored into global config, so it isn't
+    // visible here. A user who explicitly disabled the *old* header and never set
+    // the new toggle gets native decorations + custom header (doubled). This is a
+    // pre-existing divergence (already present for non-GNOME) and is self-healing:
+    // the now-visible Misc toggle lets them turn the custom header off.
+    const misc = this._globalConfigService.misc();
+    return misc?.isUseCustomWindowTitleBar ?? true;
+  }
+
+  darkMode = signal<DarkModeCfg>(
+    (localStorage.getItem(LS.DARK_MODE) as DarkModeCfg) || 'system',
+  );
+
+  private _isDarkThemeObs$: Observable<boolean> = toObservable(this.darkMode).pipe(
+    switchMap((darkMode) => {
+      switch (darkMode) {
+        case 'dark':
+          return of(true);
+        case 'light':
+          return of(false);
+        default:
+          const darkModePreference = window.matchMedia('(prefers-color-scheme: dark)');
+          return fromEvent(darkModePreference, 'change').pipe(
+            map((e: any) => e.matches),
+            startWith(darkModePreference.matches),
+          );
+      }
+    }),
+    distinctUntilChanged(),
+  );
+
+  isDarkTheme = toSignal(this._isDarkThemeObs$, { initialValue: false });
+
+  // Emits the current URL after each completed navigation, starting with the
+  // current URL so the stream is immediately available before any navigation.
+  private _currentUrl$: Observable<string> = this._router.events.pipe(
+    filter((e) => e instanceof NavigationEnd),
+    map((e) => (e as NavigationEnd).urlAfterRedirects),
+    startWith(this._router.url),
+  );
+
+  private _resolvedBackground$: Observable<ResolvedBackground> = combineLatest([
+    this._workContextService.currentTheme$,
+    this._isDarkThemeObs$,
+    this._currentUrl$,
+    this._globalConfigService.misc$,
+  ]).pipe(
+    map(([theme, isDarkMode, url, misc]) =>
+      resolveBackground(theme, misc, isDarkMode, url),
+    ),
+    distinctUntilChanged(
+      (a, b) =>
+        a.imageUrl === b.imageUrl &&
+        a.overlayOpacity === b.overlayOpacity &&
+        a.blur === b.blur,
+    ),
+  );
+
+  private _resolvedBackground = toSignal(this._resolvedBackground$, {
+    initialValue: {
+      imageUrl: null,
+      overlayOpacity: DEFAULT_BACKGROUND_OVERLAY_OPACITY * 0.01,
+      blur: 0,
+    } satisfies ResolvedBackground,
+  });
+
+  /** The resolved background image URL for the current route (null if none). */
+  readonly backgroundImg = computed(() => this._resolvedBackground().imageUrl);
+
+  /** Final CSS overlay opacity for the resolved background image. */
+  readonly bgOverlayOpacity = computed(() => this._resolvedBackground().overlayOpacity);
+
+  /** Blur radius (px) for the resolved background image. */
+  readonly bgImageBlur = computed(() => this._resolvedBackground().blur);
+
+  init(): void {
+    if (this._hasInitialized) {
+      return;
+    }
+    this._hasInitialized = true;
+
+    runInInjectionContext(this._environmentInjector, () => {
+      // This is here to make web page reloads on non-work-context pages at least usable
+      this._setBackgroundTint(true);
+      this._initIcons();
+      this._initRequiredThemeMode();
+      this._initHandlersForInitialBodyClasses();
+      this._initThemeWatchers();
+
+      // Set up dark mode persistence effect
+      effect(() => {
+        const darkMode = this.darkMode();
+        localStorage.setItem(LS.DARK_MODE, darkMode);
+      });
+    });
+  }
+
+  private _setDarkTheme(isDarkTheme: boolean): void {
+    this._materialCssVarsService.setDarkTheme(isDarkTheme);
+    this._setChartTheme(isDarkTheme).catch((err) => {
+      Log.warn('Failed to set chart theme', err);
+    });
+    // this._materialCssVarsService.setDarkTheme(true);
+    // this._materialCssVarsService.setDarkTheme(false);
+  }
+
+  private _initRequiredThemeMode(): void {
+    const enforceActiveThemeMode = (): void => {
+      const requiredMode = getRequiredThemeMode(this._customThemeService.activeRef());
+      if (requiredMode && this.darkMode() !== requiredMode) {
+        this.darkMode.set(requiredMode);
+      }
+    };
+
+    // Effects run during change detection; enforce once synchronously so the
+    // cold-start stylesheet never waits a frame for its required body class.
+    enforceActiveThemeMode();
+    effect(enforceActiveThemeMode);
+  }
+
+  private _setColorTheme(theme: WorkContextThemeCfg): void {
+    this._materialCssVarsService.setAutoContrastEnabled(!!theme.isAutoContrast);
+    this._setBackgroundTint(!!theme.isDisableBackgroundTint);
+
+    // NOTE: setting undefined values does not seem to be a problem so we use !
+    if (!theme.isAutoContrast) {
+      this._materialCssVarsService.setContrastColorThresholdPrimary(theme.huePrimary!);
+      this._materialCssVarsService.setContrastColorThresholdAccent(theme.hueAccent!);
+      this._materialCssVarsService.setContrastColorThresholdWarn(theme.hueWarn!);
+    }
+
+    this._materialCssVarsService.setPrimaryColor(theme.primary!);
+    this._materialCssVarsService.setAccentColor(theme.accent!);
+    this._materialCssVarsService.setWarnColor(theme.warn!);
+  }
+
+  private _setBackgroundTint(isDisableBackgroundTint: boolean): void {
+    // Simplify: toggle only the disable flag; CSS handles the rest
+    this.document.body.classList.toggle(
+      BodyClass.isDisableBackgroundTint,
+      !!isDisableBackgroundTint,
+    );
+  }
+
+  private _initIcons(): void {
+    // Material v22 infers the ligature class from the loaded fonts and would pick
+    // `material-symbols-outlined`; our icon styles are bound to `.material-icons`.
+    this._matIconRegistry.setDefaultFontSetClass('material-icons', 'mat-ligature-font');
+    // todo test if can be removed with airplane mode and wifi without internet
+    BUILT_IN_SVG_ICONS.forEach(([name, path]) => {
+      this._matIconRegistry.addSvgIcon(
+        name,
+        this._domSanitizer.bypassSecurityTrustResourceUrl(path),
+      );
+    });
+
+    this.preloadIcons(BUILT_IN_SVG_ICONS);
+  }
+
+  preloadIcons(icons: readonly (readonly [string, string])[]): Promise<void[]> {
+    // Map each icon name to a promise that fetches and registers the icon.
+    const iconPromises = icons.map(([iconName, url]) => {
+      // Construct the URL for the SVG file.
+      // Adjust the path if your SVGs are located elsewhere.
+      return this._http
+        .get(url, { responseType: 'text' })
+        .toPromise()
+        .then((svg) => {
+          // Register the fetched SVG as an inline icon.
+          this._matIconRegistry.addSvgIconLiteral(
+            iconName,
+            this._domSanitizer.bypassSecurityTrustHtml(svg),
+          );
+        })
+        .catch((error) => {
+          Log.err(`Error loading icon: ${iconName} from ${url}`, error);
+        });
+    });
+
+    // Return a promise that resolves when all icons have been processed.
+    return Promise.all(iconPromises);
+  }
+
+  registerSvgIcon(iconName: string, url: string): void {
+    // Plugin icon is already registered, skip
+    if (this._registeredPluginIcons.has(iconName)) return;
+    this._matIconRegistry.addSvgIcon(
+      iconName,
+      this._domSanitizer.bypassSecurityTrustResourceUrl(url),
+    );
+    this._registeredPluginIcons.add(iconName);
+  }
+
+  hasPluginIcon(iconName: string): boolean {
+    return this._registeredPluginIcons.has(iconName);
+  }
+
+  /**
+   * `svgContent` comes from a plugin, so it is untrusted. `MatIconRegistry` parses the
+   * literal with `div.innerHTML`, which makes this the trust boundary for that sink.
+   */
+  registerSvgIconFromContent(iconName: string, svgContent: string): void {
+    // Plugin icon is already registered, skip
+    if (this._registeredPluginIcons.has(iconName)) return;
+    const safeSvgContent = sanitizeSvgIconContent(svgContent);
+    if (!safeSvgContent) {
+      PluginLog.warn(`Skipping unsafe or invalid SVG icon: ${iconName}`);
+      return;
+    }
+    this._matIconRegistry.addSvgIconLiteral(
+      iconName,
+      this._domSanitizer.bypassSecurityTrustHtml(safeSvgContent),
+    );
+    this._registeredPluginIcons.add(iconName);
+  }
+
+  private _initThemeWatchers(): void {
+    // init theme watchers
+    this._workContextService.currentTheme$
+      .pipe(takeUntilDestroyed(this._destroyRef))
+      .subscribe((theme: WorkContextThemeCfg) => this._setColorTheme(theme));
+    this._isDarkThemeObs$
+      .pipe(takeUntilDestroyed(this._destroyRef))
+      .subscribe((isDarkTheme) => this._setDarkTheme(isDarkTheme));
+
+    // Update Electron title bar overlay when dark mode changes
+    if (IS_ELECTRON && !IS_MAC) {
+      effect(() => {
+        const isDark = this.isDarkTheme();
+        // Use untracked to prevent creating additional dependencies in this effect
+        const isCustomWindowTitleBarEnabled = untracked(() =>
+          this._isCustomWindowTitleBarEnabled(),
+        );
+        // Only update if custom window title bar is enabled
+        if (isCustomWindowTitleBarEnabled) {
+          window.ea.updateTitleBarDarkMode(isDark);
+        }
+      });
+    }
+  }
+
+  private _initHandlersForInitialBodyClasses(): void {
+    this.document.body.classList.add(BodyClass.isNoAdvancedFeatures);
+
+    if (!IS_FIREFOX) {
+      this.document.body.classList.add(BodyClass.isNoFirefox);
+    }
+
+    if (IS_MAC) {
+      this.document.body.classList.add(BodyClass.isMac);
+    } else {
+      this.document.body.classList.add(BodyClass.isNoMac);
+    }
+
+    if (IS_ELECTRON) {
+      this.document.body.classList.add(BodyClass.isElectron);
+      this.document.body.classList.add(BodyClass.isAdvancedFeatures);
+      this.document.body.classList.remove(BodyClass.isNoAdvancedFeatures);
+      ipcEnterFullScreen$.pipe(takeUntilDestroyed(this._destroyRef)).subscribe(() => {
+        this.document.body.classList.add(BodyClass.isFullScreen);
+      });
+      ipcLeaveFullScreen$.pipe(takeUntilDestroyed(this._destroyRef)).subscribe(() => {
+        this.document.body.classList.remove(BodyClass.isFullScreen);
+      });
+    } else {
+      this.document.body.classList.add(BodyClass.isWeb);
+      this._chromeExtensionInterfaceService.onReady$.pipe(take(1)).subscribe(() => {
+        this.document.body.classList.add(BodyClass.isExtension);
+        this.document.body.classList.add(BodyClass.isAdvancedFeatures);
+        this.document.body.classList.remove(BodyClass.isNoAdvancedFeatures);
+      });
+    }
+
+    // Add native mobile platform classes
+    if (this._platformService.isNative) {
+      this.document.body.classList.add(BodyClass.isNativeMobile);
+      this._initMobileStatusBar();
+      this._initSafeAreaInsets();
+
+      if (this._platformService.isIOS()) {
+        this.document.body.classList.add(BodyClass.isIOS);
+        this._iosKeyboardService.init();
+        lockViewportZoom(this.document);
+
+        // Add iPad-specific class for tablet optimizations
+        if (this._platformService.isIPad()) {
+          this.document.body.classList.add(BodyClass.isIPad);
+        }
+      }
+    }
+
+    // Engine-level marker for the iOS focus-zoom workaround, set for web too:
+    // `isIOS` above is inside the isNative branch, so mobile Safari and the
+    // installed PWA never get it, yet they zoom exactly the same. Styles that
+    // must clear the 16px threshold key off THIS class (see
+    // styles/mixins/_ios-focus-zoom.scss).
+    if (this._platformService.isIOSWebKit()) {
+      this.document.body.classList.add(BodyClass.isIOSWebKit);
+    }
+
+    if (IS_ANDROID_WEB_VIEW) {
+      androidInterface.isKeyboardShown$
+        // The native OnGlobalLayoutListener pushes a value on every layout pass
+        // (i.e. every frame of the IME slide), so dedupe to actual transitions —
+        // otherwise we rewrite <body> classes and re-trigger change detection
+        // every frame while the keyboard animates.
+        .pipe(distinctUntilChanged(), takeUntilDestroyed(this._destroyRef))
+        .subscribe((isShown) => {
+          Log.log('isShown', isShown);
+
+          this.document.body.classList.remove(BodyClass.isAndroidKeyboardHidden);
+          this.document.body.classList.remove(BodyClass.isAndroidKeyboardShown);
+          this.document.body.classList.remove(BodyClass.isKeyboardVisible);
+          this.document.body.classList.add(
+            isShown
+              ? BodyClass.isAndroidKeyboardShown
+              : BodyClass.isAndroidKeyboardHidden,
+          );
+          if (isShown) {
+            this.document.body.classList.add(BodyClass.isKeyboardVisible);
+          }
+        });
+    }
+
+    // VisualViewport keyboard-height tracking covers every non-iOS touch
+    // build: Capacitor Android, the legacy F-Droid build, and Android
+    // mobile-web. iOS is handled entirely by IosKeyboardService above.
+    if (IS_TOUCH_ONLY && !this._platformService.isIOS()) {
+      this._initVisualViewportKeyboardTracking();
+    }
+
+    // Use effect to reactively update animation class
+    effect(() => {
+      const misc = this._globalConfigService.misc();
+      if (misc?.isDisableAnimations) {
+        this.document.body.classList.add(BodyClass.isDisableAnimations);
+      } else {
+        this.document.body.classList.remove(BodyClass.isDisableAnimations);
+      }
+    });
+
+    effect(() => {
+      if (this._isCustomWindowTitleBarEnabled()) {
+        this.document.body.classList.add(BodyClass.isObsidianStyleHeader);
+      } else {
+        this.document.body.classList.remove(BodyClass.isObsidianStyleHeader);
+      }
+    });
+
+    effect(() => {
+      const misc = this._globalConfigService.misc();
+      if (misc?.isVerticalActionBar) {
+        this.document.body.classList.add(BodyClass.isVerticalActionBar);
+      } else {
+        this.document.body.classList.remove(BodyClass.isVerticalActionBar);
+      }
+    });
+
+    // Add/remove hasBgImage class to body when background image changes
+    effect(() => {
+      if (this.backgroundImg()) {
+        this.document.body.classList.add(BodyClass.hasBgImage);
+      } else {
+        this.document.body.classList.remove(BodyClass.hasBgImage);
+      }
+    });
+
+    // Add/remove has-mobile-bottom-nav class to body for snack bar positioning
+    effect(() => {
+      if (this._layoutService.isShowMobileBottomNav()) {
+        this.document.body.classList.add(BodyClass.hasMobileBottomNav);
+      } else {
+        this.document.body.classList.remove(BodyClass.hasMobileBottomNav);
+      }
+    });
+
+    this._imexMetaService.isDataImportInProgress$
+      .pipe(takeUntilDestroyed(this._destroyRef))
+      .subscribe((isInProgress) => {
+        // timer(1000, 5000)
+        //   .pipe(map((val) => val % 2 === 0))
+        //   .subscribe((isInProgress) => {
+        if (isInProgress) {
+          this.document.body.classList.add(BodyClass.isDataImportInProgress);
+        } else {
+          this.document.body.classList.remove(BodyClass.isDataImportInProgress);
+        }
+      });
+
+    if (IS_TOUCH_ONLY) {
+      this.document.body.classList.add(BodyClass.isTouchOnly);
+    } else {
+      this.document.body.classList.add(BodyClass.isNoTouchOnly);
+    }
+
+    // On hybrid devices, InputIntentService dynamically toggles these classes
+    if (!IS_HYBRID_DEVICE) {
+      if (IS_MOUSE_PRIMARY) {
+        this.document.body.classList.add(BodyClass.isMousePrimary);
+      } else if (IS_TOUCH_PRIMARY) {
+        this.document.body.classList.add(BodyClass.isTouchPrimary);
+      }
+    }
+  }
+
+  private async _setChartTheme(isDarkTheme: boolean): Promise<void> {
+    const { ThemeService } = await import('ng2-charts');
+
+    const chartThemeService = this._environmentInjector.get(ThemeService);
+
+    const overrides: import('chart.js').ChartConfiguration['options'] = isDarkTheme
+      ? {
+          scales: {
+            x: {
+              ticks: {
+                color: 'white',
+              },
+              grid: {
+                color: 'rgba(255,255,255,0.1)',
+              },
+            },
+
+            y: {
+              ticks: {
+                color: 'white',
+              },
+              grid: {
+                color: 'rgba(255,255,255,0.1)',
+              },
+            },
+          },
+        }
+      : {
+          scales: {},
+        };
+    chartThemeService.setColorschemesOptions(overrides);
+  }
+
+  /**
+   * Keyboard-height tracking via VisualViewport — the fallback path for any
+   * non-iOS touch build (Capacitor Android, F-Droid, mobile-web).
+   *
+   * Android's `adjustResize` is supposed to shrink the WebView when the IME
+   * appears, in which case `position: fixed; bottom: 0` would naturally sit
+   * above the keyboard. In practice it's inconsistent — depending on Chrome
+   * version, transient transitions, and edge-to-edge insets, the layout
+   * viewport sometimes does not shrink in step with the keyboard, leaving
+   * fixed-position UI hidden behind it.
+   *
+   * VisualViewport always reflects the actual visible area. The difference
+   * `window.innerHeight - visualViewport.height` is the obscured area —
+   * which is zero when adjustResize already handled it, and equals the
+   * keyboard height otherwise. Either way, `--keyboard-height` ends up
+   * correct without needing to know which path Android took.
+   */
+  private _initVisualViewportKeyboardTracking(): void {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const root = this.document.documentElement;
+    // Filter out small differences from URL bar / overlay UI rather than the
+    // IME — keeps us from setting a phantom keyboard offset.
+    const KEYBOARD_THRESHOLD_PX = 100;
+    // IME open/close on Android resizes the layout viewport (adjustResize)
+    // and the visual viewport at slightly different times, so per-event
+    // commits park fixed-position UI (e.g. the global add-task bar) at
+    // intermediate partial-keyboard amounts. Debounce the OPEN path so only
+    // the final value lands (200ms, just past `--transition-duration-m`:
+    // 225ms). Commit the CLOSE path synchronously so the bar drops the moment
+    // the IME is gone rather than parking at the old height for the debounce
+    // window — that would just invert the original symptom.
+    const KEYBOARD_RESIZE_DEBOUNCE_MS = 200;
+    let resizeTimer: number | null = null;
+
+    const commit = (): void => {
+      const obscured = window.innerHeight - vv.height;
+      const keyboardHeight = obscured > KEYBOARD_THRESHOLD_PX ? obscured : 0;
+      root.style.setProperty(CSS_VAR_KEYBOARD_HEIGHT, `${keyboardHeight}px`);
+    };
+
+    const onViewportResize = (): void => {
+      const obscured = window.innerHeight - vv.height;
+      if (obscured <= KEYBOARD_THRESHOLD_PX) {
+        if (resizeTimer !== null) {
+          window.clearTimeout(resizeTimer);
+          resizeTimer = null;
+        }
+        commit();
+        return;
+      }
+      if (resizeTimer !== null) {
+        window.clearTimeout(resizeTimer);
+      }
+      resizeTimer = window.setTimeout(() => {
+        resizeTimer = null;
+        commit();
+      }, KEYBOARD_RESIZE_DEBOUNCE_MS);
+    };
+
+    commit();
+    vv.addEventListener('resize', onViewportResize, { passive: true });
+    this._destroyRef.onDestroy(() => {
+      vv.removeEventListener('resize', onViewportResize);
+      if (resizeTimer !== null) {
+        window.clearTimeout(resizeTimer);
+      }
+    });
+  }
+
+  /**
+   * Initialize mobile status bar styling.
+   * Syncs status bar style with app dark/light mode on both iOS and Android.
+   */
+  /**
+   * Read native safe area insets and set CSS variables.
+   * Works around Android WebView's unreliable env(safe-area-inset-*) values.
+   */
+  private _initSafeAreaInsets(): void {
+    const applyInsets = (insets: {
+      top: number;
+      right: number;
+      bottom: number;
+      left: number;
+    }): void => {
+      const root = this.document.documentElement;
+      root.style.setProperty(CSS_VAR_SAFE_AREA_TOP, `${insets.top}px`);
+      root.style.setProperty(CSS_VAR_SAFE_AREA_BOTTOM, `${insets.bottom}px`);
+      root.style.setProperty(CSS_VAR_SAFE_AREA_LEFT, `${insets.left}px`);
+      root.style.setProperty(CSS_VAR_SAFE_AREA_RIGHT, `${insets.right}px`);
+    };
+
+    // On Android the WebView now draws edge-to-edge (the @capawesome plugin that
+    // used to inset it via native margins was removed in favour of Capacitor's
+    // built-in SystemBars). The --safe-area-inset-* vars are no longer written
+    // from JS on Android — that would race SystemBars on the same documentElement
+    // inline style (last-writer-wins, OS/timing dependent). Each band resolves
+    // them on its own (verified against the bundled SystemBars.java, Capacitor
+    // 8.5.3 — see docs/android-edge-to-edge-keyboard.md, "Capacitor 8.5.2+"):
+    //   - WebView >= 140 (any API, viewport-fit=cover): SystemBars passes the
+    //     native insets through and mirrors them into --safe-area-inset-*
+    //     (bottom 0px while the keyboard is up, which it pads natively).
+    //   - WebView < 140 (any API): SystemBars pads the window natively for the
+    //     system bars and keyboard and writes 0px into --safe-area-inset-*.
+    // In every case the SCSS fallback `var(--safe-area-inset-*, env(...))` in
+    // _css-variables.scss resolves to the injected px when present, else to
+    // env() — which covers the moment before SystemBars' first write.
+    // Only iOS (contentInset: 'never') still needs JS-fed insets from
+    // capacitor-plugin-safe-area; SystemBars insetsHandling is Android-only.
+    if (!this._platformService.isAndroid()) {
+      SafeArea.getSafeAreaInsets().then(({ insets }) => applyInsets(insets));
+      SafeArea.addListener('safeAreaChanged', ({ insets }) => applyInsets(insets));
+    }
+    patchCdkViewportForSafeArea(
+      this.document,
+      this._overlayContainer.getContainerElement(),
+    );
+  }
+
+  private _initMobileStatusBar(): void {
+    effect(() => {
+      const isDark = this.isDarkTheme();
+      // Re-read computed tokens only after the loader has atomically swapped
+      // the stylesheet. Theme changes do not necessarily change dark mode.
+      this._customThemeService.appliedThemeVersion();
+      StatusBar.setStyle({ style: isDark ? Style.Dark : Style.Light }).catch((err) => {
+        Log.warn('Failed to set status bar style', err);
+      });
+      if (this._platformService.isAndroid()) {
+        const bgColor = resolveSystemSurfaceColor(
+          getComputedStyle(this.document.body).getPropertyValue(CSS_VAR_SYSTEM_SURFACE),
+          isDark,
+        );
+        // The @capawesome edge-to-edge plugin (which painted opaque bar overlays
+        // via EdgeToEdge.set{Status,Navigation}BarColor) was removed in favour of
+        // Capacitor's built-in SystemBars. SystemBars has NO bar-color API — the
+        // edge-to-edge model is transparent bars with the web content drawn
+        // behind them. The bar backgrounds are therefore painted by:
+        //   - setWebViewBackgroundColor below (window decor + WebView surface),
+        //     which shows through the transparent bars (the color backstop on
+        //     API 35+ where window.*BarColor is a no-op), and
+        //   - NavigationBar.setColor's window.navigationBarColor, still effective
+        //     on API < 35, plus its setSystemBarsAppearance which drives the nav
+        //     bar icon light/dark on all versions.
+        // Status-bar icon light/dark is set via StatusBar.setStyle above.
+        NavigationBar.setColor({
+          color: bgColor,
+          style: isDark ? 'DARK' : 'LIGHT',
+        }).catch((err) => {
+          Log.warn('Failed to set navigation bar appearance', err);
+        });
+        // Paint the WebView surface and window decor with the theme background so
+        // the transparent system bars show the theme color behind them and the
+        // keyboard animation can't flash white between frames.
+        NavigationBar.setWebViewBackgroundColor({ color: bgColor }).catch((err) => {
+          Log.warn('Failed to set web view background color', err);
+        });
+      }
+    });
+  }
+}

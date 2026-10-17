@@ -1,0 +1,133 @@
+@use '../../../../styles/_globals.scss' as *;
+
+:host {
+  display: block;
+  text-align: left;
+  // min-height: 50px;
+  list-style: none;
+  // add a little padding to top and bottom, to make drag dropping easier
+  padding: 5px 0;
+  margin: 0;
+  position: relative;
+
+  ::ng-deep task-list & {
+    margin: var(--s-quarter) 5px 0 5px;
+
+    @include mq(xs, max) {
+      margin: 1px 0 0 10px;
+    }
+  }
+}
+
+// Sub-task drop lists keep their drag-drop padding INSIDE the cdkDropList
+// element (`.task-list-inner`) instead of on :host, so the strip above the
+// first subtask and below the last one becomes part of the CDK drop rect. A
+// task dragged into that strip then enters the list and CDK drops it as the
+// first / last child (SingleAxisSortStrategy._shouldEnterAsFirstChild).
+// Without it, the only target for the first/last slot is half of the edge row,
+// which is awkwardly small to hit (#7905 scenario B). The matching :host
+// padding is dropped for sub-lists so the visible gap stays compact.
+:host-context(.sub-tasks) {
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
+.task-list-inner[data-list-id='SUB'] {
+  padding: var(--s) 0;
+}
+
+.done-task-box {
+  text-align: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.no-tasks {
+  @include center;
+  text-align: center;
+  width: 90%;
+
+  color: var(--text-color-muted);
+}
+
+// Reads as a quiet section label (like the work view header labels), not as
+// another task row.
+.expand-tasks-btn {
+  // No extra opacity: --text-color-muted is already ~0.66 alpha, and multiplying
+  // the two dropped this 12px label below the 4.5:1 contrast minimum.
+  mat-icon {
+    font-size: 18px;
+    width: 18px;
+    height: 18px;
+    line-height: 18px;
+    color: var(--text-color-muted);
+  }
+}
+
+.expand-tasks-label {
+  font-size: var(--font-size-sm);
+  letter-spacing: var(--letter-spacing-wide);
+  color: var(--text-color-muted);
+}
+
+// The global placeholder opacity (0.1) is too faint between hairline rows;
+// a stronger ghost plus an accent top line marks the drop slot.
+.cdk-drag-placeholder {
+  opacity: 0.3;
+  border-top: 2px solid var(--c-accent);
+}
+
+.cdk-drag-placeholder,
+.cdk-drag-preview {
+  border-radius: var(--task-border-radius);
+  overflow: hidden;
+
+  ::ng-deep .controls {
+    display: none;
+  }
+  ::ng-deep .box {
+    display: none;
+    box-shadow: none !important;
+  }
+}
+
+// Keep the rows in the layout so CDK's cached drop positions stay accurate.
+.multi-drag-source {
+  opacity: 0;
+}
+
+// A group has one insertion slot, without showing the picked row as its ghost.
+.is-multi-dragging > .cdk-drag-placeholder {
+  ::ng-deep * {
+    visibility: hidden;
+  }
+}
+
+.multi-task-drag-preview {
+  width: min(480px, 80vw);
+  padding: var(--s2) var(--s3);
+  background: var(--bg-lighter);
+  color: var(--text-color);
+  border: 1px solid var(--divider-color);
+  border-radius: var(--task-border-radius);
+}
+
+.multi-task-drag-preview-tasks {
+  max-height: min(360px, 50vh);
+  overflow: hidden;
+}
+
+.multi-task-drag-preview-row {
+  padding: var(--s) 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.multi-task-drag-preview-count {
+  padding-bottom: var(--s);
+  border-bottom: 1px solid var(--divider-color);
+  color: var(--c-accent);
+  font-size: var(--font-size-sm);
+}

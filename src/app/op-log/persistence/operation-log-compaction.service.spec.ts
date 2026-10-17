@@ -1,0 +1,1469 @@
+import { TestBed } from '@angular/core/testing';
+import { OperationLogCompactionService } from './operation-log-compaction.service';
+import { OperationLogStoreService } from './operation-log-store.service';
+import { LockService } from '../sync/lock.service';
+import { StateSnapshotService } from '../backup/state-snapshot.service';
+import { VectorClockService } from '../sync/vector-clock.service';
+import {
+  COMPACTION_RETENTION_MS,
+  SLOW_COMPACTION_THRESHOLD_MS,
+  STARTUP_COMPACTION_OP_THRESHOLD,
+} from '../core/operation-log.const';
+import { CURRENT_SCHEMA_VERSION } from './schema-migration.service';
+import { OperationLogEntry, OpType } from '../core/operation.types';
+import { OpLog } from '../../core/log';
+import { MODEL_CONFIGS } from '../model/model-config';
+import { CLIENT_ID_PROVIDER, ClientIdProvider } from '../util/client-id.provider';
+import { OperationCaptureService } from '../capture/operation-capture.service';
+import { OperationWriteFlushService } from '../sync/operation-write-flush.service';
+import { HydrationStateService } from '../apply/hydration-state.service';
+import {
+  bufferDeferredAction,
+  clearDeferredActions,
+} from '../capture/operation-capture.meta-reducer';
+import { PersistentAction } from '../core/persistent-action.interface';
+
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+// Minimal persistent action for driving the real capture-service pending
+// counter in the quiesce tests (#8469).
+const FAKE_PENDING_ACTION = {
+  type: '[Task] Test pending action',
+  meta: { entityType: 'TASK', entityId: 't-pending' },
+} as any;
+
+describe('OperationLogCompactionService', () => {
+  let service: OperationLogCompactionService;
+  let captureService: OperationCaptureService;
+  let mockOpLogStore: jasmine.SpyObj<OperationLogStoreService>;
+  let mockLockService: jasmine.SpyObj<LockService>;
+  let mockStateSnapshot: jasmine.SpyObj<StateSnapshotService>;
+  let mockVectorClockService: jasmine.SpyObj<VectorClockService>;
+  let mockClientIdProvider: jasmine.SpyObj<ClientIdProvider>;
+
+  // Meaningful by default (contains a task) so compaction proceeds. The
+  // empty-state guard (#7892) is exercised by dedicated tests below.
+  const mockState = {
+    task: { entities: { t1: { id: 't1' } }, ids: ['t1'] },
+    project: { entities: {}, ids: [] },
+    tag: { entities: {}, ids: [] },
+  } as any;
+
+  const mockVectorClock = { clientA: 10, clientB: 5 };
+
+  beforeEach(() => {
+    mockOpLogStore = jasmine.createSpyObj('OperationLogStoreService', [
+      'clearVectorClockCache',
+      'getLastSeq',
+      'saveStateCache',
+      'resetCompactionCounter',
+      'deleteOpsWhere',
+      'getPendingRemoteOps',
+      'countOps',
+      'hasSyncedOps',
+    ]);
+    mockLockService = jasmine.createSpyObj('LockService', ['request']);
+    mockStateSnapshot = jasmine.createSpyObj('StateSnapshotService', [
+      'getStateSnapshot',
+      'getStateSnapshotForOperationLog',
+    ]);
+    mockVectorClockService = jasmine.createSpyObj('VectorClockService', [
+      'getCurrentVectorClock',
+    ]);
+    mockClientIdProvider = jasmine.createSpyObj('ClientIdProvider', ['loadClientId']);
+    mockClientIdProvider.loadClientId.and.resolveTo('test-client');
+    // Mock OpLog methods
+    spyOn(OpLog, 'warn');
+    spyOn(OpLog, 'normal');
+
+    // Default mock implementations
+    mockLockService.request.and.callFake(async <T>(_name: string, fn: () => Promise<T>) =>
+      fn(),
+    );
+    mockOpLogStore.getLastSeq.and.returnValue(Promise.resolve(100));
+    mockOpLogStore.saveStateCache.and.returnValue(Promise.resolve());
+    mockOpLogStore.resetCompactionCounter.and.returnValue(Promise.resolve());
+    mockOpLogStore.deleteOpsWhere.and.returnValue(Promise.resolve());
+    mockOpLogStore.getPendingRemoteOps.and.resolveTo([]);
+    mockStateSnapshot.getStateSnapshot.and.returnValue(mockState);
+    mockStateSnapshot.getStateSnapshotForOperationLog.and.callFake(() =>
+      mockStateSnapshot.getStateSnapshot(),
+    );
+    mockVectorClockService.getCurrentVectorClock.and.returnValue(
+      Promise.resolve(mockVectorClock),
+    );
+
+    TestBed.configureTestingModule({
+      providers: [
+        OperationLogCompactionService,
+        // Real quiesce pipeline (flush + capture counter) on top of the mocked
+        // lock, so the #8469 tests exercise the actual drain behavior.
+        OperationWriteFlushService,
+        OperationCaptureService,
+        { provide: OperationLogStoreService, useValue: mockOpLogStore },
+        { provide: LockService, useValue: mockLockService },
+        { provide: StateSnapshotService, useValue: mockStateSnapshot },
+        { provide: VectorClockService, useValue: mockVectorClockService },
+        { provide: CLIENT_ID_PROVIDER, useValue: mockClientIdProvider },
+      ],
+    });
+
+    service = TestBed.inject(OperationLogCompactionService);
+    captureService = TestBed.inject(OperationCaptureService);
+    captureService.clear();
+    clearDeferredActions();
+  });
+
+  afterEach(() => {
+    captureService.clear();
+    clearDeferredActions();
+  });
+
+  describe('compact', () => {
+    it('should acquire lock before compaction', async () => {
+      await service.compact();
+
+      expect(mockLockService.request).toHaveBeenCalledWith(
+        'sp_op_log',
+        jasmine.any(Function),
+      );
+    });
+
+    it('should get current state from store delegate', async () => {
+      await service.compact();
+
+      expect(mockStateSnapshot.getStateSnapshotForOperationLog).toHaveBeenCalled();
+    });
+
+    // #9140: while boot hydration fell back to an op-log replay (intact but
+    // unhydratable snapshot on disk), the live state may be partial —
+    // compacting would overwrite the last complete local copy and prune the
+    // ops the next boot's recovery replays.
+    it('should skip compaction while hydration fallback recovery is active (#9140)', async () => {
+      TestBed.inject(HydrationStateService).setHydrationFallbackActive(true);
+
+      const result = await service.compact();
+
+      expect(result).toBe(false);
+      expect(mockOpLogStore.saveStateCache).not.toHaveBeenCalled();
+      expect(mockOpLogStore.deleteOpsWhere).not.toHaveBeenCalled();
+    });
+
+    it('should also block emergency compaction while hydration fallback recovery is active', async () => {
+      TestBed.inject(HydrationStateService).setHydrationFallbackActive(true);
+
+      const result = await service.emergencyCompact();
+
+      expect(result).toBe(false);
+      expect(mockOpLogStore.saveStateCache).not.toHaveBeenCalled();
+    });
+
+    // #9084: compaction must skip while hydration is between the snapshot's
+    // loadAllData dispatch and the tail-op replay — see the guard in _doCompact.
+    it('should skip compaction while hydration replay is in progress (#9084)', async () => {
+      TestBed.inject(HydrationStateService).setHydrationInProgress(true);
+
+      const result = await service.compact();
+
+      expect(result).toBe(false);
+      expect(mockOpLogStore.saveStateCache).not.toHaveBeenCalled();
+      expect(mockOpLogStore.deleteOpsWhere).not.toHaveBeenCalled();
+    });
+
+    it('should also block emergency compaction while hydration replay is in progress', async () => {
+      TestBed.inject(HydrationStateService).setHydrationInProgress(true);
+
+      const result = await service.emergencyCompact();
+
+      expect(result).toBe(false);
+      expect(mockOpLogStore.saveStateCache).not.toHaveBeenCalled();
+    });
+
+    it('should log metrics if compaction is slow', async () => {
+      // Use jasmine.clock to control Date.now() without actual delays
+      jasmine.clock().install();
+      const baseTime = new Date(2024, 0, 1).getTime();
+      jasmine.clock().mockDate(new Date(baseTime));
+
+      // Mock saveStateCache to advance the clock, simulating slow operation
+      mockOpLogStore.saveStateCache.and.callFake(async () => {
+        // Advance the mocked Date.now() to simulate time passing
+        jasmine.clock().mockDate(new Date(baseTime + SLOW_COMPACTION_THRESHOLD_MS + 100));
+      });
+
+      await service.compact();
+
+      jasmine.clock().uninstall();
+
+      expect(OpLog.normal).toHaveBeenCalledWith(
+        'OperationLogCompactionService: Compaction completed',
+        jasmine.objectContaining({
+          durationMs: jasmine.any(Number),
+          isEmergency: false,
+        }),
+      );
+      const args = (OpLog.normal as jasmine.Spy).calls.mostRecent().args;
+      expect(args[1].durationMs).toBeGreaterThan(SLOW_COMPACTION_THRESHOLD_MS);
+    });
+
+    it('should not log metrics if compaction is fast', async () => {
+      await service.compact();
+
+      // The flush pre-pass logs its own progress lines; only the compaction
+      // metrics line must be absent.
+      expect(OpLog.normal).not.toHaveBeenCalledWith(
+        'OperationLogCompactionService: Compaction completed',
+        jasmine.anything(),
+      );
+    });
+
+    it('should get current vector clock', async () => {
+      await service.compact();
+
+      expect(mockVectorClockService.getCurrentVectorClock).toHaveBeenCalled();
+    });
+
+    it('should read the durable vector clock, not a stale per-tab cache', async () => {
+      await service.compact();
+
+      // Another tab can raise this client's counter in place (#10214).
+      expect(mockOpLogStore.clearVectorClockCache).toHaveBeenCalledBefore(
+        mockVectorClockService.getCurrentVectorClock,
+      );
+    });
+
+    it('should get last sequence number', async () => {
+      await service.compact();
+
+      expect(mockOpLogStore.getLastSeq).toHaveBeenCalled();
+    });
+
+    it('should save state cache with correct data', async () => {
+      await service.compact();
+
+      expect(mockOpLogStore.saveStateCache).toHaveBeenCalledWith(
+        jasmine.objectContaining({
+          state: mockState,
+          lastAppliedOpSeq: 100,
+          vectorClock: mockVectorClock,
+          schemaVersion: CURRENT_SCHEMA_VERSION,
+        }),
+      );
+    });
+
+    // Vector-clock pruning is store-owned (saveStateCache prunes internally,
+    // #9096) — covered by the OperationLogStoreService spec. This service
+    // passes the clock through unmodified:
+    it('should pass the current vector clock through to saveStateCache unmodified', async () => {
+      const smallClock = { clientA: 10, clientB: 5 };
+      mockVectorClockService.getCurrentVectorClock.and.resolveTo(smallClock);
+
+      await service.compact();
+
+      const savedCache = mockOpLogStore.saveStateCache.calls.mostRecent().args[0];
+      expect(savedCache.vectorClock).toEqual(smallClock);
+    });
+
+    it('should save state cache with compactedAt timestamp', async () => {
+      const beforeTime = Date.now();
+      await service.compact();
+      const afterTime = Date.now();
+
+      const savedCache = mockOpLogStore.saveStateCache.calls.mostRecent().args[0];
+      expect(savedCache.compactedAt).toBeGreaterThanOrEqual(beforeTime);
+      expect(savedCache.compactedAt).toBeLessThanOrEqual(afterTime);
+    });
+
+    it('should reset compaction counter after saving cache', async () => {
+      await service.compact();
+
+      expect(mockOpLogStore.resetCompactionCounter).toHaveBeenCalled();
+      expect(mockOpLogStore.saveStateCache).toHaveBeenCalledBefore(
+        mockOpLogStore.resetCompactionCounter,
+      );
+    });
+
+    it('should delete old operations with filter function', async () => {
+      await service.compact();
+
+      expect(mockOpLogStore.deleteOpsWhere).toHaveBeenCalledWith(jasmine.any(Function));
+    });
+
+    it('should not delete unsynced operations', async () => {
+      let capturedFilter: ((entry: OperationLogEntry) => boolean) | undefined;
+      mockOpLogStore.deleteOpsWhere.and.callFake(async (filterFn) => {
+        capturedFilter = filterFn;
+      });
+
+      await service.compact();
+
+      const unsyncedEntry: OperationLogEntry = {
+        seq: 50,
+        op: {} as any,
+        appliedAt: Date.now() - COMPACTION_RETENTION_MS - 1000,
+        source: 'local',
+        syncedAt: undefined, // Not synced
+      };
+
+      expect(capturedFilter!(unsyncedEntry)).toBeFalse();
+    });
+
+    it('should not delete recently applied operations', async () => {
+      let capturedFilter: ((entry: OperationLogEntry) => boolean) | undefined;
+      mockOpLogStore.deleteOpsWhere.and.callFake(async (filterFn) => {
+        capturedFilter = filterFn;
+      });
+
+      await service.compact();
+
+      const recentEntry: OperationLogEntry = {
+        seq: 50,
+        op: {} as any,
+        appliedAt: Date.now() - 1000, // Very recent
+        source: 'remote',
+        syncedAt: Date.now() - 1000,
+      };
+
+      expect(capturedFilter!(recentEntry)).toBeFalse();
+    });
+
+    it('should delete old synced operations', async () => {
+      let capturedFilter: ((entry: OperationLogEntry) => boolean) | undefined;
+      mockOpLogStore.deleteOpsWhere.and.callFake(async (filterFn) => {
+        capturedFilter = filterFn;
+      });
+
+      await service.compact();
+
+      const oldSyncedEntry: OperationLogEntry = {
+        seq: 50,
+        op: {} as any,
+        appliedAt: Date.now() - COMPACTION_RETENTION_MS - 1000, // Old enough
+        source: 'remote',
+        syncedAt: Date.now() - COMPACTION_RETENTION_MS - 500,
+      };
+
+      expect(capturedFilter!(oldSyncedEntry)).toBeTrue();
+    });
+
+    it('should preserve old remote operations with incomplete application status', async () => {
+      let capturedFilter: ((entry: OperationLogEntry) => boolean) | undefined;
+      mockOpLogStore.deleteOpsWhere.and.callFake(async (filterFn) => {
+        capturedFilter = filterFn;
+      });
+
+      await service.compact();
+
+      for (const applicationStatus of ['pending', 'archive_pending', 'failed'] as const) {
+        const quarantinedEntry: OperationLogEntry = {
+          seq: 50,
+          op: {} as any,
+          appliedAt: Date.now() - COMPACTION_RETENTION_MS - 1000,
+          source: 'remote',
+          syncedAt: Date.now() - COMPACTION_RETENTION_MS - 500,
+          applicationStatus,
+        };
+
+        expect(capturedFilter!(quarantinedEntry))
+          .withContext(applicationStatus)
+          .toBeFalse();
+      }
+    });
+
+    it('should delete old rejected operations that were never synced', async () => {
+      let capturedFilter: ((entry: OperationLogEntry) => boolean) | undefined;
+      mockOpLogStore.deleteOpsWhere.and.callFake(async (filterFn) => {
+        capturedFilter = filterFn;
+      });
+
+      await service.compact();
+
+      const rejectedEntry: OperationLogEntry = {
+        seq: 50,
+        op: {} as any,
+        appliedAt: Date.now() - COMPACTION_RETENTION_MS - 1000,
+        source: 'remote',
+        rejectedAt: Date.now() - COMPACTION_RETENTION_MS - 500,
+        applicationStatus: 'pending',
+      };
+
+      expect(capturedFilter!(rejectedEntry)).toBeTrue();
+    });
+
+    it('should skip compaction when reducer-uncommitted remote operations exist', async () => {
+      mockOpLogStore.getPendingRemoteOps.and.resolveTo([
+        {
+          seq: 50,
+          op: {} as any,
+          appliedAt: Date.now(),
+          source: 'remote',
+          syncedAt: Date.now(),
+          applicationStatus: 'pending',
+        },
+      ]);
+
+      await service.compact();
+
+      expect(mockOpLogStore.saveStateCache).not.toHaveBeenCalled();
+      expect(mockOpLogStore.resetCompactionCounter).not.toHaveBeenCalled();
+      expect(mockOpLogStore.deleteOpsWhere).not.toHaveBeenCalled();
+    });
+
+    it('should not delete operations with seq greater than lastSeq', async () => {
+      mockOpLogStore.getLastSeq.and.returnValue(Promise.resolve(100));
+
+      let capturedFilter: ((entry: OperationLogEntry) => boolean) | undefined;
+      mockOpLogStore.deleteOpsWhere.and.callFake(async (filterFn) => {
+        capturedFilter = filterFn;
+      });
+
+      await service.compact();
+
+      const futureSeqEntry: OperationLogEntry = {
+        seq: 101, // Greater than lastSeq
+        op: {} as any,
+        appliedAt: Date.now() - COMPACTION_RETENTION_MS - 1000,
+        source: 'remote',
+        syncedAt: Date.now() - COMPACTION_RETENTION_MS - 500,
+      };
+
+      expect(capturedFilter!(futureSeqEntry)).toBeFalse();
+    });
+
+    it('should skip compaction entirely when state has no meaningful data (#7892)', async () => {
+      // A transient empty/initial NgRx state must never be cached over good data,
+      // and the op-deletion must not run against it (it would prune the very ops
+      // needed to recover).
+      mockStateSnapshot.getStateSnapshot.and.returnValue({} as any);
+
+      await service.compact();
+
+      expect(mockOpLogStore.saveStateCache).not.toHaveBeenCalled();
+      expect(mockOpLogStore.deleteOpsWhere).not.toHaveBeenCalled();
+      expect(mockOpLogStore.resetCompactionCounter).not.toHaveBeenCalled();
+    });
+
+    it('should report when regular compaction is skipped', async () => {
+      mockStateSnapshot.getStateSnapshot.and.returnValue({} as never);
+
+      expect(await service.compact()).toBeFalse();
+    });
+
+    it('should handle empty vector clock', async () => {
+      mockVectorClockService.getCurrentVectorClock.and.returnValue(Promise.resolve({}));
+
+      await service.compact();
+
+      expect(mockOpLogStore.saveStateCache).toHaveBeenCalledWith(
+        jasmine.objectContaining({ vectorClock: {} }),
+      );
+    });
+
+    it('should handle sequence number of 0', async () => {
+      mockOpLogStore.getLastSeq.and.returnValue(Promise.resolve(0));
+
+      await service.compact();
+
+      expect(mockOpLogStore.saveStateCache).toHaveBeenCalledWith(
+        jasmine.objectContaining({ lastAppliedOpSeq: 0 }),
+      );
+    });
+
+    it('should execute all steps within the lock', async () => {
+      const callOrder: string[] = [];
+
+      mockLockService.request.and.callFake(
+        async <T>(_name: string, fn: () => Promise<T>) => {
+          callOrder.push('lock-start');
+          const r = await fn();
+          callOrder.push('lock-end');
+          return r;
+        },
+      );
+
+      mockStateSnapshot.getStateSnapshot.and.callFake((() => {
+        callOrder.push('getState');
+        return mockState;
+      }) as any);
+
+      mockVectorClockService.getCurrentVectorClock.and.callFake(async () => {
+        callOrder.push('getVectorClock');
+        return mockVectorClock;
+      });
+
+      mockOpLogStore.getLastSeq.and.callFake(async () => {
+        callOrder.push('getLastSeq');
+        return 100;
+      });
+
+      mockOpLogStore.saveStateCache.and.callFake(async () => {
+        callOrder.push('saveStateCache');
+      });
+
+      mockOpLogStore.resetCompactionCounter.and.callFake(async () => {
+        callOrder.push('resetCompactionCounter');
+      });
+
+      mockOpLogStore.deleteOpsWhere.and.callFake(async () => {
+        callOrder.push('deleteOpsWhere');
+      });
+
+      await service.compact();
+
+      // The flush pre-pass acquires/releases the lock once on its own; all
+      // compaction steps must happen inside the LAST lock window.
+      const lockStartIndex = callOrder.lastIndexOf('lock-start');
+      const lockEndIndex = callOrder.lastIndexOf('lock-end');
+
+      expect(callOrder.indexOf('getState')).toBeGreaterThan(lockStartIndex);
+      expect(callOrder.indexOf('getState')).toBeLessThan(lockEndIndex);
+      expect(callOrder.indexOf('saveStateCache')).toBeGreaterThan(lockStartIndex);
+      expect(callOrder.indexOf('saveStateCache')).toBeLessThan(lockEndIndex);
+      expect(callOrder.indexOf('deleteOpsWhere')).toBeGreaterThan(lockStartIndex);
+      expect(callOrder.indexOf('deleteOpsWhere')).toBeLessThan(lockEndIndex);
+    });
+
+    it('should propagate errors from saveStateCache', async () => {
+      mockOpLogStore.saveStateCache.and.rejectWith(new Error('IndexedDB write failed'));
+
+      await expectAsync(service.compact()).toBeRejectedWithError(
+        'IndexedDB write failed',
+      );
+    });
+
+    it('should propagate errors from vector clock service', async () => {
+      mockVectorClockService.getCurrentVectorClock.and.rejectWith(
+        new Error('Clock read failed'),
+      );
+
+      await expectAsync(service.compact()).toBeRejectedWithError('Clock read failed');
+    });
+
+    it('should propagate errors from state delegate', async () => {
+      mockStateSnapshot.getStateSnapshot.and.throwError(new Error('State read failed'));
+
+      await expectAsync(service.compact()).toBeRejectedWithError('State read failed');
+    });
+  });
+
+  describe('emergencyCompact', () => {
+    it('should return true on successful compaction', async () => {
+      const result = await service.emergencyCompact();
+      expect(result).toBeTrue();
+    });
+
+    it('should log metrics (including isEmergency: true) for emergency compaction', async () => {
+      await service.emergencyCompact();
+
+      expect(OpLog.normal).toHaveBeenCalledWith(
+        'OperationLogCompactionService: Compaction completed',
+        jasmine.objectContaining({
+          isEmergency: true,
+        }),
+      );
+    });
+
+    it('should return false when compaction fails', async () => {
+      mockOpLogStore.saveStateCache.and.rejectWith(new Error('Storage full'));
+
+      const result = await service.emergencyCompact();
+
+      expect(result).toBeFalse();
+    });
+
+    it('should return false when pending reducer work makes compaction skip', async () => {
+      mockOpLogStore.getPendingRemoteOps.and.resolveTo([
+        {
+          seq: 1,
+          op: {} as never,
+          appliedAt: Date.now(),
+          source: 'remote',
+          applicationStatus: 'pending',
+        },
+      ]);
+
+      expect(await service.emergencyCompact()).toBeFalse();
+    });
+
+    it('should return false when the empty-state safety guard skips compaction', async () => {
+      mockStateSnapshot.getStateSnapshot.and.returnValue({} as never);
+
+      expect(await service.emergencyCompact()).toBeFalse();
+    });
+
+    it('should use shorter retention window than regular compaction', async () => {
+      let capturedFilter: ((entry: OperationLogEntry) => boolean) | undefined;
+      mockOpLogStore.deleteOpsWhere.and.callFake(async (filterFn) => {
+        capturedFilter = filterFn;
+      });
+
+      await service.emergencyCompact();
+
+      // Create an entry that's 2 days old (would be kept by regular compaction,
+      // but deleted by emergency compaction which uses 1-day retention)
+      const twoDaysMs = 2 * MS_PER_DAY;
+      const twoDaysAgo = Date.now() - twoDaysMs;
+      const entry: OperationLogEntry = {
+        seq: 50,
+        op: {} as any,
+        appliedAt: twoDaysAgo,
+        source: 'remote',
+        syncedAt: twoDaysAgo,
+      };
+
+      expect(capturedFilter!(entry)).toBeTrue();
+    });
+
+    it('should still protect unsynced operations during emergency compaction', async () => {
+      let capturedFilter: ((entry: OperationLogEntry) => boolean) | undefined;
+      mockOpLogStore.deleteOpsWhere.and.callFake(async (filterFn) => {
+        capturedFilter = filterFn;
+      });
+
+      await service.emergencyCompact();
+
+      const tenDaysMs = 10 * MS_PER_DAY;
+      const oldUnsyncedEntry: OperationLogEntry = {
+        seq: 50,
+        op: {} as any,
+        appliedAt: Date.now() - tenDaysMs, // 10 days old
+        source: 'local',
+        syncedAt: undefined, // Not synced!
+      };
+
+      expect(capturedFilter!(oldUnsyncedEntry)).toBeFalse();
+    });
+
+    it('should acquire lock during emergency compaction', async () => {
+      await service.emergencyCompact();
+
+      expect(mockLockService.request).toHaveBeenCalledWith(
+        'sp_op_log',
+        jasmine.any(Function),
+      );
+    });
+
+    it('should return false when lock acquisition fails', async () => {
+      mockLockService.request.and.rejectWith(new Error('Lock timeout'));
+
+      const result = await service.emergencyCompact();
+
+      expect(result).toBeFalse();
+    });
+
+    it('should catch and log errors without throwing', async () => {
+      mockOpLogStore.getLastSeq.and.rejectWith(new Error('Database corrupted'));
+
+      // Should not throw, just return false
+      const result = await service.emergencyCompact();
+
+      expect(result).toBeFalse();
+    });
+
+    it('should complete all phases during emergency compaction', async () => {
+      await service.emergencyCompact();
+
+      expect(mockStateSnapshot.getStateSnapshot).toHaveBeenCalled();
+      expect(mockVectorClockService.getCurrentVectorClock).toHaveBeenCalled();
+      expect(mockOpLogStore.getLastSeq).toHaveBeenCalled();
+      expect(mockOpLogStore.saveStateCache).toHaveBeenCalled();
+      expect(mockOpLogStore.resetCompactionCounter).toHaveBeenCalled();
+      expect(mockOpLogStore.deleteOpsWhere).toHaveBeenCalled();
+    });
+  });
+
+  describe('quiesced capture (#8469)', () => {
+    it('compact() should wait for in-flight op writes to drain before capturing', async () => {
+      // An action whose reducer has already run but whose op write is still
+      // queued must end up covered by the saved lastAppliedOpSeq — otherwise
+      // the next boot's tail replay re-applies an op whose effect is already
+      // baked into the cached state (double-applying non-idempotent reducers).
+      captureService.incrementPending(FAKE_PENDING_ACTION);
+      let opWriteDurable = false;
+      mockOpLogStore.getLastSeq.and.callFake(async () => (opWriteDurable ? 101 : 100));
+
+      // Simulate the persist effect completing the queued write while the
+      // compaction's flush pre-pass is polling.
+      setTimeout(() => {
+        opWriteDurable = true;
+        captureService.decrementPending();
+      }, 30);
+
+      const result = await service.compact();
+
+      expect(result).toBeTrue();
+      expect(mockOpLogStore.saveStateCache).toHaveBeenCalledWith(
+        jasmine.objectContaining({ lastAppliedOpSeq: 101 }),
+      );
+    });
+
+    it('compact() should bail without saving when a local write lands mid-capture', async () => {
+      // A dispatch landing during the locked body's awaits (the pending
+      // remote-ops read) would be baked into the captured state while its op
+      // is still unsequenced — the cache would be tagged behind an op it
+      // already contains. The re-check at the state-read cutoff must bail;
+      // compaction re-triggers on the next threshold.
+      mockOpLogStore.getPendingRemoteOps.and.callFake(async () => {
+        captureService.incrementPending(FAKE_PENDING_ACTION);
+        return [];
+      });
+
+      const result = await service.compact();
+
+      expect(result).toBeFalse();
+      expect(mockOpLogStore.saveStateCache).not.toHaveBeenCalled();
+      expect(mockOpLogStore.deleteOpsWhere).not.toHaveBeenCalled();
+    });
+
+    it('compact() should bail without saving when deferred actions are pending durable write', async () => {
+      // Deferred actions (buffered during a sync window, kept across windows
+      // after a failed drain) have their reducer effects in state but no seq
+      // yet and are invisible to the pending counter — capturing would tag
+      // the cache behind their future seqs.
+      bufferDeferredAction(FAKE_PENDING_ACTION);
+      try {
+        const result = await service.compact();
+
+        expect(result).toBeFalse();
+        expect(mockOpLogStore.saveStateCache).not.toHaveBeenCalled();
+        expect(mockOpLogStore.deleteOpsWhere).not.toHaveBeenCalled();
+      } finally {
+        // Module-level buffer persists across TestBed resets — always clean up.
+        clearDeferredActions();
+      }
+    });
+
+    it('emergencyCompact() should skip when writes are pending', async () => {
+      captureService.incrementPending(FAKE_PENDING_ACTION); // never drained
+      bufferDeferredAction(FAKE_PENDING_ACTION);
+      try {
+        const result = await service.emergencyCompact();
+
+        expect(result).toBeFalse();
+        expect(mockOpLogStore.saveStateCache).not.toHaveBeenCalled();
+      } finally {
+        clearDeferredActions();
+      }
+    });
+  });
+
+  // =========================================================================
+  // Phantom-change guards (#8751)
+  // =========================================================================
+  // A persist failure (or a still-buffered deferred action) leaves live NgRx
+  // state containing changes that no durable op represents. Snapshotting the
+  // live store then would bake the phantom change into state_cache — durable
+  // locally with no op to sync = permanent, silent cross-device divergence.
+
+  describe('phantom-change guards (#8751)', () => {
+    const createDeferredAction = (): PersistentAction => ({
+      type: '[Task] Update Task',
+      meta: {
+        isPersistent: true,
+        isRemote: false,
+        opType: OpType.Update,
+        entityType: 'TASK',
+        entityId: 'task-1',
+      },
+    });
+
+    it('should skip compaction after an unrecovered persist failure (persist failure → user keeps working → compaction must not snapshot)', async () => {
+      spyOn(captureService, 'hasUnrecoveredPersistFailure').and.returnValue(true);
+
+      const result = await service.compact();
+
+      expect(result).toBeFalse();
+      expect(mockOpLogStore.saveStateCache).not.toHaveBeenCalled();
+      expect(mockOpLogStore.deleteOpsWhere).not.toHaveBeenCalled();
+      expect(mockOpLogStore.resetCompactionCounter).not.toHaveBeenCalled();
+    });
+
+    it('should skip emergency compaction too after an unrecovered persist failure', async () => {
+      // Quota recovery must not become a back door that bakes the phantom in.
+      spyOn(captureService, 'hasUnrecoveredPersistFailure').and.returnValue(true);
+
+      const result = await service.emergencyCompact();
+
+      expect(result).toBeFalse();
+      expect(mockOpLogStore.saveStateCache).not.toHaveBeenCalled();
+    });
+
+    it('should skip compaction while captured writes are still pending (in-flight write could fail after the snapshot)', async () => {
+      // The sticky flag is a lagging indicator: a write that is pending when
+      // the snapshot is taken and fails afterwards would be baked in before
+      // the flag ever gets set. The pending counter is incremented in the
+      // same reducer pass that applies the state change, so it closes that
+      // window.
+      mockOpLogStore.getPendingRemoteOps.and.callFake(async () => {
+        captureService.incrementPending(FAKE_PENDING_ACTION);
+        return [];
+      });
+
+      const result = await service.compact();
+
+      expect(result).toBeFalse();
+      expect(mockOpLogStore.saveStateCache).not.toHaveBeenCalled();
+      expect(mockOpLogStore.deleteOpsWhere).not.toHaveBeenCalled();
+    });
+
+    it('should compact again once pending writes have settled', async () => {
+      mockOpLogStore.getPendingRemoteOps.and.callFake(async () => {
+        captureService.incrementPending(FAKE_PENDING_ACTION);
+        return [];
+      });
+      expect(await service.compact()).toBeFalse();
+
+      captureService.decrementPending();
+      mockOpLogStore.getPendingRemoteOps.and.resolveTo([]);
+
+      expect(await service.compact()).toBeTrue();
+      expect(mockOpLogStore.saveStateCache).toHaveBeenCalled();
+    });
+
+    it('should still compact when the triggering write decrements the counter on lock release (guard position)', async () => {
+      // Liveness regression. triggerCompaction() fires from INSIDE the write
+      // path, so the triggering action is still counted pending when compact()
+      // is called; it is decremented on a microtask chain once the write
+      // releases the op-log lock.
+      captureService.incrementPending(FAKE_PENDING_ACTION);
+      void Promise.resolve().then(() => captureService.decrementPending());
+
+      const result = await service.compact();
+
+      expect(result).toBeTrue();
+      expect(mockOpLogStore.saveStateCache).toHaveBeenCalled();
+    });
+
+    it('should not even acquire the lock once the sticky failure flag is set (fast-path)', async () => {
+      spyOn(captureService, 'hasUnrecoveredPersistFailure').and.returnValue(true);
+
+      await service.compact();
+
+      expect(mockLockService.request).not.toHaveBeenCalled();
+    });
+
+    it('should skip compaction while deferred actions from a sync window are still buffered', async () => {
+      bufferDeferredAction(createDeferredAction());
+
+      const result = await service.compact();
+
+      expect(result).toBeFalse();
+      expect(mockOpLogStore.saveStateCache).not.toHaveBeenCalled();
+      expect(mockOpLogStore.deleteOpsWhere).not.toHaveBeenCalled();
+    });
+
+    it('should compact again once the deferred buffer has drained', async () => {
+      bufferDeferredAction(createDeferredAction());
+      expect(await service.compact()).toBeFalse();
+
+      clearDeferredActions();
+
+      expect(await service.compact()).toBeTrue();
+      expect(mockOpLogStore.saveStateCache).toHaveBeenCalled();
+    });
+  });
+
+  // =========================================================================
+  // Snapshot entity keys extraction tests
+  // =========================================================================
+  // These tests verify that compaction extracts and stores entity keys from
+  // the state snapshot. This is critical for conflict detection to distinguish
+  // between entities that existed at compaction time vs new entities.
+
+  describe('snapshotEntityKeys extraction', () => {
+    it('should include snapshotEntityKeys in saved state cache', async () => {
+      const stateWithEntities = {
+        task: { ids: ['task-1', 'task-2'], entities: {} },
+        project: { ids: ['proj-1'], entities: {} },
+        tag: { ids: [], entities: {} },
+        note: { ids: ['note-1'], entities: {} },
+        globalConfig: { someConfig: true },
+        planner: { days: [] },
+        reminders: [{ id: 'reminder-1' }],
+      } as any;
+
+      mockStateSnapshot.getStateSnapshot.and.returnValue(stateWithEntities);
+
+      await service.compact();
+
+      const savedCache = mockOpLogStore.saveStateCache.calls.mostRecent().args[0];
+      expect(savedCache.snapshotEntityKeys).toBeDefined();
+      expect(Array.isArray(savedCache.snapshotEntityKeys)).toBeTrue();
+    });
+
+    it('should extract TASK entity keys from state', async () => {
+      const stateWithTasks = {
+        task: { ids: ['task-1', 'task-2', 'task-3'], entities: {} },
+      } as any;
+
+      mockStateSnapshot.getStateSnapshot.and.returnValue(stateWithTasks);
+
+      await service.compact();
+
+      const savedCache = mockOpLogStore.saveStateCache.calls.mostRecent().args[0];
+      expect(savedCache.snapshotEntityKeys).toContain('TASK:task-1');
+      expect(savedCache.snapshotEntityKeys).toContain('TASK:task-2');
+      expect(savedCache.snapshotEntityKeys).toContain('TASK:task-3');
+    });
+
+    it('should extract PROJECT entity keys from state', async () => {
+      const stateWithProjects = {
+        project: { ids: ['proj-a', 'proj-b'], entities: {} },
+      } as any;
+
+      mockStateSnapshot.getStateSnapshot.and.returnValue(stateWithProjects);
+
+      await service.compact();
+
+      const savedCache = mockOpLogStore.saveStateCache.calls.mostRecent().args[0];
+      expect(savedCache.snapshotEntityKeys).toContain('PROJECT:proj-a');
+      expect(savedCache.snapshotEntityKeys).toContain('PROJECT:proj-b');
+    });
+
+    it('should extract TAG entity keys from state', async () => {
+      const stateWithTags = {
+        tag: { ids: ['tag-1'], entities: {} },
+      } as any;
+
+      mockStateSnapshot.getStateSnapshot.and.returnValue(stateWithTags);
+
+      await service.compact();
+
+      const savedCache = mockOpLogStore.saveStateCache.calls.mostRecent().args[0];
+      expect(savedCache.snapshotEntityKeys).toContain('TAG:tag-1');
+    });
+
+    it('should extract REMINDER entity keys from reminders array', async () => {
+      const stateWithReminders = {
+        // Include a task so the empty-state guard (#7892) lets compaction run;
+        // the assertions below target the REMINDER keys specifically.
+        task: { ids: ['t1'], entities: {} },
+        reminders: [{ id: 'rem-1' }, { id: 'rem-2' }],
+      } as any;
+
+      mockStateSnapshot.getStateSnapshot.and.returnValue(stateWithReminders);
+
+      await service.compact();
+
+      const savedCache = mockOpLogStore.saveStateCache.calls.mostRecent().args[0];
+      expect(savedCache.snapshotEntityKeys).toContain('REMINDER:rem-1');
+      expect(savedCache.snapshotEntityKeys).toContain('REMINDER:rem-2');
+    });
+
+    it('should extract singleton entity keys (GLOBAL_CONFIG, PLANNER, etc)', async () => {
+      const stateWithSingletons = {
+        // Include a task so the empty-state guard (#7892) lets compaction run;
+        // the assertions below target the singleton keys.
+        task: { ids: ['t1'], entities: {} },
+        globalConfig: { someConfig: true },
+        planner: { days: [] },
+        menuTree: { items: [] },
+        timeTracking: { entries: {} },
+      } as any;
+
+      mockStateSnapshot.getStateSnapshot.and.returnValue(stateWithSingletons);
+
+      await service.compact();
+
+      const savedCache = mockOpLogStore.saveStateCache.calls.mostRecent().args[0];
+      expect(savedCache.snapshotEntityKeys).toContain('GLOBAL_CONFIG:GLOBAL_CONFIG');
+      expect(savedCache.snapshotEntityKeys).toContain('PLANNER:PLANNER');
+      expect(savedCache.snapshotEntityKeys).toContain('MENU_TREE:MENU_TREE');
+      expect(savedCache.snapshotEntityKeys).toContain('TIME_TRACKING:TIME_TRACKING');
+    });
+
+    it('should extract archived task entity keys', async () => {
+      const stateWithArchive = {
+        // Include a live task so the empty-state guard (#7892) lets compaction
+        // run; the assertions below target the archived TASK keys.
+        task: { ids: ['t1'], entities: {} },
+        archiveYoung: { task: { ids: ['archived-task-1'], entities: {} } },
+        archiveOld: { task: { ids: ['old-archived-task'], entities: {} } },
+      } as any;
+
+      mockStateSnapshot.getStateSnapshot.and.returnValue(stateWithArchive);
+
+      await service.compact();
+
+      const savedCache = mockOpLogStore.saveStateCache.calls.mostRecent().args[0];
+      // Archived tasks should be tracked as TASK entities
+      expect(savedCache.snapshotEntityKeys).toContain('TASK:archived-task-1');
+      expect(savedCache.snapshotEntityKeys).toContain('TASK:old-archived-task');
+    });
+
+    it('should skip empty state instead of caching empty keys (#7892)', async () => {
+      // Previously this saved a snapshot with empty snapshotEntityKeys. The
+      // empty-overwrite guard now skips entirely so a transient empty state can
+      // never replace good cached data.
+      mockStateSnapshot.getStateSnapshot.and.returnValue({} as any);
+
+      await service.compact();
+
+      expect(mockOpLogStore.saveStateCache).not.toHaveBeenCalled();
+    });
+
+    it('should skip a state whose collections are all empty (#7892)', async () => {
+      const stateWithEmptyIds = {
+        task: { ids: [], entities: {} },
+        project: { ids: [], entities: {} },
+        reminders: [],
+      } as any;
+
+      mockStateSnapshot.getStateSnapshot.and.returnValue(stateWithEmptyIds);
+
+      await service.compact();
+
+      expect(mockOpLogStore.saveStateCache).not.toHaveBeenCalled();
+    });
+
+    it('should extract entity keys for ALL models defined in MODEL_CONFIGS', async () => {
+      // 1. Create a complete mock state with one item for every model type
+      const completeState: any = {};
+
+      // Helper to generate mock data for each model type
+      Object.keys(MODEL_CONFIGS).forEach((modelKey) => {
+        const key = modelKey as keyof typeof MODEL_CONFIGS;
+
+        if (key === 'reminders') {
+          completeState[key] = [{ id: 'reminder-1' }];
+        } else if (key === 'boards') {
+          completeState[key] = { boardCfgs: [{ id: 'board-1' }] };
+        } else if (key === 'archiveYoung' || key === 'archiveOld') {
+          completeState[key] = { task: { ids: [`${key}-task-1`], entities: {} } };
+        } else if (
+          key === 'globalConfig' ||
+          key === 'planner' ||
+          key === 'menuTree' ||
+          key === 'timeTracking'
+        ) {
+          completeState[key] = { someData: true }; // Singleton existence check
+        } else if (key === 'pluginUserData') {
+          completeState[key] = [{ id: 'plugin-user-1' }];
+        } else if (key === 'pluginMetadata') {
+          completeState[key] = [{ id: 'plugin-meta-1' }];
+        } else {
+          // Standard entity adapter models (task, project, etc.)
+          completeState[key] = { ids: [`${key}-1`], entities: {} };
+        }
+      });
+
+      mockStateSnapshot.getStateSnapshot.and.returnValue(completeState);
+
+      // 2. Run compaction
+      await service.compact();
+
+      // 3. Verify that we got at least one key for every model type
+      const savedCache = mockOpLogStore.saveStateCache.calls.mostRecent().args[0];
+      const extractedKeys = new Set(savedCache.snapshotEntityKeys);
+
+      // Define expected entity types for each model key
+      const modelToEntityType: Record<string, string> = {
+        task: 'TASK',
+        project: 'PROJECT',
+        tag: 'TAG',
+        note: 'NOTE',
+        issueProvider: 'ISSUE_PROVIDER',
+        simpleCounter: 'SIMPLE_COUNTER',
+        taskRepeatCfg: 'TASK_REPEAT_CFG',
+        metric: 'METRIC',
+        reminders: 'REMINDER',
+        boards: 'BOARD',
+        globalConfig: 'GLOBAL_CONFIG',
+        planner: 'PLANNER',
+        menuTree: 'MENU_TREE',
+        timeTracking: 'TIME_TRACKING',
+        archiveYoung: 'TASK', // Archives map to TASK
+        archiveOld: 'TASK', // Archives map to TASK
+        pluginUserData: 'PLUGIN_USER_DATA',
+        pluginMetadata: 'PLUGIN_METADATA',
+        section: 'SECTION',
+      };
+
+      const missingModels: string[] = [];
+
+      Object.keys(MODEL_CONFIGS).forEach((modelKey) => {
+        const expectedPrefix = modelToEntityType[modelKey];
+        if (!expectedPrefix) {
+          fail(
+            `Test setup error: No expected EntityType defined for model '${modelKey}'`,
+          );
+        }
+
+        const hasKey = Array.from(extractedKeys).some((k) =>
+          k.startsWith(expectedPrefix + ':'),
+        );
+        if (!hasKey) {
+          missingModels.push(modelKey);
+        }
+      });
+
+      if (missingModels.length > 0) {
+        fail(
+          `snapshotEntityKeys extraction is missing support for models: ${missingModels.join(', ')}. \n` +
+            `Update _extractEntityKeysFromState in OperationLogCompactionService to handle these models.`,
+        );
+      }
+    });
+
+    it('should correctly extract keys when state contains only a subset of models (incomplete data)', async () => {
+      // Create state with only Task, Tag, and PluginUserData populated
+      const partialState = {
+        task: { ids: ['t1'], entities: { t1: {} } },
+        tag: { ids: ['tag1'], entities: { tag1: {} } },
+        pluginUserData: [{ id: 'pud1', data: 'xyz' }],
+        // explicit undefined/missing for others
+        project: undefined,
+        note: { ids: [], entities: {} }, // empty but defined
+      } as any;
+
+      mockStateSnapshot.getStateSnapshot.and.returnValue(partialState);
+
+      await service.compact();
+
+      const savedCache = mockOpLogStore.saveStateCache.calls.mostRecent().args[0];
+      const extractedKeys = new Set(savedCache.snapshotEntityKeys);
+
+      // Should contain
+      expect(extractedKeys.has('TASK:t1')).toBeTrue();
+      expect(extractedKeys.has('TAG:tag1')).toBeTrue();
+      expect(extractedKeys.has('PLUGIN_USER_DATA:pud1')).toBeTrue();
+
+      // Should NOT contain
+      const projectKeys = Array.from(extractedKeys).filter((k: string) =>
+        k.startsWith('PROJECT:'),
+      );
+      expect(projectKeys.length).toBe(0);
+
+      const noteKeys = Array.from(extractedKeys).filter((k: string) =>
+        k.startsWith('NOTE:'),
+      );
+      expect(noteKeys.length).toBe(0);
+    });
+  });
+
+  // =========================================================================
+  // Race condition tests
+  // =========================================================================
+  // These tests verify behavior when concurrent operations occur during compaction.
+  // The compaction service uses locks to prevent data corruption, and these tests
+  // verify that the locking mechanism works correctly.
+
+  describe('race conditions', () => {
+    it('should request lock for every compact call', async () => {
+      // This test verifies that every compact() call requests the lock.
+      // The actual serialization happens in the LockService (tested separately in lock.service.spec.ts).
+      const lockRequests: string[] = [];
+
+      mockLockService.request.and.callFake(
+        async <T>(_name: string, fn: () => Promise<T>) => {
+          lockRequests.push('lock-requested');
+          return fn();
+        },
+      );
+
+      // Call compact 3 times sequentially
+      await service.compact();
+      await service.compact();
+      await service.compact();
+
+      // At least one acquisition per compact(); the flush pre-pass (#8469
+      // quiesce) may add more — that's an internal detail, not the contract.
+      expect(lockRequests.length).toBeGreaterThanOrEqual(3);
+    });
+
+    it('should always request lock with correct name', async () => {
+      await service.compact();
+
+      expect(mockLockService.request).toHaveBeenCalledWith(
+        'sp_op_log',
+        jasmine.any(Function),
+      );
+    });
+
+    it('should use lastSeq captured before deleteOpsWhere to protect new ops', async () => {
+      // Simulate a new operation being written after getLastSeq but before deleteOpsWhere
+      let capturedLastSeq: number | undefined;
+      let deleteFilterFn: ((entry: OperationLogEntry) => boolean) | undefined;
+
+      mockOpLogStore.getLastSeq.and.callFake(async () => {
+        capturedLastSeq = 100;
+        return 100;
+      });
+
+      mockOpLogStore.deleteOpsWhere.and.callFake(async (filterFn) => {
+        deleteFilterFn = filterFn;
+      });
+
+      await service.compact();
+
+      // Verify lastSeq was captured
+      expect(capturedLastSeq).toBe(100);
+
+      // Simulate a new operation written after getLastSeq (seq 101)
+      const newOpAfterSnapshot: OperationLogEntry = {
+        seq: 101, // Written after getLastSeq returned 100
+        op: {} as any,
+        appliedAt: Date.now() - COMPACTION_RETENTION_MS - 1000, // Old enough to delete
+        source: 'local',
+        syncedAt: Date.now() - COMPACTION_RETENTION_MS - 500, // Synced
+      };
+
+      // The filter should NOT delete this op because seq > lastSeq
+      expect(deleteFilterFn!(newOpAfterSnapshot)).toBeFalse();
+
+      // But an op with seq <= lastSeq and old enough should be deleted
+      const oldOpBeforeSnapshot: OperationLogEntry = {
+        seq: 99,
+        op: {} as any,
+        appliedAt: Date.now() - COMPACTION_RETENTION_MS - 1000,
+        source: 'remote',
+        syncedAt: Date.now() - COMPACTION_RETENTION_MS - 500,
+      };
+      expect(deleteFilterFn!(oldOpBeforeSnapshot)).toBeTrue();
+    });
+
+    it('should handle concurrent compact and emergencyCompact calls', async () => {
+      const callOrder: string[] = [];
+
+      mockLockService.request.and.callFake(
+        async <T>(_name: string, fn: () => Promise<T>) => {
+          callOrder.push('lock-start');
+          const r = await fn();
+          callOrder.push('lock-end');
+          return r;
+        },
+      );
+
+      // Launch both regular and emergency compaction concurrently
+      const [regularResult, emergencyResult] = await Promise.all([
+        service.compact().then(() => 'regular-done'),
+        service
+          .emergencyCompact()
+          .then((success) => (success ? 'emergency-done' : 'emergency-failed')),
+      ]);
+
+      // Both should complete
+      expect(regularResult).toBe('regular-done');
+      expect(emergencyResult).toBe('emergency-done');
+
+      // Both paths acquire the lock (serialized): regular compact at least
+      // once plus the flush pre-pass (#8469 quiesce), emergency exactly once
+      // (bare lock — pinned separately by the quiesced-capture tests).
+      expect(callOrder.filter((c) => c === 'lock-start').length).toBeGreaterThanOrEqual(
+        2,
+      );
+    });
+
+    it('should not delete operations that arrive during compaction', async () => {
+      // This test verifies the TOCTOU protection:
+      // 1. getLastSeq() returns 100
+      // 2. New op with seq 101 arrives (simulated)
+      // 3. deleteOpsWhere should NOT delete seq 101
+
+      const operationsInStore: OperationLogEntry[] = [
+        {
+          seq: 99,
+          op: { id: 'op-99' } as any,
+          appliedAt: Date.now() - COMPACTION_RETENTION_MS - 2000,
+          source: 'remote',
+          syncedAt: Date.now() - COMPACTION_RETENTION_MS - 1000,
+        },
+        {
+          seq: 100,
+          op: { id: 'op-100' } as any,
+          appliedAt: Date.now() - COMPACTION_RETENTION_MS - 1000,
+          source: 'remote',
+          syncedAt: Date.now() - COMPACTION_RETENTION_MS - 500,
+        },
+        // This op "arrives" during compaction (seq > lastSeq when getLastSeq was called)
+        {
+          seq: 101,
+          op: { id: 'op-101' } as any,
+          appliedAt: Date.now() - COMPACTION_RETENTION_MS - 500,
+          source: 'local',
+          syncedAt: Date.now() - COMPACTION_RETENTION_MS - 100,
+        },
+      ];
+
+      mockOpLogStore.getLastSeq.and.returnValue(Promise.resolve(100));
+
+      const deletedSeqs: number[] = [];
+      mockOpLogStore.deleteOpsWhere.and.callFake(async (filterFn) => {
+        for (const entry of operationsInStore) {
+          if (filterFn(entry)) {
+            deletedSeqs.push(entry.seq);
+          }
+        }
+      });
+
+      await service.compact();
+
+      // seq 99 and 100 should be eligible for deletion (old, synced, seq <= lastSeq)
+      expect(deletedSeqs).toContain(99);
+      expect(deletedSeqs).toContain(100);
+
+      // seq 101 should NOT be deleted (seq > lastSeq at time of check)
+      expect(deletedSeqs).not.toContain(101);
+    });
+
+    it('should complete all steps atomically within the lock', async () => {
+      // Verify that if saveStateCache fails, subsequent steps don't run
+      const callOrder: string[] = [];
+
+      mockLockService.request.and.callFake(
+        async <T>(_name: string, fn: () => Promise<T>) => {
+          callOrder.push('lock-acquired');
+          try {
+            return await fn();
+          } finally {
+            callOrder.push('lock-released');
+          }
+        },
+      );
+
+      mockOpLogStore.saveStateCache.and.callFake(async () => {
+        callOrder.push('saveStateCache');
+        throw new Error('Simulated failure');
+      });
+
+      mockOpLogStore.resetCompactionCounter.and.callFake(async () => {
+        callOrder.push('resetCompactionCounter');
+      });
+
+      mockOpLogStore.deleteOpsWhere.and.callFake(async () => {
+        callOrder.push('deleteOpsWhere');
+      });
+
+      await expectAsync(service.compact()).toBeRejectedWithError('Simulated failure');
+
+      // Lock should have been acquired and released
+      expect(callOrder).toContain('lock-acquired');
+      expect(callOrder).toContain('lock-released');
+
+      // saveStateCache was called
+      expect(callOrder).toContain('saveStateCache');
+
+      // But subsequent steps should NOT have been called
+      expect(callOrder).not.toContain('resetCompactionCounter');
+      expect(callOrder).not.toContain('deleteOpsWhere');
+    });
+  });
+
+  // =========================================================================
+  // Compaction timeout tests
+  // =========================================================================
+  // These tests verify compaction handles timeout scenarios gracefully
+  // to prevent data corruption from lock expiration.
+
+  describe('compaction timeout handling', () => {
+    // NOTE: keep the capture-service pending counter at 0 in these tests —
+    // with the clock frozen by the Date.now spy, the flush pre-pass's poll
+    // loop would never trip its MAX_WAIT_TIME and would spin on real timers
+    // until the jasmine timeout (a confusing hang, not a clean failure).
+    it('should throw error when compaction exceeds timeout', async () => {
+      // Simulate slow pending-remote-ops retrieval that exceeds the 25s
+      // timeout. The jump is keyed off getPendingRemoteOps (the first step
+      // inside the compaction body) rather than a Date.now call count, so the
+      // flush pre-pass (#8469) reading the clock first doesn't skew it.
+      const originalDateNow = Date.now;
+      let timeJumped = false;
+
+      spyOn(Date, 'now').and.callFake(() => (timeJumped ? 26000 : 0));
+      mockOpLogStore.getPendingRemoteOps.and.callFake(async () => {
+        timeJumped = true; // 26 seconds elapse "during" the read
+        return [];
+      });
+
+      mockStateSnapshot.getStateSnapshot.and.returnValue(mockState);
+
+      await expectAsync(service.compact()).toBeRejectedWithError(
+        /Compaction timeout after.*Aborting to prevent lock expiration/,
+      );
+
+      // Restore original Date.now
+      (Date.now as jasmine.Spy).and.callFake(originalDateNow);
+    });
+
+    it('should not throw when compaction completes within timeout', async () => {
+      // Normal operation should complete without timeout
+      mockStateSnapshot.getStateSnapshot.and.returnValue(mockState);
+
+      await expectAsync(service.compact()).toBeResolved();
+    });
+
+    it('should include phase info in timeout error message', async () => {
+      // Same clock-jump keying as above — see the first timeout test.
+      let timeJumped = false;
+
+      spyOn(Date, 'now').and.callFake(() => (timeJumped ? 26000 : 0));
+      mockOpLogStore.getPendingRemoteOps.and.callFake(async () => {
+        timeJumped = true;
+        return [];
+      });
+
+      mockStateSnapshot.getStateSnapshot.and.returnValue(mockState);
+
+      try {
+        await service.compact();
+        fail('Expected error to be thrown');
+      } catch (e: any) {
+        expect(e.message).toContain('during');
+        expect(e.message).toContain('Consider reducing state size');
+      }
+    });
+  });
+
+  describe('compactIfBloated (startup safety net, #8336)', () => {
+    beforeEach(() => {
+      spyOn(service, 'compact').and.resolveTo(true);
+      mockOpLogStore.hasSyncedOps.and.resolveTo(true);
+    });
+
+    it('triggers compaction when the op-log has grown past the threshold', async () => {
+      mockOpLogStore.countOps.and.resolveTo(STARTUP_COMPACTION_OP_THRESHOLD + 1);
+
+      await service.compactIfBloated();
+
+      expect(service.compact).toHaveBeenCalledTimes(1);
+    });
+
+    it('does NOT trigger compaction at or below the threshold', async () => {
+      mockOpLogStore.countOps.and.resolveTo(STARTUP_COMPACTION_OP_THRESHOLD);
+
+      await service.compactIfBloated();
+
+      expect(service.compact).not.toHaveBeenCalled();
+      // The cheap count check must short-circuit before the index probe.
+      expect(mockOpLogStore.hasSyncedOps).not.toHaveBeenCalled();
+    });
+
+    it('does NOT trigger compaction when nothing is prunable (no synced ops)', async () => {
+      // A never-synced log can only grow — compaction prunes synced ops only,
+      // so firing it would pay a full snapshot + scan pass and delete nothing.
+      mockOpLogStore.countOps.and.resolveTo(STARTUP_COMPACTION_OP_THRESHOLD + 1);
+      mockOpLogStore.hasSyncedOps.and.resolveTo(false);
+
+      await service.compactIfBloated();
+
+      expect(service.compact).not.toHaveBeenCalled();
+    });
+
+    it('resolves without throwing if the op-count check fails', async () => {
+      // Self-contained: a failure must never abort the caller's startup path.
+      mockOpLogStore.countOps.and.rejectWith(new Error('count failed'));
+
+      await expectAsync(service.compactIfBloated()).toBeResolved();
+      expect(service.compact).not.toHaveBeenCalled();
+    });
+
+    it('resolves without throwing when the compaction itself fails', async () => {
+      mockOpLogStore.countOps.and.resolveTo(STARTUP_COMPACTION_OP_THRESHOLD + 1);
+      (service.compact as jasmine.Spy).and.rejectWith(new Error('compaction failed'));
+
+      // compact() IS awaited internally, so this genuinely pins the swallow:
+      // without the try/catch this expectation rejects.
+      await expectAsync(service.compactIfBloated()).toBeResolved();
+      expect(service.compact).toHaveBeenCalledTimes(1);
+    });
+  });
+});

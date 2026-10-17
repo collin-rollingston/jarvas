@@ -1,0 +1,61 @@
+@use '../../../../styles/_globals.scss' as *;
+
+:host {
+  position: absolute;
+  width: 100%;
+  height: 100%;
+  top: 0;
+  left: 0;
+
+  task-list ::ng-deep > .task-list-inner {
+    min-height: 50px;
+  }
+
+  // Neutral zone: drop the primary-blue tint. The faint darkening overlay below
+  // (::before) still marks the backlog as a distinct area without a color of its own.
+  background: var(--bg);
+
+  &:before {
+    position: absolute;
+    content: '';
+    background: var(--c-dark-20);
+    width: 100%;
+    top: 0;
+    left: 0;
+    height: 100%;
+    pointer-events: none;
+  }
+
+  &:after {
+    pointer-events: none;
+    position: absolute;
+    content: '';
+    width: 100%;
+    height: 100%;
+    top: 0;
+    left: 0;
+    z-index: var(--z-right-panel);
+    // Flat: a hairline top divider replaces the heavy recessed "well" shadow — the
+    // backlog still reads as a distinct zone via its tint, without deep inset chrome.
+    box-shadow: inset 0 1px 0 var(--separator-color);
+  }
+}
+
+body.isDarkTheme :host {
+  background: var(--bg);
+
+  &:before {
+    background: var(--c-dark-50);
+  }
+}
+
+.wrapper {
+  position: absolute;
+  width: 100%;
+  height: 100%;
+  top: 0;
+  left: 0;
+  padding-top: var(--s5);
+  overflow-x: hidden;
+  @include scrollYImportant();
+}

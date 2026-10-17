@@ -1,0 +1,407 @@
+import { getTaskRepeatInfoText } from './get-task-repeat-info-text.util';
+import {
+  DEFAULT_TASK_REPEAT_CFG,
+  TaskRepeatCfg,
+} from '../../task-repeat-cfg/task-repeat-cfg.model';
+import { T } from '../../../t.const';
+import { TranslateService } from '@ngx-translate/core';
+import { DateTimeFormatService } from '../../../core/date-time-format/date-time-format.service';
+
+const mockTranslateService = {
+  instant: (key: string) => {
+    if (key === T.F.TASK_REPEAT.F.ORD_FIRST_NTH) return 'first';
+    if (key === T.F.TASK_REPEAT.F.ORD_SECOND_NTH) return 'second';
+    if (key === T.F.TASK_REPEAT.F.ORD_THIRD_NTH) return 'third';
+    if (key === T.F.TASK_REPEAT.F.ORD_FOURTH_NTH) return 'fourth';
+    if (key === T.F.TASK_REPEAT.F.ORD_LAST_NTH) return 'last';
+    return key;
+  },
+} as unknown as TranslateService;
+
+describe('getTaskRepeatInfoText()', () => {
+  (
+    [
+      // TODO make case work:
+      // [
+      //   T.F.TASK_REPEAT.ADD_INFO_PANEL.DAILY,
+      //   undefined,
+      //   { ...DEFAULT_TASK_REPEAT_CFG, repeatEvery: 2, repeatCycle: 'DAILY' },
+      // ],
+
+      [
+        T.F.TASK_REPEAT.ADD_INFO_PANEL.DAILY,
+        undefined,
+        {
+          repeatEvery: 1,
+          repeatCycle: 'DAILY',
+          quickSetting: 'DAILY',
+        },
+      ],
+      [
+        T.F.TASK_REPEAT.ADD_INFO_PANEL.DAILY,
+        undefined,
+        {
+          repeatEvery: 1,
+          repeatCycle: 'DAILY',
+          quickSetting: 'CUSTOM',
+        },
+      ],
+      [
+        T.F.TASK_REPEAT.ADD_INFO_PANEL.DAILY_AND_TIME,
+        { timeStr: '10:00 AM' },
+        {
+          repeatEvery: 1,
+          repeatCycle: 'DAILY',
+          quickSetting: 'CUSTOM',
+          startTime: '10:00',
+        },
+      ],
+      [
+        T.F.TASK_REPEAT.ADD_INFO_PANEL.MONDAY_TO_FRIDAY,
+        undefined,
+        {
+          repeatEvery: 1,
+          repeatCycle: 'WEEKLY',
+          quickSetting: 'MONDAY_TO_FRIDAY',
+          monday: true,
+          tuesday: true,
+          wednesday: true,
+          thursday: true,
+          friday: true,
+          saturday: false,
+          sunday: false,
+        },
+      ],
+      [
+        T.F.TASK_REPEAT.ADD_INFO_PANEL.MONDAY_TO_FRIDAY,
+        undefined,
+        {
+          repeatEvery: 1,
+          repeatCycle: 'WEEKLY',
+          quickSetting: 'CUSTOM',
+          monday: true,
+          tuesday: true,
+          wednesday: true,
+          thursday: true,
+          friday: true,
+          saturday: false,
+          sunday: false,
+        },
+      ],
+      [
+        T.F.TASK_REPEAT.ADD_INFO_PANEL.WEEKLY_CURRENT_WEEKDAY,
+        { timeStr: '', weekdayStr: 'Mon' },
+        {
+          repeatEvery: 1,
+          repeatCycle: 'WEEKLY',
+          quickSetting: 'WEEKLY_CURRENT_WEEKDAY',
+          startDate: '2022-02-24',
+          monday: true,
+        },
+      ],
+      [
+        T.F.TASK_REPEAT.ADD_INFO_PANEL.WEEKLY_CURRENT_WEEKDAY,
+        { timeStr: '', weekdayStr: 'Mon' },
+        {
+          repeatEvery: 1,
+          repeatCycle: 'WEEKLY',
+          quickSetting: 'CUSTOM',
+          startDate: '2022-02-24',
+          monday: true,
+        },
+      ],
+      [
+        T.F.TASK_REPEAT.ADD_INFO_PANEL.MONTHLY_CURRENT_DATE,
+        { timeStr: '', dateDayStr: '24' },
+        {
+          repeatEvery: 1,
+          repeatCycle: 'MONTHLY',
+          quickSetting: 'MONTHLY_CURRENT_DATE',
+          startDate: '2022-02-24',
+        },
+      ],
+      [
+        T.F.TASK_REPEAT.ADD_INFO_PANEL.MONTHLY_CURRENT_DATE,
+        { timeStr: '', dateDayStr: '24' },
+        {
+          repeatEvery: 1,
+          repeatCycle: 'MONTHLY',
+          quickSetting: 'CUSTOM',
+          startDate: '2022-02-24',
+        },
+      ],
+      [
+        T.F.TASK_REPEAT.ADD_INFO_PANEL.YEARLY_CURRENT_DATE,
+        { timeStr: '', dayAndMonthStr: '2/24' },
+        {
+          repeatEvery: 1,
+          repeatCycle: 'YEARLY',
+          quickSetting: 'YEARLY_CURRENT_DATE',
+          startDate: '2022-02-24',
+        },
+      ],
+      [
+        T.F.TASK_REPEAT.ADD_INFO_PANEL.YEARLY_CURRENT_DATE,
+        { timeStr: '', dayAndMonthStr: '2/24' },
+        {
+          repeatEvery: 1,
+          repeatCycle: 'YEARLY',
+          quickSetting: 'CUSTOM',
+          startDate: '2022-02-24',
+        },
+      ],
+
+      [
+        T.F.TASK_REPEAT.ADD_INFO_PANEL.EVERY_X_DAILY,
+        { timeStr: '', x: 4 },
+        {
+          repeatEvery: 4,
+          repeatCycle: 'DAILY',
+          quickSetting: 'CUSTOM',
+        },
+      ],
+      [
+        T.F.TASK_REPEAT.ADD_INFO_PANEL.EVERY_X_MONTHLY,
+        { timeStr: '', x: 4 },
+        {
+          repeatEvery: 4,
+          repeatCycle: 'MONTHLY',
+          quickSetting: 'CUSTOM',
+        },
+      ],
+      [
+        T.F.TASK_REPEAT.ADD_INFO_PANEL.MONTHLY_LAST_DAY,
+        { timeStr: '' },
+        {
+          repeatEvery: 1,
+          repeatCycle: 'MONTHLY',
+          quickSetting: 'CUSTOM',
+          monthlyLastDay: true,
+        },
+      ],
+      [
+        T.F.TASK_REPEAT.ADD_INFO_PANEL.MONTHLY_NTH_WEEKDAY,
+        { timeStr: '', ordinalStr: 'first', weekdayStr: 'Saturday' },
+        {
+          repeatEvery: 1,
+          repeatCycle: 'MONTHLY',
+          quickSetting: 'CUSTOM',
+          monthlyWeekOfMonth: 1,
+          monthlyWeekday: 6,
+        },
+      ],
+      [
+        T.F.TASK_REPEAT.ADD_INFO_PANEL.MONTHLY_NTH_WEEKDAY,
+        { timeStr: '', ordinalStr: 'last', weekdayStr: 'Monday' },
+        {
+          repeatEvery: 1,
+          repeatCycle: 'MONTHLY',
+          quickSetting: 'CUSTOM',
+          monthlyWeekOfMonth: -1,
+          monthlyWeekday: 1,
+        },
+      ],
+      [
+        T.F.TASK_REPEAT.ADD_INFO_PANEL.MONTHLY_NTH_WEEKDAY,
+        { timeStr: '', ordinalStr: 'second', weekdayStr: 'Wednesday' },
+        {
+          repeatEvery: 1,
+          repeatCycle: 'MONTHLY',
+          quickSetting: 'CUSTOM',
+          monthlyWeekOfMonth: 2,
+          monthlyWeekday: 3,
+          monthlyLastDay: true,
+        },
+      ],
+      [
+        T.F.TASK_REPEAT.ADD_INFO_PANEL.MONTHLY_CURRENT_DATE,
+        { timeStr: '', dateDayStr: '24' },
+        {
+          repeatEvery: 1,
+          repeatCycle: 'MONTHLY',
+          quickSetting: 'CUSTOM',
+          startDate: '2022-02-24',
+          monthlyWeekOfMonth: 5,
+          monthlyWeekday: 6,
+        },
+      ],
+      [
+        T.F.TASK_REPEAT.ADD_INFO_PANEL.MONTHLY_CURRENT_DATE,
+        { timeStr: '', dateDayStr: '24' },
+        {
+          repeatEvery: 1,
+          repeatCycle: 'MONTHLY',
+          quickSetting: 'CUSTOM',
+          startDate: '2022-02-24',
+          monthlyWeekOfMonth: 1,
+          monthlyWeekday: undefined,
+        },
+      ],
+
+      [
+        T.F.TASK_REPEAT.ADD_INFO_PANEL.CUSTOM_WEEKLY,
+        { daysStr: 'Mo, We, Fr', timeStr: '' },
+        {
+          repeatEvery: 1,
+          repeatCycle: 'WEEKLY',
+          quickSetting: 'CUSTOM',
+          monday: true,
+          wednesday: true,
+          friday: true,
+        },
+      ],
+    ] as [
+      string,
+      { [key: string]: string | number } | undefined,
+      Partial<TaskRepeatCfg>,
+    ][]
+  ).forEach(([translationKey, translateParams = { timeStr: '' }, cfg]) => {
+    it('should get correct label for cfg', () => {
+      expect(
+        getTaskRepeatInfoText(
+          {
+            ...DEFAULT_TASK_REPEAT_CFG,
+            monday: false,
+            tuesday: false,
+            wednesday: false,
+            thursday: false,
+            friday: false,
+            saturday: false,
+            sunday: false,
+            ...cfg,
+            id: 'IDDD',
+          },
+          'en-US',
+          undefined,
+          mockTranslateService,
+        ),
+      ).toEqual([translationKey, translateParams]);
+    });
+  });
+
+  // #8987 follow-up: under the ISO 8601 option the numeric locale is the `sv`
+  // sentinel; spelled-out weekday names must follow the UI language (from
+  // DateTimeFormatService.textLocale), while numeric day/month keep `locale`.
+  describe('ISO 8601 option (sv sentinel) weekday localization', () => {
+    const isoDateTimeFormatService = {
+      textLocale: () => 'en',
+    } as unknown as DateTimeFormatService;
+
+    it('renders the single-weekday name in the UI language, not Swedish', () => {
+      const [, params] = getTaskRepeatInfoText(
+        {
+          ...DEFAULT_TASK_REPEAT_CFG,
+          id: 'IDDD',
+          repeatEvery: 1,
+          repeatCycle: 'WEEKLY',
+          // DEFAULT has Mon–Fri true; zero them so only Monday is enabled and
+          // the single-weekday branch is exercised.
+          monday: true,
+          tuesday: false,
+          wednesday: false,
+          thursday: false,
+          friday: false,
+          saturday: false,
+          sunday: false,
+        },
+        'sv',
+        isoDateTimeFormatService,
+        mockTranslateService,
+      );
+      // English 'Mon', not Swedish 'mån'.
+      expect(params.weekdayStr).toBe('Mon');
+    });
+
+    it('keeps numeric day/month on the configured (sv, day-first) locale', () => {
+      const [, params] = getTaskRepeatInfoText(
+        {
+          ...DEFAULT_TASK_REPEAT_CFG,
+          id: 'IDDD',
+          repeatEvery: 1,
+          repeatCycle: 'YEARLY',
+          startDate: '2022-02-24',
+        },
+        'sv',
+        isoDateTimeFormatService,
+        mockTranslateService,
+      );
+      // sv keeps day-first ordering '24/2' (would be '2/24' under en).
+      expect(params.dayAndMonthStr).toBe('24/2');
+    });
+  });
+
+  describe('invalid startTime (bug #7067)', () => {
+    it('should not throw when startTime is an invalid clock string', () => {
+      expect(() =>
+        getTaskRepeatInfoText(
+          {
+            ...DEFAULT_TASK_REPEAT_CFG,
+            id: 'IDDD',
+            repeatEvery: 1,
+            repeatCycle: 'DAILY',
+            startTime: 'INVALID_CLOCK_STRING',
+          },
+          'en-US',
+          undefined,
+          mockTranslateService,
+        ),
+      ).not.toThrow();
+    });
+
+    it('should fall back to no-time label when startTime is invalid', () => {
+      const [key, params] = getTaskRepeatInfoText(
+        {
+          ...DEFAULT_TASK_REPEAT_CFG,
+          id: 'IDDD',
+          repeatEvery: 1,
+          repeatCycle: 'DAILY',
+          startTime: 'INVALID_CLOCK_STRING',
+        },
+        'en-US',
+        undefined,
+        mockTranslateService,
+      );
+      expect(key).toBe(T.F.TASK_REPEAT.ADD_INFO_PANEL.DAILY);
+      expect(params).toEqual({ timeStr: '' });
+    });
+  });
+});
+
+describe('getTaskRepeatInfoText() with repeatUntilDay (#10091)', () => {
+  const dailyCfg = (repeatUntilDay?: string): TaskRepeatCfg => ({
+    ...DEFAULT_TASK_REPEAT_CFG,
+    id: 'IDDD',
+    repeatEvery: 1,
+    repeatCycle: 'DAILY',
+    quickSetting: 'DAILY',
+    repeatUntilDay,
+  });
+
+  it('keeps the open-ended label when no end day is set', () => {
+    expect(
+      getTaskRepeatInfoText(dailyCfg(), 'en-US', undefined, mockTranslateService),
+    ).toEqual([T.F.TASK_REPEAT.ADD_INFO_PANEL.DAILY, { timeStr: '' }]);
+  });
+
+  it('wraps the label with the formatted end day', () => {
+    const formatDate = jasmine
+      .createSpy('formatDate')
+      .and.callFake((d: Date) => `${d.getMonth() + 1}/${d.getDate()}/${d.getFullYear()}`);
+    const dateTimeFormatService = {
+      textLocale: () => 'en',
+      formatDate,
+    } as unknown as DateTimeFormatService;
+
+    expect(
+      getTaskRepeatInfoText(
+        dailyCfg('2026-03-05'),
+        'en-US',
+        dateTimeFormatService,
+        mockTranslateService,
+      ),
+    ).toEqual([
+      T.F.TASK_REPEAT.ADD_INFO_PANEL.UNTIL,
+      { repeatStr: T.F.TASK_REPEAT.ADD_INFO_PANEL.DAILY, untilStr: '3/5/2026' },
+    ]);
+  });
+});

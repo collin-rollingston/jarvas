@@ -1,0 +1,341 @@
+# Styling Guide
+
+## Rules
+
+- **All visual styling must use CSS variables** from `src/styles/_css-variables.scss` — never hardcode colors, spacing, shadows, transitions, or z-index.
+- **Positioning/layout is fine as plain CSS** — flexbox, grid, display, position, dimensions.
+- **Check `src/app/ui/` first** before creating new styled elements — 40+ reusable components exist.
+- **Component SCSS should be minimal** — shared styles belong in `src/styles/components/` or as a mixin.
+- **Material overlay components** (menus, dialogs, tooltips) render outside component scope — style them in `src/styles/components/` and add a comment in the component pointing there.
+- **Only reference custom properties that can reach the rule** — a `var(--x)` whose `--x` is undeclared, or declared only inside some component's `:host`, silently voids the whole declaration. Enforced across SCSS, theme CSS and inline `styles:`/`[ngStyle]` by `npm run lint:css-vars` (`tools/check-css-vars.js`), which explains the fix when it fails.
+
+## Anti-Patterns
+
+| Avoid                                | Do Instead                                                                |
+| ------------------------------------ | ------------------------------------------------------------------------- |
+| Hardcoded colors (`#fff`, `red`)     | CSS variables (`--text-color`, `--card-bg`, `--color-danger`)             |
+| Hardcoded spacing (`16px`, `1rem`)   | Spacing variables (`--s2`, `--s`, `--s-half`)                             |
+| Hardcoded shadows                    | Elevation variables (`--whiteframe-shadow-*dp`, `--md-sys-level*`)        |
+| Hardcoded transitions/durations      | Transition variables (`--transition-standard`, `--transition-duration-*`) |
+| Custom z-index values                | Z-index variables (`--z-main-header`, `--z-backdrop`, etc.)               |
+| New styled elements without checking | Check `src/app/ui/` for existing reusable components first                |
+
+## Dialog action buttons
+
+One treatment per role so dialogs feel consistent. Classify by **function, not label** ("Close" that dismisses a read-only view is secondary; "Close" that commits is primary).
+
+| Role                             | Treatment                         | Notes                                                            |
+| -------------------------------- | --------------------------------- | ---------------------------------------------------------------- |
+| Primary / confirming             | `mat-flat-button color="primary"` | Save, OK, Submit, Create, Schedule — the main affirmative action |
+| Cancel / dismiss / secondary     | `mat-button` (no `color`)         | De-emphasized text button                                        |
+| Destructive                      | `color="warn"` (keep the variant) | Delete, Remove, Unschedule — never folded into primary           |
+| Genuine alternative (not cancel) | `mat-stroked-button`              | e.g. "Skip instance", "Configure" next to a primary action       |
+
+Rules:
+
+- **Icons:** drop generic `check`/`close` icons on OK/Cancel/Save/Submit — they add nothing. Keep icons that carry meaning (`alarm`/`today`/`event_busy` in scheduling, `wb_sunny`, `save`, `cloud_upload`, `delete_forever`).
+- **No `color` on cancel/close** — leftover `color="primary"` on a Cancel just tints it; remove it.
+- **Reactive appearance** — when a button's appearance must change at runtime, bind it on a single element (`[matButton]="cond ? 'filled' : 'outlined'"`) instead of swapping two buttons in an `@if`/`@else`. The attribute form is fixed at construction, and the swap re-creates the node, dropping focus and any click that lands mid-flip. See `finish-day-btn.component.html`.
+- **No dead classes** — the legacy Bootstrap `btn btn-primary` classes are gone; don't reintroduce them. `submit-button` is only styled inside `dialog-create-tag`.
+- **Symmetric choice dialogs** (e.g. sync "use remote" vs "use local") may use two matched `mat-stroked-button`s — there is no single primary.
+
+## Callouts (info / warning / danger / success)
+
+Tinted message boxes inside dialogs and config panes use the global `.callout`
+class from `src/styles/components/_callout.scss` — never a local `.warning-box`
+clone with its own `rgba(255, 152, 0, …)`, which is invisible to the 15 themes.
+
+```html
+<div class="callout callout--warning">
+  <mat-icon aria-hidden="true">warning</mat-icon>
+  <p>If you lose this password your synced data cannot be recovered.</p>
+</div>
+```
+
+| Modifier          | Tone token        | Use for                                   |
+| ----------------- | ----------------- | ----------------------------------------- |
+| _(none)_/`--info` | `--c-primary`     | Neutral context, "what will happen" notes |
+| `--success`       | `--color-success` | Confirmation, savings, "nothing to do"    |
+| `--warning`       | `--color-warning` | Irreversible-but-intended actions         |
+| `--danger`        | `--color-danger`  | Destructive actions, failures             |
+
+One tone token (`--callout-c`) drives icon color, border and fill, the latter two
+via `color-mix()` — so every tone is theme-aware and a new tone is one
+declaration. Outer spacing stays with the consumer
+(`.callout { margin-bottom: var(--s2); }` in the dialog's own SCSS), the
+primitive owns no margin.
+
+The icon is optional, but the copy must be a single child element — one `<p>`, or
+a `<div>` wrapping several. `.callout` is a flex row, so putting the class on a
+`<p>` and leaving the text bare turns every inline child into its own flex item:
+`<strong>Note:</strong> …` renders as two columns with a gap and a hanging indent
+on the wrap.
+
+Sibling: `.info-panel` (`_info-panel.scss`) is the same idea for
+formly-generated markup, where no icon element can be added and the glyph has to
+come from a `::before`.
+
+## Typography Scale
+
+| Variable         | Value | Variable          | Value |
+| ---------------- | ----- | ----------------- | ----- |
+| `--font-size-xs` | 11px  | `--font-size-xl`  | 18px  |
+| `--font-size-sm` | 12px  | `--font-size-2xl` | 22px  |
+| `--font-size-md` | 14px  | `--font-size-3xl` | 28px  |
+| `--font-size-lg` | 16px  |                   |       |
+
+Text sizes go through the scale; snap an off-scale value to the nearest step.
+Companion tokens: `--font-weight-medium/-semibold/-bold`,
+`--line-height-tight/-snug/-normal`, `--font-mono-stack`.
+
+Two deliberate exceptions — leave these as plain px/em:
+
+- **Material icon glyph sizes** written as a matched set — `font-size`, `width` and `height` all 20px. The glyph must equal its box or it decenters, and the scale has no 20/24px step. See `main-header.component.scss` and the `.tab-icon` rules in `config-page.component.scss`.
+- **Deliberately proportional `em`** sizes that track their parent
+  (`font-size: 1em` on an inline icon).
+
+## Key Files
+
+| File                             | Purpose                                                       |
+| -------------------------------- | ------------------------------------------------------------- |
+| `src/styles/_css-variables.scss` | All CSS custom properties (design tokens)                     |
+| `src/styles/themes.scss`         | Material theme setup + utility classes                        |
+| `src/styles/page.scss`           | Global page/body styles                                       |
+| `src/styles/util.scss`           | Utility classes                                               |
+| `src/styles/components/`         | Global component styles (Material overrides, shared patterns) |
+| `src/styles/mixins/`             | Reusable SCSS mixins                                          |
+| `src/app/ui/`                    | 40+ reusable Angular UI components                            |
+
+## Spacing Variables (8px Grid)
+
+| Variable      | Value | Variable | Value |
+| ------------- | ----- | -------- | ----- |
+| `--s-quarter` | 2px   | `--s4`   | 32px  |
+| `--s-half`    | 4px   | `--s5`   | 40px  |
+| `--s`         | 8px   | `--s6`   | 48px  |
+| `--s2`        | 16px  | `--s7`   | 56px  |
+| `--s3`        | 24px  | `--s8`   | 64px  |
+
+```scss
+// ✅ Good
+padding: var(--s2) var(--s3);
+gap: var(--s-half);
+
+// ❌ Bad
+padding: 16px 24px;
+gap: 4px;
+```
+
+## Color Variables
+
+| Use case           | Variables                                                                                          |
+| ------------------ | -------------------------------------------------------------------------------------------------- |
+| Text               | `--text-color`, `--text-color-muted`, `--text-color-most-intense`                                  |
+| Backgrounds        | `--bg`, `--card-bg`, `--task-c-bg`, `--sub-task-c-bg`                                              |
+| Semantic           | `--color-success` (#4caf50), `--color-warning` (#ff9800), `--color-danger` (#f44336)               |
+| Material palette   | `--palette-primary-500`, `--palette-accent-500`, `--palette-warn-500` (100–900)                    |
+| Overlays           | `--c-dark-10` through `--c-dark-90`, `--c-light-05` through `--c-light-90`                         |
+| Alpha coefficients | `--border-alpha` (0.12), `--overlay-alpha` (0.1), `--muted-alpha` (0.6), `--separator-alpha` (0.3) |
+
+### Theme-Specific Values
+
+Light theme sets: `--bg: #f8f8f7`, `--card-bg: #ffffff`, `--text-color: rgb(44, 44, 44)`
+Dark theme sets: `--bg: #131314`, `--card-bg: var(--dark3)`, `--text-color: rgb(230, 230, 230)`
+
+Dark elevation colors: `--dark0` (rgb(0,0,0)) through `--dark24` (rgb(56,56,56))
+
+### Theme-Specific Overrides in Components
+
+```scss
+@include darkTheme() {
+  /* dark-only styles */
+}
+@include lightTheme() {
+  /* light-only styles */
+}
+```
+
+Mixins are in `src/styles/mixins/_theming.scss`.
+
+## Task rows (flat vs boxed)
+
+Tasks, planner and board rows, and issue-panel items are flat, hairline-separated
+rows by default. The boxed look lives in the `classic` theme and is token-only, so
+every switch must stay token-driven — never hardcode a border or surface on a row:
+
+| Token                  | Default                            | Classic                              |
+| ---------------------- | ---------------------------------- | ------------------------------------ |
+| `--task-border`        | `none`                             | `1px solid var(--task-border-color)` |
+| `--task-separator`     | `1px solid var(--separator-color)` | `none`                               |
+| `--task-row-edge`      | `var(--task-separator)`            | `var(--task-border)`                 |
+| `--task-border-radius` | `0`                                | `var(--radius-sm)`                   |
+| `--task-list-row-gap`  | `0`                                | `var(--s-half)`                      |
+| `--task-c-bg` & co     | `transparent`                      | surfaces                             |
+
+Rows that draw their own box (planner, board and issue-panel items) take their
+top/bottom edge from `--task-row-edge`, so the separator and the box border never
+cancel each other out on one element. Bare `task` hosts use `--task-separator`.
+
+Chrome around task lists — section headings (`collapsible.task-section`), board panel
+titles, the collapsed "+ n completed subtasks" label — is typed one level below the
+content it frames: `--font-size-sm`, `--font-weight-semibold` (regular for inline
+labels), `--letter-spacing-wide`, `--text-color-muted`. Task text stays at the 14px
+base, so the two never read alike. No `text-transform: uppercase` — these labels are
+often long and user-authored, where caps only add width. Meta counts follow the same
+label style and are omitted entirely when zero rather than shown as `-` or `0`.
+
+Task multi-selection is a `--task-c-multi-selected-bg` tint plus a 1px
+`--palette-primary-400` outline; keyboard focus is a `--focus-ring-width` (2px) outline
+in the same color and no tint. The tint is what separates them — a 1px vs 2px line in
+one color is not readable as two states — but it is the weaker channel, so the outline
+stays: `background` on a task row is contested (the `isCurrent` chain and the
+`isSelected` `!important` rule win over it, and several bundled themes force it with
+`!important`), and author backgrounds are dropped in forced-colors mode while outlines
+survive. Never make a row state depend on `background` alone. The task open in the
+detail panel uses the neutral `--task-c-selected-bg`.
+
+Focus rings on rows and other focusable containers (anything carrying a `tabindex`,
+as opposed to a button or control — those keep the `.focus-ring` utility from the Focus
+Ring section below) pair `:host-context(.isMousePrimary):focus` with `:focus-visible`.
+Never a bare `:focus`: rows carry `tabindex="0"`, so a tap focuses them and the ring
+then stays on the tapped row for the rest of the session. The two halves split the
+work — the mouse-intent one covers clicks plus the scripted navigation and focus
+restoration that follow them, and `:focus-visible` covers keyboards, including on a
+touch device, where only a pen otherwise sets mouse intent. `.isNoTouchOnly` is not a
+usable guard here: it only excludes pure touch devices, so iPads and touchscreen
+laptops (`hybrid` for detect-it) still get the stuck ring.
+
+Known edge of the mouse-intent half: on a hybrid device, a row that was tapped and left
+focused picks up its ring once the user moves the mouse and intent flips back. Dropping
+to `:focus-visible` alone removes that, at the cost of no ring on plain mouse clicks —
+the ring on click is the deliberate choice here. Where a cue must show regardless of
+input, use a class instead (see `highlight-searched-task`).
+
+## Shadows & Elevation
+
+- `--whiteframe-shadow-1dp` through `--whiteframe-shadow-24dp` — classic Material shadows
+- `--md-sys-level1` through `--md-sys-level5` — Material Design 3 style
+
+## Transitions & Animations
+
+| Type       | Variables                                                                                                          |
+| ---------- | ------------------------------------------------------------------------------------------------------------------ |
+| Shorthands | `--transition-fast`, `--transition-standard`, `--transition-enter`, `--transition-leave`                           |
+| Durations  | `--transition-duration-xs` (90ms), `-s` (150ms), `-m` (225ms), `-l` (375ms)                                        |
+| Additional | `--transition-duration-enter` (225ms), `--transition-duration-leave` (195ms), `--page-transition-duration` (225ms) |
+| Timing     | `--ani-standard-timing`, `--ani-enter-timing`, `--ani-leave-timing`, `--ani-sharp-timing`                          |
+
+When migrating hardcoded durations, pick the nearest bucket — up to ~15% drift is acceptable for UI transitions.
+
+## Focus Ring
+
+Keyboard-accessibility tokens for custom interactive elements. Material components keep their own focus treatment; use these for non-Material buttons, cards, and custom controls.
+
+| Variable              | Value               |
+| --------------------- | ------------------- |
+| `--focus-ring-width`  | 2px                 |
+| `--focus-ring-offset` | 2px                 |
+| `--focus-ring`        | `var(--brand)`      |
+| `--focus-ring-color`  | `var(--focus-ring)` |
+
+Themes should override the public `--focus-ring` primitive on `body` / `body.isDarkTheme`. `--focus-ring-color` is the compatibility alias consumed by existing components.
+
+Quickest adoption — add the `.focus-ring` utility class from `util.scss`, which applies an `outline` on `:focus-visible` only (so it doesn't fire on mouse clicks).
+
+```scss
+// opt-in per-element
+.my-button:focus-visible {
+  outline: var(--focus-ring-width) solid var(--focus-ring-color);
+  outline-offset: var(--focus-ring-offset);
+}
+```
+
+## Z-Index Layers
+
+| Variable                | Value | Purpose                  |
+| ----------------------- | ----- | ------------------------ |
+| `--z-check-done`        | 11    | Task done checkbox       |
+| `--z-main-header`       | 12    | Main header              |
+| `--z-task-title-focus`  | 32    | Focused task title       |
+| `--z-multi-select-bar`  | 45    | Multi-select action bar  |
+| `--z-mobile-bottom-nav` | 50    | Mobile bottom navigation |
+| `--z-side-nav`          | 60    | Side navigation          |
+| `--z-backdrop`          | 222   | Backdrop overlay         |
+| `--z-add-task-bar`      | 999   | Add task bar             |
+| `--z-search-bar`        | 999   | Search bar               |
+| `--z-tour`              | 1001  | Tour overlay             |
+| `--z-onboarding-hint`   | 1100  | First-run hints          |
+
+## Layout Variables
+
+| Variable                | Value | Notes              |
+| ----------------------- | ----- | ------------------ |
+| `--component-max-width` | 800px | 900–1000px on iPad |
+| `--side-nav-width`      | 200px |                    |
+| `--side-nav-width-l`    | 400px |                    |
+| `--bar-height-large`    | 56px  |                    |
+| `--bar-height`          | 48px  |                    |
+| `--bar-height-small`    | 40px  |                    |
+
+## Responsive Breakpoints
+
+Available as CSS vars (`--layout-xxxs` through `--layout-xl`) and as SCSS variables and mixins in `src/styles/mixins/_media-queries.scss`:
+
+| Breakpoint | Value  |
+| ---------- | ------ |
+| `xxxs`     | 398px  |
+| `xxs`      | 440px  |
+| `xs`       | 600px  |
+| `sm`       | 960px  |
+| `md`       | 1280px |
+| `lg`       | 1920px |
+| `xl`       | 2000px |
+
+## Utility Classes
+
+Defined in `src/styles/util.scss` and `src/styles/themes.scss`:
+
+- Layout: `.center-wrapper`, `.mw` (max-width container)
+- Responsive: `.hide-xs`, `.hide-xxs`, `.hide-gt-sm`
+- Input: `.show-only-on-touch-primary`, `.show-only-on-mouse-primary`
+- Theme: `.show-dark-only`, `.show-light-only`
+- Color: `.bg-primary`, `.bgc-accent`, `.color-primary`, `.bg-success`, `.bg-warning`, `.bg-danger`
+- Effects: `.milk-glass` (backdrop blur)
+
+## Authoring Themes
+
+Theme files live in `src/assets/themes/*.css` and are loaded at runtime.
+
+### Side nav: never apply CB-creating properties to the `magic-side-nav` host
+
+The mobile drawer (`.nav-sidenav`) and its overlay (`.nav-backdrop-mobile`) are `position: fixed` children of the `magic-side-nav` host. On mobile the host shrinks to `width: 0` (`hostWidthSignal` in `magic-side-nav.component.ts`).
+
+Any property that establishes a [new containing block for fixed-position descendants](https://developer.mozilla.org/en-US/docs/Web/CSS/Containing_block#identifying_the_containing_block) — `backdrop-filter`, `filter`, `transform`, `perspective`, `contain: paint|layout|strict`, or a matching `will-change` — re-anchors the drawer and backdrop to the 0-wide host. The drawer never appears when the user taps the menu.
+
+Apply glass/blur/tint to the inner `.nav-sidenav` instead:
+
+```css
+/* ❌ Bad — collapses the mobile drawer */
+body.isDarkTheme magic-side-nav {
+  background: var(--my-pane);
+  backdrop-filter: blur(32px);
+}
+
+/* ✅ Good — host stays visually inert */
+body.isDarkTheme magic-side-nav .nav-sidenav {
+  background: var(--my-pane);
+  backdrop-filter: blur(32px);
+}
+```
+
+Properties that do NOT create a containing block — `background`, `border`, `box-shadow`, `margin` — are safe on the host. See `velvet.css` and `liquid-glass.css` for full reference patterns.
+
+## Global Component Styles
+
+Located in `src/styles/components/`, these are needed for elements that render outside component scope:
+
+- `_overwrite-material.scss` — Material component customizations
+- `_customizer-menu.scss`, `backdrop.scss`, `bottom-panel.scss`
+- `markdown.scss`, `mentions.scss`, `table.scss`
+- `fab-wrapper.scss`, `wrap-buttons.scss`, `multi-btn-wrapper.scss`
+- `planner-shared.scss`, `formly-rows.scss`, `scrollbars.scss`

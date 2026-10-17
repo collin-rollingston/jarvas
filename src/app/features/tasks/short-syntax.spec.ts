@@ -1,0 +1,3748 @@
+import { TaskCopy } from './task.model';
+import {
+  shortSyntax,
+  parseTimeSpentChanges,
+  ShortSyntaxRange,
+  ShortSyntaxTokenType,
+} from './short-syntax';
+import { getDbDateStr } from '../../util/get-db-date-str';
+import {
+  MONTH_SHORT_NAMES,
+  oneDayInMilliseconds,
+} from '../../util/month-time-conversion';
+import { Tag } from '../tag/tag.model';
+import { DEFAULT_TAG } from '../tag/tag.const';
+import { Project } from '../project/project.model';
+import { DEFAULT_GLOBAL_CONFIG } from '../config/default-global-config.const';
+import { INBOX_PROJECT } from '../project/project.const';
+import { RepeatQuickSetting } from '../task-repeat-cfg/task-repeat-cfg.model';
+import { findSpringForwardSunday } from './dst.test-helper';
+
+const TASK: TaskCopy = {
+  id: 'id',
+  projectId: INBOX_PROJECT.id,
+  subTaskIds: [],
+  timeSpentOnDay: {},
+  timeSpent: 0,
+  timeEstimate: 0,
+  isDone: false,
+  doneOn: undefined,
+  title: '',
+  notes: '',
+  tagIds: [],
+  parentId: undefined,
+  created: Date.now(),
+  repeatCfgId: undefined,
+  dueWithTime: undefined,
+
+  attachments: [],
+
+  issueId: undefined,
+  issueProviderId: undefined,
+  issuePoints: undefined,
+  issueType: undefined,
+  issueAttachmentNr: undefined,
+  issueLastUpdated: undefined,
+  issueWasUpdated: undefined,
+  issueTimeTracked: undefined,
+};
+const ALL_TAGS: Tag[] = [
+  { ...DEFAULT_TAG, id: 'blu_id', title: 'blu' },
+  { ...DEFAULT_TAG, id: 'bla_id', title: 'bla' },
+  { ...DEFAULT_TAG, id: 'hihi_id', title: 'hihi' },
+  { ...DEFAULT_TAG, id: '1_id', title: '1' },
+  { ...DEFAULT_TAG, id: 'A_id', title: 'A' },
+  { ...DEFAULT_TAG, id: 'multi_word_id', title: 'Multi Word Tag' },
+];
+const CONFIG = DEFAULT_GLOBAL_CONFIG.shortSyntax;
+const DEADLINE_CONFIG = { ...CONFIG, isEnableDeadline: true };
+
+// Builds the expected parsedRanges for inputs where each consumed substring
+// occurs unambiguously; cases exercising ambiguous inputs (token text also
+// present inside a tag/URL/word) assert literal positions instead.
+const expectedRanges = (
+  title: string,
+  tokens: [type: ShortSyntaxTokenType, text: string][],
+): ShortSyntaxRange[] => {
+  const ranges: ShortSyntaxRange[] = [];
+  for (const [type, text] of tokens) {
+    let start = title.indexOf(text);
+    while (
+      start !== -1 &&
+      ranges.some((r) => start < r.end && start + text.length > r.start)
+    ) {
+      start = title.indexOf(text, start + 1);
+    }
+    if (start === -1) {
+      throw new Error(`spec error: '${text}' not found in '${title}'`);
+    }
+    ranges.push({ type, start, end: start + text.length });
+  }
+  return ranges.sort((a, b) => a.start - b.start);
+};
+
+const getPlannedDateTimestampFromShortSyntaxReturnValue = async (
+  taskInput: TaskCopy,
+  now: Date = new Date(),
+): Promise<number> => {
+  const r = await shortSyntax(taskInput, CONFIG, undefined, undefined, now);
+  const parsedDateInMilliseconds = r?.taskChanges?.dueWithTime as number;
+  return parsedDateInMilliseconds;
+};
+
+const checkSameDay = (date1: Date, date2: Date): boolean => {
+  expect(date1.getFullYear()).toBe(date2.getFullYear());
+  expect(date1.getMonth()).toBe(date2.getMonth());
+  expect(date1.getDate()).toBe(date2.getDate());
+
+  return (
+    date1.getFullYear() === date2.getFullYear() &&
+    date1.getMonth() === date2.getMonth() &&
+    date1.getDate() === date2.getDate()
+  );
+};
+
+const checkIfDateHasCorrectTime = (date: Date, hour: number, minute: number): boolean => {
+  expect(date.getHours()).toBe(hour);
+  expect(date.getMinutes()).toBe(minute);
+  return date.getHours() === hour && date.getMinutes() === minute;
+};
+
+const formatDateToISO = (dateObj: Date): string => {
+  const year = dateObj.getFullYear();
+  const month = dateObj.getMonth() + 1;
+  const monthString = month < 10 ? `0${month}` : `${month}`;
+  const date = dateObj.getDate();
+  const dateString = date < 10 ? `0${date}` : `${date}`;
+  return `${year}-${monthString}-${dateString}`;
+};
+
+const dayToNumberMap = {
+  sunday: 0,
+  monday: 1,
+  tuesday: 2,
+  wednesday: 3,
+  thursday: 4,
+  friday: 5,
+  saturday: 6,
+};
+
+const checkIfCorrectDateAndTime = (
+  timestamp: number,
+  day: string,
+  hour: number,
+  minute: number,
+): boolean => {
+  const date = new Date(timestamp);
+  const isDayCorrect = date.getDay() === dayToNumberMap[day.toLowerCase()];
+  const isHourCorrect = date.getHours() === hour;
+  const isMinuteCorrect = date.getMinutes() === minute;
+  return isDayCorrect && isHourCorrect && isMinuteCorrect;
+};
+
+const checkIfCorrectDateMonthAndYear = (
+  timestamp: number,
+  givenDate: number,
+  givenMonth: number,
+  givenYear: number,
+  hour?: number,
+  minute?: number,
+): boolean => {
+  const date = new Date(timestamp);
+  const correctDateMonthYear =
+    date.getDate() === givenDate &&
+    date.getMonth() + 1 === givenMonth &&
+    date.getFullYear() === givenYear;
+  if (!hour) {
+    return correctDateMonthYear;
+  }
+  if (!minute) {
+    return correctDateMonthYear && date.getHours() === hour;
+  }
+  return correctDateMonthYear && date.getHours() === hour && date.getMinutes() === minute;
+};
+
+describe('shortSyntax', () => {
+  it('should ignore for no short syntax', async () => {
+    const r = await shortSyntax(TASK, CONFIG);
+    expect(r).toEqual(undefined);
+  });
+
+  it('should ignore if the changes cause no further changes', async () => {
+    const r = await shortSyntax(
+      {
+        ...TASK,
+        title: 'So what shall I do',
+      },
+      CONFIG,
+    );
+    expect(r).toEqual(undefined);
+  });
+
+  describe('should work for time short syntax', () => {
+    it('', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title 10m/1h',
+      };
+      const r = await shortSyntax(t, CONFIG);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['estimate', '10m/1h']]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: 'Fun title',
+          // timeSpent: 7200000,
+          timeSpentOnDay: {
+            [getDbDateStr()]: 600000,
+          },
+          timeEstimate: 3600000,
+        },
+      });
+    });
+
+    it('', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title whatever 1h/120m',
+      };
+      const r = await shortSyntax(t, CONFIG);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['estimate', '1h/120m']]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: 'Fun title whatever',
+          // timeSpent: 7200000,
+          timeSpentOnDay: {
+            [getDbDateStr()]: 3600000,
+          },
+          timeEstimate: 7200000,
+        },
+      });
+    });
+
+    it('', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title whatever 1.5h',
+      };
+      const r = await shortSyntax(t, CONFIG);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['estimate', '1.5h']]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: 'Fun title whatever',
+          timeEstimate: 5400000,
+        },
+      });
+    });
+
+    it('', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title whatever 1.5h/2.5h',
+      };
+      const r = await shortSyntax(t, CONFIG);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['estimate', '1.5h/2.5h']]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: 'Fun title whatever',
+          // timeSpent: 7200000,
+          timeSpentOnDay: {
+            [getDbDateStr()]: 5400000,
+          },
+          timeEstimate: 9000000,
+        },
+      });
+    });
+
+    it('should ignore time short syntax when disabled', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title whatever 1h/120m',
+      };
+      const r = await shortSyntax(t, { ...CONFIG, isEnableDue: false });
+      expect(r).toEqual(undefined);
+    });
+
+    it('with time spent only', async () => {
+      const t = {
+        ...TASK,
+        title: 'Task description 30m/',
+      };
+      const r = await shortSyntax(t, CONFIG);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['estimate', '30m/']]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: 'Task description',
+          timeSpentOnDay: {
+            [getDbDateStr()]: 1800000,
+          },
+        },
+      });
+    });
+  });
+
+  describe('should recognize short syntax for date', () => {
+    it('should correctly parse schedule syntax with time only', async () => {
+      const t = {
+        ...TASK,
+        title: 'Test @4pm',
+      };
+      // Use fixed date at 10am to avoid race conditions with real system time
+      // and ensure we're safely before 4pm for same-day scheduling
+      const now = new Date(2024, 0, 15, 10, 0, 0, 0); // Jan 15, 2024 at 10:00 AM
+      const parsedDateInMilliseconds =
+        await getPlannedDateTimestampFromShortSyntaxReturnValue(t, now);
+      const parsedDate = new Date(parsedDateInMilliseconds);
+      const isSetToSameDay = checkSameDay(parsedDate, now);
+      expect(isSetToSameDay).toBeTrue();
+      const isTimeSetCorrectly = checkIfDateHasCorrectTime(parsedDate, 16, 0);
+      expect(isTimeSetCorrectly).toBeTrue();
+    });
+
+    it('should ignore schedule syntax with time only when disabled', async () => {
+      const t = {
+        ...TASK,
+        title: 'Test @4pm',
+      };
+      const r = await shortSyntax(t, { ...CONFIG, isEnableDue: false });
+      expect(r).toEqual(undefined);
+    });
+
+    it('should ignore day of the week when disabled', async () => {
+      const t = {
+        ...TASK,
+        title: 'Test @Friday',
+      };
+      const r = await shortSyntax(t, { ...CONFIG, isEnableDue: false });
+      expect(r).toEqual(undefined);
+    });
+
+    it('should correctly parse day of the week', async () => {
+      const t = {
+        ...TASK,
+        title: 'Test @Friday',
+      };
+      const now = new Date('Fri Feb 09 2024 11:31:29 ');
+      const parsedDateInMilliseconds =
+        await getPlannedDateTimestampFromShortSyntaxReturnValue(t, now);
+      const parsedDate = new Date(parsedDateInMilliseconds);
+      expect(parsedDate.getDay()).toEqual(5);
+      const dayIncrement = 0;
+      // If today happens to be Friday, the parsed date will be the next Friday,
+      // 7 days from today only when after 12
+      const nextFriday = new Date(
+        now.getFullYear(),
+        now.getMonth(),
+        now.getDate() + dayIncrement,
+      );
+      const isDateSetCorrectly = checkSameDay(parsedDate, nextFriday);
+      expect(isDateSetCorrectly).toBeTrue();
+    });
+
+    it('should properly remove date syntax when there is a space after @', async () => {
+      const t = {
+        ...TASK,
+        title: 'Test @ tomorrow 19:00',
+      };
+      // set a fixed date to avoid test flakiness
+      const now = new Date('2025-12-05T10:00:00');
+      const r = await shortSyntax(t, CONFIG, undefined, undefined, now);
+
+      expect(r?.taskChanges.title).toBe('Test');
+      expect(r?.taskChanges.dueDay).toBeNull();
+    });
+
+    it('should properly remove date syntax when there is a space after @ for simple number', async () => {
+      const t = {
+        ...TASK,
+        title: 'Test @ 4',
+      };
+      const r = await shortSyntax(t, CONFIG);
+      expect(r?.taskChanges.title).toBe('Test');
+      expect(r?.taskChanges.dueDay).toBeNull();
+    });
+
+    it('should properly remove date syntax with date format like 12/20/25', async () => {
+      const t = {
+        ...TASK,
+        title: 'Test @ 12/20/25 19:00',
+      };
+      const now = new Date('2025-12-05T10:00:00');
+      const r = await shortSyntax(t, CONFIG, undefined, undefined, now);
+
+      expect(r?.taskChanges.title).toBe('Test');
+      expect(r?.taskChanges.dueDay).toBeNull();
+      expect(r?.taskChanges.dueWithTime).toBeDefined();
+      // Verify it's scheduled for the future (Dec 20, 2025 at 19:00)
+      const scheduledDate = new Date(r?.taskChanges.dueWithTime as number);
+      expect(scheduledDate.getMonth()).toBe(11); // December (0-indexed)
+      expect(scheduledDate.getDate()).toBe(20);
+      expect(scheduledDate.getHours()).toBe(19);
+    });
+
+    it('should schedule overdue task to future when using inline @ syntax', async () => {
+      const t = {
+        ...TASK,
+        title: 'Overdue task @tomorrow 14:00',
+        dueDay: '2025-12-01', // Simulating an overdue task
+      };
+      const now = new Date('2025-12-05T10:00:00');
+      const r = await shortSyntax(t, CONFIG, undefined, undefined, now);
+
+      expect(r?.taskChanges.title).toBe('Overdue task');
+      expect(r?.taskChanges.dueDay).toBeNull(); // Should clear the old dueDay
+      expect(r?.taskChanges.dueWithTime).toBeDefined();
+      // Verify it's scheduled for tomorrow (Dec 6, 2025 at 14:00)
+      const scheduledDate = new Date(r?.taskChanges.dueWithTime as number);
+      expect(scheduledDate.getFullYear()).toBe(2025);
+      expect(scheduledDate.getMonth()).toBe(11); // December
+      expect(scheduledDate.getDate()).toBe(6); // Tomorrow
+      expect(scheduledDate.getHours()).toBe(14);
+    });
+
+    it('should correctly parse combined schedule and deadline together without corrupting title', async () => {
+      const t = {
+        ...TASK,
+        title: 'Pay rent @monday !friday',
+      };
+      const now = new Date('2026-06-01T10:00:00'); // Mon Jun 1 2026
+      const r = await shortSyntax(t, DEADLINE_CONFIG, undefined, undefined, now);
+
+      expect(r?.taskChanges.title).toBe('Pay rent');
+      expect(r?.taskChanges.dueWithTime).toBeDefined();
+      expect(r?.taskChanges.deadlineWithTime).toBeDefined();
+
+      const dueDate = new Date(r?.taskChanges.dueWithTime as number);
+      const deadlineDate = new Date(r?.taskChanges.deadlineWithTime as number);
+
+      expect(dueDate.getDay()).toBe(1); // Monday
+      expect(deadlineDate.getDay()).toBe(5); // Friday
+    });
+
+    it('should ignore deadline syntax by default', async () => {
+      const t = {
+        ...TASK,
+        title: 'Pay rent !friday',
+      };
+      const now = new Date('2026-06-01T10:00:00');
+      const r = await shortSyntax(t, CONFIG, undefined, undefined, now);
+
+      expect(r).toBeUndefined();
+    });
+
+    it('should still parse schedule syntax when there is no preceding space (e.g. lunch@12)', async () => {
+      const t = {
+        ...TASK,
+        title: 'lunch@12',
+      };
+      const now = new Date('2026-06-01T10:00:00');
+      const r = await shortSyntax(t, CONFIG, undefined, undefined, now);
+
+      expect(r?.taskChanges.title).toBe('lunch');
+      expect(r?.taskChanges.dueWithTime).toBeDefined();
+    });
+
+    it('should not parse deadline syntax when there is no preceding space (e.g. Done!)', async () => {
+      const t = {
+        ...TASK,
+        title: 'Done!',
+      };
+      const now = new Date('2026-06-01T10:00:00');
+      const r = await shortSyntax(t, DEADLINE_CONFIG, undefined, undefined, now);
+
+      expect(r).toBeUndefined();
+    });
+
+    // #10217: an earlier "!" that is not a deadline trigger must not hide a later one
+    it('should parse a later deadline token after an earlier "!" in the title', async () => {
+      const t = {
+        ...TASK,
+        title: 'wow! !tomorrow',
+      };
+      const now = new Date('2026-06-01T10:00:00'); // Mon Jun 1 2026
+      const r = await shortSyntax(t, DEADLINE_CONFIG, undefined, undefined, now);
+
+      expect(r?.taskChanges.title).toBe('wow!');
+      expect(r?.taskChanges.deadlineWithTime).toBeDefined();
+      const deadlineDate = new Date(r?.taskChanges.deadlineWithTime as number);
+      expect(deadlineDate.getFullYear()).toBe(2026);
+      expect(deadlineDate.getMonth()).toBe(5); // June
+      expect(deadlineDate.getDate()).toBe(2);
+    });
+
+    it('should strip the matched deadline token, not an earlier identical one', async () => {
+      const t = {
+        ...TASK,
+        title: 'Call!5 !5',
+      };
+      const now = new Date('2026-06-01T10:00:00');
+      const r = await shortSyntax(t, DEADLINE_CONFIG, undefined, undefined, now);
+
+      expect(r?.taskChanges.title).toBe('Call!5');
+      expect(r?.taskChanges.deadlineWithTime).toBeDefined();
+      const deadlineDate = new Date(r?.taskChanges.deadlineWithTime as number);
+      expect(deadlineDate.getDate()).toBe(2); // 05:00 has passed today -> tomorrow
+      expect(deadlineDate.getHours()).toBe(5);
+    });
+
+    it('should not parse deadline syntax for issue tasks', async () => {
+      const t = {
+        ...TASK,
+        issueId: '42',
+        title: 'Crash on save !3',
+      };
+      const now = new Date('2026-06-01T10:00:00');
+      const r = await shortSyntax(t, DEADLINE_CONFIG, undefined, undefined, now);
+
+      expect(r).toBeUndefined();
+    });
+  });
+
+  describe('tags', () => {
+    it('should not trigger for tasks with starting # (e.g. github issues)', async () => {
+      const t = {
+        ...TASK,
+        title: '#134 Fun title',
+      };
+      const r = await shortSyntax(t, CONFIG, ALL_TAGS);
+
+      expect(r).toEqual(undefined);
+    });
+
+    it('should not trigger for tasks with starting # (e.g. github issues) when disabled', async () => {
+      const t = {
+        ...TASK,
+        title: '#134 Fun title',
+      };
+      const r = await shortSyntax(t, { ...CONFIG, isEnableTag: false }, ALL_TAGS);
+
+      expect(r).toEqual(undefined);
+    });
+
+    it('should not parse numeric tag when it is the first word in the title', async () => {
+      const t = {
+        ...TASK,
+        title: '#123 Task description',
+      };
+      const r = await shortSyntax(t, CONFIG, ALL_TAGS);
+
+      expect(r).toEqual(undefined);
+    });
+
+    it('should not parse issue references (e.g. "fixes #1234") as tags for issue tasks', async () => {
+      const t = {
+        ...TASK,
+        issueId: '42',
+        title: '#42 Fix regression from #1234',
+      };
+      const r = await shortSyntax(t, CONFIG, ALL_TAGS);
+
+      expect(r).toEqual(undefined);
+    });
+
+    it('should still parse non-numeric existing #tags in issue task titles', async () => {
+      const t = {
+        ...TASK,
+        issueId: '42',
+        title: '#42 Some title #blu',
+      };
+      const r = await shortSyntax(t, CONFIG, ALL_TAGS);
+
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['tag', '#blu']]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: '#42 Some title',
+          tagIds: ['blu_id'],
+        },
+      });
+    });
+
+    it('should not trigger for tasks with starting # (e.g. github issues) when adding tags', async () => {
+      const t = {
+        ...TASK,
+        title: '#134 Fun title #blu',
+      };
+      const r = await shortSyntax(t, CONFIG, ALL_TAGS);
+
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['tag', '#blu']]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: '#134 Fun title',
+          tagIds: ['blu_id'],
+        },
+      });
+    });
+
+    it('should not trigger for multiple tasks when disabled', async () => {
+      const t = {
+        ...TASK,
+        title: '#134 Fun title #blu',
+      };
+      const r = await shortSyntax(t, { ...CONFIG, isEnableTag: false }, ALL_TAGS);
+
+      expect(r).toEqual(undefined);
+    });
+
+    it('should add tag when it is the first word in the title', async () => {
+      const t = {
+        ...TASK,
+        title: '#blu Fun title',
+      };
+      const r = await shortSyntax(t, CONFIG, ALL_TAGS);
+
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['tag', '#blu']]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: 'Fun title',
+          tagIds: ['blu_id'],
+        },
+      });
+    });
+
+    it('should add multiple tags even if the first tag is at the beginning', async () => {
+      const t = {
+        ...TASK,
+        title: '#blu #hihi Fun title',
+      };
+      const r = await shortSyntax(t, CONFIG, ALL_TAGS);
+
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [
+          ['tag', '#blu'],
+          ['tag', '#hihi'],
+        ]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: 'Fun title',
+          tagIds: ['blu_id', 'hihi_id'],
+        },
+      });
+    });
+
+    it('should work with tags', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title #blu #A',
+      };
+      const r = await shortSyntax(t, CONFIG, ALL_TAGS);
+
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [
+          ['tag', '#blu'],
+          ['tag', '#A'],
+        ]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: 'Fun title',
+          tagIds: ['blu_id', 'A_id'],
+        },
+      });
+    });
+
+    it("shouldn't work with tags when disabled", async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title #blu #A',
+      };
+      const r = await shortSyntax(t, { ...CONFIG, isEnableTag: false }, ALL_TAGS);
+
+      expect(r).toEqual(undefined);
+    });
+
+    it('should not trigger for # without space before', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title#blu',
+      };
+      const r = await shortSyntax(t, CONFIG, ALL_TAGS);
+
+      expect(r).toEqual(undefined);
+    });
+
+    it('should not trigger for # without space before but parse other tags', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title#blu #bla',
+      };
+      const r = await shortSyntax(t, CONFIG, ALL_TAGS);
+
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['tag', '#bla']]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: 'Fun title#blu',
+          tagIds: ['bla_id'],
+        },
+      });
+    });
+
+    it('should not overwrite existing tags', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title #blu #hihi',
+        tagIds: ['blu_id', 'A', 'multi_word_id'],
+      };
+      const r = await shortSyntax(t, CONFIG, ALL_TAGS);
+
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [
+          ['tag', '#blu'],
+          ['tag', '#hihi'],
+        ]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: 'Fun title',
+          tagIds: ['blu_id', 'A', 'multi_word_id', 'hihi_id'],
+        },
+      });
+    });
+
+    it('should not overwrite existing tags when disabled', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title #blu #hihi',
+        tagIds: ['blu_id', 'A', 'multi_word_id'],
+      };
+      const r = await shortSyntax(t, { ...CONFIG, isEnableTag: false }, ALL_TAGS);
+
+      expect(r).toEqual(undefined);
+    });
+
+    it('should add new tag names', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title #blu #idontexist',
+        tagIds: [],
+      };
+      const r = await shortSyntax(t, CONFIG, ALL_TAGS);
+
+      expect(r).toEqual({
+        newTagTitles: ['idontexist'],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [
+          ['tag', '#blu'],
+          ['tag', '#idontexist'],
+        ]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: 'Fun title',
+          tagIds: ['blu_id'],
+        },
+      });
+    });
+
+    it('should not add new tag names when disabled', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title #blu #idontexist',
+        tagIds: [],
+      };
+      const r = await shortSyntax(t, { ...CONFIG, isEnableTag: false }, ALL_TAGS);
+
+      expect(r).toEqual(undefined);
+    });
+
+    it('should remove tags not existing on title', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title #blu #bla',
+        tagIds: ['blu_id', 'bla_id', 'hihi_id'],
+      };
+      const r = await shortSyntax(t, CONFIG, ALL_TAGS, undefined, undefined, 'replace');
+
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [
+          ['tag', '#blu'],
+          ['tag', '#bla'],
+        ]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: 'Fun title',
+          tagIds: ['blu_id', 'bla_id'],
+        },
+      });
+    });
+
+    it('should not remove tags not existing on title when disabled', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title #blu #bla',
+        tagIds: ['blu_id', 'bla_id', 'hihi_id'],
+      };
+      const r = await shortSyntax(t, { ...CONFIG, isEnableTag: false }, ALL_TAGS);
+
+      expect(r).toEqual(undefined);
+    });
+
+    it('should add new "asd #asd" tag', async () => {
+      const t = {
+        ...TASK,
+        title: 'asd #asd',
+        tagIds: [],
+      };
+      const r = await shortSyntax(t, CONFIG, ALL_TAGS);
+
+      expect(r).toEqual({
+        newTagTitles: ['asd'],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['tag', '#asd']]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: 'asd',
+        },
+      });
+    });
+
+    it('should work for edge case #3728', async () => {
+      const t = {
+        ...TASK,
+        title: 'Test tag error #testing #someNewTag3',
+        tagIds: [],
+      };
+      const r = await shortSyntax(t, CONFIG, [
+        ...ALL_TAGS,
+        { ...DEFAULT_TAG, id: 'testing_id', title: 'testing' },
+      ]);
+
+      expect(r).toEqual({
+        newTagTitles: ['someNewTag3'],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [
+          ['tag', '#testing'],
+          ['tag', '#someNewTag3'],
+        ]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: 'Test tag error',
+          tagIds: ['testing_id'],
+        },
+      });
+    });
+
+    it('should not add new "asd #asd" tag when disabled', async () => {
+      const t = {
+        ...TASK,
+        title: 'asd #asd',
+        tagIds: [],
+      };
+      const r = await shortSyntax(t, { ...CONFIG, isEnableTag: false }, ALL_TAGS);
+
+      expect(r).toEqual(undefined);
+    });
+
+    it('should add tags for sub tasks', async () => {
+      const t = {
+        ...TASK,
+        parentId: 'SOMEPARENT',
+        title: 'Fun title #blu #idontexist',
+        tagIds: [],
+      };
+      const r = await shortSyntax(t, CONFIG, ALL_TAGS);
+
+      expect(r).toEqual({
+        newTagTitles: ['idontexist'],
+        projectId: undefined,
+        attachments: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [
+          ['tag', '#blu'],
+          ['tag', '#idontexist'],
+        ]),
+        taskChanges: { tagIds: ['blu_id'], title: 'Fun title' },
+      });
+    });
+
+    it('should not add tags for sub tasks when disabled', async () => {
+      const t = {
+        ...TASK,
+        parentId: 'SOMEPARENT',
+        title: 'Fun title #blu #idontexist',
+        tagIds: [],
+      };
+      const r = await shortSyntax(t, { ...CONFIG, isEnableTag: false }, ALL_TAGS);
+
+      expect(r).toEqual(undefined);
+    });
+
+    it('should remove tag from title if task already has tag', async () => {
+      const t = {
+        ...TASK,
+        title: 'Test tag #testing',
+        tagIds: ['testing_id'],
+      };
+      const r = await shortSyntax(t, CONFIG, [
+        ...ALL_TAGS,
+        { ...DEFAULT_TAG, id: 'testing_id', title: 'testing' },
+      ]);
+
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['tag', '#testing']]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: 'Test tag',
+        },
+      });
+    });
+
+    it('should create new tag and remove both from title if task already has one given tag', async () => {
+      const t = {
+        ...TASK,
+        title: 'Test tag #testing #blu',
+        tagIds: ['blu_id'],
+      };
+      const r = await shortSyntax(t, CONFIG, [
+        ...ALL_TAGS,
+        { ...DEFAULT_TAG, id: 'blu_id', title: 'blu' },
+      ]);
+
+      expect(r).toEqual({
+        newTagTitles: ['testing'],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [
+          ['tag', '#testing'],
+          ['tag', '#blu'],
+        ]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: 'Test tag',
+        },
+      });
+    });
+
+    it('should add existing tag and remove both from title if task already has one given tag', async () => {
+      const t = {
+        ...TASK,
+        title: 'Test tag #testing #blu',
+        tagIds: ['blu_id'],
+      };
+      const r = await shortSyntax(t, CONFIG, [
+        ...ALL_TAGS,
+        { ...DEFAULT_TAG, id: 'blu_id', title: 'blu' },
+        { ...DEFAULT_TAG, id: 'testing_id', title: 'testing' },
+      ]);
+
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [
+          ['tag', '#testing'],
+          ['tag', '#blu'],
+        ]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: 'Test tag',
+          tagIds: ['blu_id', 'testing_id'],
+        },
+      });
+    });
+
+    it('should not remove tag from title if task already has tag when disabled', async () => {
+      const t = {
+        ...TASK,
+        title: 'Test tag #testing',
+        tagIds: ['testing_id'],
+      };
+      const r = await shortSyntax(t, { ...CONFIG, isEnableTag: false }, ALL_TAGS);
+
+      expect(r).toEqual(undefined);
+    });
+  });
+  describe('should work with tags and time estimates combined', () => {
+    it('tag before time estimate', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title #blu 10m/1h',
+      };
+      const r = await shortSyntax(t, CONFIG, ALL_TAGS);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [
+          ['estimate', '10m/1h'],
+          ['tag', '#blu'],
+        ]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: 'Fun title',
+          // timeSpent: 7200000,
+          timeSpentOnDay: {
+            [getDbDateStr()]: 600000,
+          },
+          timeEstimate: 3600000,
+          tagIds: ['blu_id'],
+        },
+      });
+    });
+
+    it('time estimate before tag', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title 10m/1h #blu',
+      };
+      const r = await shortSyntax(t, CONFIG, ALL_TAGS);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [
+          ['estimate', '10m/1h'],
+          ['tag', '#blu'],
+        ]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: 'Fun title',
+          timeSpentOnDay: {
+            [getDbDateStr()]: 600000,
+          },
+          timeEstimate: 3600000,
+          tagIds: ['blu_id'],
+        },
+      });
+    });
+
+    it('time estimate disabled', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title 10m/1h #blu',
+      };
+      const r = await shortSyntax(t, { ...CONFIG, isEnableDue: false }, ALL_TAGS);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['tag', '#blu']]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: 'Fun title 10m/1h',
+          tagIds: ['blu_id'],
+        },
+      });
+    });
+
+    it('tags disabled', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title 10m/1h #blu',
+      };
+      const r = await shortSyntax(t, { ...CONFIG, isEnableTag: false }, ALL_TAGS);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['estimate', '10m/1h']]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: 'Fun title #blu',
+          timeSpentOnDay: {
+            [getDbDateStr()]: 600000,
+          },
+          timeEstimate: 3600000,
+        },
+      });
+    });
+  });
+
+  describe('projects', () => {
+    let projects: Project[];
+    beforeEach(() => {
+      projects = [
+        {
+          title: 'ProjectEasyShort',
+          id: 'ProjectEasyShortID',
+        },
+        {
+          title: 'Some Project Title',
+          id: 'SomeProjectID',
+        },
+      ] as any;
+    });
+
+    it('should work', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title +ProjectEasyShort',
+      };
+      const r = await shortSyntax(t, CONFIG, [], projects);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['project', '+ProjectEasyShort']]),
+        projectId: 'ProjectEasyShortID',
+        attachments: [],
+        taskChanges: {
+          title: 'Fun title',
+        },
+      });
+    });
+
+    it("shouldn't work when disabled", async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title +ProjectEasyShort',
+      };
+      const r = await shortSyntax(t, { ...CONFIG, isEnableProject: false }, [], projects);
+      expect(r).toEqual(undefined);
+    });
+
+    it('should not parse without missing whitespace before', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title+ProjectEasyShort',
+      };
+      const r = await shortSyntax(t, CONFIG, [], projects);
+      expect(r).toEqual(undefined);
+    });
+
+    it('should work together with time estimates', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title +ProjectEasyShort 10m/1h',
+      };
+      const r = await shortSyntax(t, CONFIG, [], projects);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [
+          ['estimate', '10m/1h'],
+          ['project', '+ProjectEasyShort'],
+        ]),
+        projectId: 'ProjectEasyShortID',
+        attachments: [],
+        taskChanges: {
+          title: 'Fun title',
+          // timeSpent: 7200000,
+          timeSpentOnDay: {
+            [getDbDateStr()]: 600000,
+          },
+          timeEstimate: 3600000,
+        },
+      });
+    });
+
+    it('should work together with time estimates when disabled', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title +ProjectEasyShort 10m/1h',
+      };
+      const r = await shortSyntax(t, { ...CONFIG, isEnableProject: false }, [], projects);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['estimate', '10m/1h']]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: 'Fun title +ProjectEasyShort',
+          // timeSpent: 7200000,
+          timeSpentOnDay: {
+            [getDbDateStr()]: 600000,
+          },
+          timeEstimate: 3600000,
+        },
+      });
+    });
+
+    it('should work together with disabled time estimates', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title +ProjectEasyShort 10m/1h',
+      };
+      const r = await shortSyntax(t, { ...CONFIG, isEnableDue: false }, [], projects);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['project', '+ProjectEasyShort']]),
+        projectId: 'ProjectEasyShortID',
+        attachments: [],
+        taskChanges: {
+          title: 'Fun title 10m/1h',
+        },
+      });
+    });
+
+    it('should work with only the beginning of a project title if it is at least 3 chars long', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title +Project',
+      };
+      const r = await shortSyntax(t, CONFIG, [], projects);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['project', '+Project']]),
+        projectId: 'ProjectEasyShortID',
+        attachments: [],
+        taskChanges: {
+          title: 'Fun title',
+        },
+      });
+    });
+
+    it('should work with multi word project titles', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title +Some Project Title',
+      };
+      const r = await shortSyntax(t, CONFIG, [], projects);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['project', '+Some Project Title']]),
+        projectId: 'SomeProjectID',
+        attachments: [],
+        taskChanges: {
+          title: 'Fun title',
+        },
+      });
+    });
+
+    it('should work with multi word project titles partial', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title +Some Pro',
+      };
+      const r = await shortSyntax(t, CONFIG, [], projects);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['project', '+Some Pro']]),
+        projectId: 'SomeProjectID',
+        attachments: [],
+        taskChanges: {
+          title: 'Fun title',
+        },
+      });
+    });
+
+    it('should work with multi word project titles partial written without white space', async () => {
+      const t = {
+        ...TASK,
+        title: 'Other fun title +SomePro',
+      };
+      const r = await shortSyntax(t, CONFIG, [], projects);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['project', '+SomePro']]),
+        projectId: 'SomeProjectID',
+        attachments: [],
+        taskChanges: {
+          title: 'Other fun title',
+        },
+      });
+    });
+
+    it('should keep task content typed after a multi word project title', async () => {
+      const t = {
+        ...TASK,
+        title: '+Some Project Title do the thing',
+      };
+      const r = await shortSyntax(t, CONFIG, [], projects);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['project', '+Some Project Title']]),
+        projectId: 'SomeProjectID',
+        attachments: [],
+        taskChanges: {
+          title: 'do the thing',
+        },
+      });
+    });
+
+    it('should keep task content typed after a partial multi word project title', async () => {
+      const t = {
+        ...TASK,
+        title: '+Some Pro do the thing',
+      };
+      const r = await shortSyntax(t, CONFIG, [], projects);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['project', '+Some Pro']]),
+        projectId: 'SomeProjectID',
+        attachments: [],
+        taskChanges: {
+          title: 'do the thing',
+        },
+      });
+    });
+
+    it('should keep task content typed after a single word project title', async () => {
+      const t = {
+        ...TASK,
+        title: '+ProjectEasyShort do the thing',
+      };
+      const r = await shortSyntax(t, CONFIG, [], projects);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['project', '+ProjectEasyShort']]),
+        projectId: 'ProjectEasyShortID',
+        attachments: [],
+        taskChanges: {
+          title: 'do the thing',
+        },
+      });
+    });
+
+    it('should keep task content surrounding a multi word project title', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title +Some Project Title and more',
+      };
+      const r = await shortSyntax(t, CONFIG, [], projects);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['project', '+Some Project Title']]),
+        projectId: 'SomeProjectID',
+        attachments: [],
+        taskChanges: {
+          title: 'Fun title and more',
+        },
+      });
+    });
+
+    it('should prefer a fully typed title over a longer partially matching one', async () => {
+      const overlappingProjects = [
+        { title: 'Work', id: 'WorkID' },
+        { title: 'Work Inbox', id: 'WorkInboxID' },
+      ] as Project[];
+      const t = {
+        ...TASK,
+        title: 'Task +Work in progress',
+      };
+      const r = await shortSyntax(t, CONFIG, [], overlappingProjects);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['project', '+Work']]),
+        projectId: 'WorkID',
+        attachments: [],
+        taskChanges: {
+          title: 'Task in progress',
+        },
+      });
+    });
+
+    it('should still consume the longer title when it is typed in full', async () => {
+      const overlappingProjects = [
+        { title: 'Work', id: 'WorkID' },
+        { title: 'Work Inbox', id: 'WorkInboxID' },
+      ] as Project[];
+      const t = {
+        ...TASK,
+        title: 'Task +Work Inbox stuff',
+      };
+      const r = await shortSyntax(t, CONFIG, [], overlappingProjects);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['project', '+Work Inbox']]),
+        projectId: 'WorkInboxID',
+        attachments: [],
+        taskChanges: {
+          title: 'Task stuff',
+        },
+      });
+    });
+
+    it('should not join task words into a project title written without white space', async () => {
+      const concatenatedProjects = [
+        { title: 'Home', id: 'HomeID' },
+        { title: 'Homework', id: 'HomeworkID' },
+      ] as Project[];
+      const t = {
+        ...TASK,
+        title: '+Home work on taxes',
+      };
+      const r = await shortSyntax(t, CONFIG, [], concatenatedProjects);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['project', '+Home']]),
+        projectId: 'HomeID',
+        attachments: [],
+        taskChanges: {
+          title: 'work on taxes',
+        },
+      });
+    });
+
+    it('should parse a tag and an estimate typed after a multi word project title', async () => {
+      const t = {
+        ...TASK,
+        title: '+Some Project Title do the thing 30m #blu',
+      };
+      const r = await shortSyntax(t, CONFIG, ALL_TAGS, projects);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [
+          ['project', '+Some Project Title'],
+          ['estimate', '30m'],
+          ['tag', '#blu'],
+        ]),
+        projectId: 'SomeProjectID',
+        attachments: [],
+        taskChanges: {
+          title: 'do the thing',
+          tagIds: ['blu_id'],
+          timeEstimate: 1800000,
+        },
+      });
+    });
+
+    it('should keep a fully typed title even when only part of a longer one is typed', async () => {
+      const overlappingProjects = [
+        { title: 'Work', id: 'WorkID' },
+        { title: 'Work Inbox', id: 'WorkInboxID' },
+      ] as Project[];
+      const t = {
+        ...TASK,
+        title: 'Task +Work Inb stuff',
+      };
+      const r = await shortSyntax(t, CONFIG, [], overlappingProjects);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['project', '+Work']]),
+        projectId: 'WorkID',
+        attachments: [],
+        taskChanges: {
+          title: 'Task Inb stuff',
+        },
+      });
+    });
+
+    it('should ignore non existing', async () => {
+      const t = {
+        ...TASK,
+        title: 'Other fun title +Non existing project',
+      };
+      const r = await shortSyntax(t, CONFIG, [], projects);
+      expect(r).toEqual(undefined);
+    });
+
+    it('should not parse when there is a space after +', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title + ProjectEasyShort',
+      };
+      const r = await shortSyntax(t, CONFIG, [], projects);
+      expect(r).toEqual(undefined);
+    });
+
+    it('should not parse when there is a space after + with other syntax', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title + ProjectEasyShort 10m',
+      };
+      const r = await shortSyntax(t, CONFIG, [], projects);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['estimate', '10m']]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: 'Fun title + ProjectEasyShort',
+          timeEstimate: 600000,
+        },
+      });
+    });
+
+    it('should not parse when + is followed by multiple spaces', async () => {
+      const t = {
+        ...TASK,
+        title: 'Fun title +  ProjectEasyShort',
+      };
+      const r = await shortSyntax(t, CONFIG, [], projects);
+      expect(r).toEqual(undefined);
+    });
+
+    it('should prefer shortest prefix full project title match', async () => {
+      const t = {
+        ...TASK,
+        title: 'Task +print',
+      };
+      projects = ['printer', 'imprints', 'print', 'printable'].map(
+        (title) => ({ id: title, title }) as Project,
+      );
+      const r = await shortSyntax(t, CONFIG, [], projects);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['project', '+print']]),
+        projectId: 'print',
+        attachments: [],
+        taskChanges: {
+          title: 'Task',
+        },
+      });
+    });
+  });
+
+  describe('combined', () => {
+    it('should work when time comes first', async () => {
+      const projects = [
+        {
+          title: 'ProjectEasyShort',
+          id: 'ProjectEasyShortID',
+        },
+      ] as any;
+      const t = {
+        ...TASK,
+        title: 'Fun title 10m/1h +ProjectEasyShort',
+      };
+      const r = await shortSyntax(t, CONFIG, [], projects);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [
+          ['estimate', '10m/1h'],
+          ['project', '+ProjectEasyShort'],
+        ]),
+        projectId: 'ProjectEasyShortID',
+        attachments: [],
+        taskChanges: {
+          title: 'Fun title',
+          // timeSpent: 7200000,
+          timeSpentOnDay: {
+            [getDbDateStr()]: 600000,
+          },
+          timeEstimate: 3600000,
+        },
+      });
+    });
+
+    it('should work for project first', async () => {
+      const projects = [
+        {
+          title: 'ProjectEasyShort',
+          id: 'ProjectEasyShortID',
+        },
+      ] as any;
+      const t = {
+        ...TASK,
+        title: 'Some task +ProjectEasyShort 30m #tag',
+      };
+      const r = await shortSyntax(t, CONFIG, [], projects);
+      expect(r).toEqual({
+        newTagTitles: ['tag'],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [
+          ['project', '+ProjectEasyShort'],
+          ['estimate', '30m'],
+          ['tag', '#tag'],
+        ]),
+        projectId: 'ProjectEasyShortID',
+        attachments: [],
+        taskChanges: {
+          title: 'Some task',
+          // timeSpent: 7200000,
+          timeEstimate: 1800000,
+        },
+      });
+    });
+    it('should correctly parse scheduled date, project, time spent and estimate', async () => {
+      const projects = [
+        {
+          title: 'Project',
+          id: 'a1b2',
+        },
+        {
+          title: 'Another Project',
+          id: 'c3d4',
+        },
+      ] as any;
+      const taskInput = `Test @Friday 4pm +${projects[0].title} 2h/4h`;
+      const t = {
+        ...TASK,
+        title: taskInput,
+      };
+      const parsedDateInMilliseconds =
+        await getPlannedDateTimestampFromShortSyntaxReturnValue(t);
+      const parsedDate = new Date(parsedDateInMilliseconds);
+      // The parsed day and time should be Friday, or 5, and time is 16 hours and 0 minute
+      expect(parsedDate.getDay()).toEqual(5);
+      const isTimeSetCorrectly = checkIfDateHasCorrectTime(parsedDate, 16, 0);
+      expect(isTimeSetCorrectly).toBeTrue();
+      const parsedTaskInfo = await shortSyntax(t, CONFIG, [], projects);
+      expect(parsedTaskInfo?.projectId).toEqual(projects[0].id);
+      // The time spent value is stored to the property equal to today
+      // in format YYYY-MM-DD of the object `timeSpentOnDay`
+      const today = new Date();
+      const formatedToday = formatDateToISO(today);
+      // Time estimate and time spent should be correctly parsed in milliseconds
+      expect(parsedTaskInfo?.taskChanges.timeEstimate).toEqual(3600 * 4 * 1000);
+      expect(parsedTaskInfo?.taskChanges?.timeSpentOnDay?.[formatedToday]).toEqual(
+        3600 * 2 * 1000,
+      );
+    });
+    it('should correctly parse scheduled date and multiple tags', async () => {
+      const t = {
+        ...TASK,
+        title: 'Test @fri 4pm #html #css',
+      };
+      const plannedTimestamp = await getPlannedDateTimestampFromShortSyntaxReturnValue(t);
+      const isPlannedDateAndTimeCorrect = checkIfCorrectDateAndTime(
+        plannedTimestamp,
+        'friday',
+        16,
+        0,
+      );
+      expect(isPlannedDateAndTimeCorrect).toBeTrue();
+      const parsedTaskInfo = await shortSyntax(t, CONFIG, []);
+      expect(parsedTaskInfo?.newTagTitles.includes('html')).toBeTrue();
+      expect(parsedTaskInfo?.newTagTitles.includes('css')).toBeTrue();
+    });
+
+    it('should parse scheduled date using local time zone when unspecified', async () => {
+      const t = {
+        ...TASK,
+        title: '@2030-10-12T13:37',
+      };
+      const plannedTimestamp = await getPlannedDateTimestampFromShortSyntaxReturnValue(t);
+      expect(checkIfCorrectDateAndTime(plannedTimestamp, 'saturday', 13, 37)).toBeTrue();
+    });
+
+    it('should work when all are disabled', async () => {
+      const t = {
+        ...TASK,
+        title: 'Test @fri 4pm #html #css +ProjectEasyShort',
+      };
+      const r = await shortSyntax(t, {
+        isEnableDue: false,
+        isEnableProject: false,
+        isEnableTag: false,
+        urlBehavior: 'keep-and-attach',
+      });
+      expect(r).toEqual(undefined);
+    });
+  });
+
+  describe('projects using special delimiters', () => {
+    const taskTemplates = [
+      'Task *',
+      'Task * 10m',
+      'Task * 1h / 2h',
+      'Task * @tomorrow',
+      'Task * @in 1 day',
+      'Task * #A',
+    ];
+
+    const projects = ['a+b', '10 contracts', 'c++', 'my@email.com', 'issue#123'].map(
+      (title) => ({ id: title, title }) as Project,
+    );
+
+    for (const taskTemplate of taskTemplates) {
+      for (const project of projects) {
+        const taskTitle = taskTemplate.replaceAll('*', `+${project.title}`);
+        it(`should parse project "${project.title}" from "${taskTitle}"`, async () => {
+          const task = {
+            ...TASK,
+            title: taskTitle,
+          };
+          const result = await shortSyntax(task, CONFIG, ALL_TAGS, projects);
+          expect(result?.projectId).toBe(project.id);
+        });
+      }
+    }
+  });
+
+  // This group of tests address Chrono's parsing the format "<date> <month> <yy}>" as year
+  // This will cause unintended parsing result when the date syntax is used together with the time estimate syntax
+  // https://github.com/super-productivity/super-productivity/issues/4194
+  // The focus of this test group will be the ability of the parser to get the correct year and time estimate
+  describe('should not parse time estimate syntax as year', () => {
+    const today = new Date();
+    const minuteEstimate = 90;
+
+    it('should correctly parse year and time estimate when the input date only has month and day of the month', async () => {
+      const tomorrow = new Date(today.getTime() + oneDayInMilliseconds);
+      const inputMonth = tomorrow.getMonth() + 1;
+      const inputMonthName = MONTH_SHORT_NAMES[tomorrow.getMonth()];
+      const inputDayOfTheMonth = tomorrow.getDate();
+      const t = {
+        ...TASK,
+        title: `Test @${inputMonthName} ${inputDayOfTheMonth} ${minuteEstimate}m`,
+      };
+      const parsedTaskInfo = await shortSyntax(t, CONFIG, []);
+      const taskChanges = parsedTaskInfo?.taskChanges;
+      const dueWithTime = taskChanges?.dueWithTime as number;
+      expect(
+        checkIfCorrectDateMonthAndYear(
+          dueWithTime,
+          inputDayOfTheMonth,
+          inputMonth,
+          tomorrow.getFullYear(),
+        ),
+      ).toBeTrue();
+      expect(taskChanges?.timeEstimate).toEqual(minuteEstimate * 60 * 1000);
+    });
+
+    it('should correctly parse year and time estimate when the input date contains month, day of the month and time', async () => {
+      const time = '4pm';
+      const tomorrow = new Date(today.getTime() + oneDayInMilliseconds);
+      const inputMonth = tomorrow.getMonth() + 1;
+      const inputMonthName = MONTH_SHORT_NAMES[tomorrow.getMonth()];
+      const inputDayOfTheMonth = tomorrow.getDate();
+      const t = {
+        ...TASK,
+        title: `Test @${inputMonthName} ${inputDayOfTheMonth} ${time} ${minuteEstimate}m`,
+      };
+      const parsedTaskInfo = await shortSyntax(t, CONFIG, []);
+      const taskChanges = parsedTaskInfo?.taskChanges;
+      const dueWithTime = taskChanges?.dueWithTime as number;
+      expect(
+        checkIfCorrectDateMonthAndYear(
+          dueWithTime,
+          inputDayOfTheMonth,
+          inputMonth,
+          tomorrow.getFullYear(),
+          16,
+        ),
+      ).toBeTrue();
+      expect(taskChanges?.timeEstimate).toEqual(minuteEstimate * 60 * 1000);
+    });
+  });
+
+  describe('time unit clusters', () => {
+    const testCases: [string, number | undefined, number | undefined][] = [
+      ['1h 30m', 90, undefined],
+      ['2h5m', 125, undefined],
+      ['1h 30m /', undefined, 90],
+      ['2h5m/', undefined, 125],
+      ['1h 30m / 12h', 720, 90],
+      ['1.25h / 1h 4m', 64, 75],
+      ['2h5m/3h', 180, 125],
+    ];
+
+    for (const [title, timeEstimateMins, timeSpentMins] of testCases) {
+      const timeEstimate =
+        typeof timeEstimateMins === 'number' ? timeEstimateMins * 60 * 1000 : undefined;
+      const timeSpentOnDay =
+        typeof timeSpentMins === 'number' ? timeSpentMins * 60 * 1000 : undefined;
+      it(`should parse ${
+        timeEstimate === undefined
+          ? 'no time estimate'
+          : 'time estimate of ' + timeEstimate
+      } and ${
+        timeSpentOnDay === undefined
+          ? 'no time spent on day'
+          : 'time spent on day of ' + timeSpentOnDay
+      } from "${title}"`, async () => {
+        const task = {
+          ...TASK,
+          title,
+        };
+        const result = await shortSyntax(task, CONFIG, [], []);
+        expect(result?.taskChanges.timeEstimate).toBe(timeEstimate);
+        expect(result?.taskChanges.timeSpentOnDay?.[getDbDateStr()]).toBe(timeSpentOnDay);
+      });
+    }
+  });
+
+  describe('case sensitivity (#6515)', () => {
+    it('should not parse uppercase 3D in task title', async () => {
+      const t = { ...TASK, title: 'create 3D floor plan' };
+      const r = await shortSyntax(t, CONFIG);
+      expect(r).toEqual(undefined);
+    });
+
+    it('should not parse mixed case 3D in task title', async () => {
+      const t = { ...TASK, title: 'create 3d floor plan' };
+      const r = await shortSyntax(t, CONFIG);
+      expect(r).toEqual(undefined);
+    });
+
+    it('should not parse uppercase 3M in task title', async () => {
+      const t = { ...TASK, title: 'compare 3M products' };
+      const r = await shortSyntax(t, CONFIG);
+      expect(r).toEqual(undefined);
+    });
+
+    it('should not parse uppercase 3H in task title', async () => {
+      const t = { ...TASK, title: 'task 3H' };
+      const r = await shortSyntax(t, CONFIG);
+      expect(r).toEqual(undefined);
+    });
+
+    it('should still parse lowercase 3m as time estimate', async () => {
+      const t = { ...TASK, title: 'task 3m' };
+      const r = await shortSyntax(t, CONFIG);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['estimate', '3m']]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: 'task',
+          timeEstimate: 180000,
+        },
+      });
+    });
+
+    it('should still parse lowercase 3h as time estimate', async () => {
+      const t = { ...TASK, title: 'task 3h' };
+      const r = await shortSyntax(t, CONFIG);
+      expect(r).toEqual({
+        newTagTitles: [],
+        remindAt: null,
+        repeat: null,
+        parsedRanges: expectedRanges(t.title, [['estimate', '3h']]),
+        projectId: undefined,
+        attachments: [],
+        taskChanges: {
+          title: 'task',
+          timeEstimate: 10800000,
+        },
+      });
+    });
+  });
+
+  describe('URL attachments', () => {
+    const EXTRACT_CONFIG = { ...CONFIG, urlBehavior: 'extract' as const };
+
+    it('should extract single URL with https protocol', async () => {
+      const t = {
+        ...TASK,
+        title: 'Task https://example.com',
+      };
+      const r = await shortSyntax(t, EXTRACT_CONFIG);
+      expect(r).toBeDefined();
+      expect(r?.attachments).toBeDefined();
+      expect(r?.attachments.length).toBe(1);
+      expect(r?.attachments[0].path).toBe('https://example.com');
+      expect(r?.attachments[0].type).toBe('LINK');
+      expect(r?.attachments[0].icon).toBe('bookmark');
+      expect(r?.taskChanges.title).toBe('Task');
+    });
+
+    it('should extract single URL with http protocol', async () => {
+      const t = {
+        ...TASK,
+        title: 'Task http://example.com',
+      };
+      const r = await shortSyntax(t, EXTRACT_CONFIG);
+      expect(r).toBeDefined();
+      expect(r?.attachments.length).toBe(1);
+      expect(r?.attachments[0].path).toBe('http://example.com');
+      expect(r?.attachments[0].type).toBe('LINK');
+      expect(r?.taskChanges.title).toBe('Task');
+    });
+
+    it('should extract single URL with file:// protocol', async () => {
+      const t = {
+        ...TASK,
+        title: 'Task file:///path/to/document.pdf',
+      };
+      const r = await shortSyntax(t, EXTRACT_CONFIG);
+      expect(r).toBeDefined();
+      expect(r?.attachments.length).toBe(1);
+      expect(r?.attachments[0].path).toBe('file:///path/to/document.pdf');
+      expect(r?.attachments[0].type).toBe('FILE');
+      expect(r?.attachments[0].icon).toBe('insert_drive_file');
+      expect(r?.taskChanges.title).toBe('Task');
+    });
+
+    it('should extract single URL with www prefix', async () => {
+      const t = {
+        ...TASK,
+        title: 'Task www.example.com',
+      };
+      const r = await shortSyntax(t, EXTRACT_CONFIG);
+      expect(r).toBeDefined();
+      expect(r?.attachments.length).toBe(1);
+      expect(r?.attachments[0].path).toBe('//www.example.com');
+      expect(r?.attachments[0].type).toBe('LINK');
+      expect(r?.taskChanges.title).toBe('Task');
+    });
+
+    it('should handle multiple URLs with mixed protocols', async () => {
+      const t = {
+        ...TASK,
+        title: 'Task https://example.com www.test.org file:///home/doc.txt',
+      };
+      const r = await shortSyntax(t, EXTRACT_CONFIG);
+      expect(r).toBeDefined();
+      expect(r?.attachments.length).toBe(3);
+      expect(r?.attachments[0].path).toBe('https://example.com');
+      expect(r?.attachments[0].type).toBe('LINK');
+      expect(r?.attachments[1].path).toBe('//www.test.org');
+      expect(r?.attachments[1].type).toBe('LINK');
+      expect(r?.attachments[2].path).toBe('file:///home/doc.txt');
+      expect(r?.attachments[2].type).toBe('FILE');
+      expect(r?.taskChanges.title).toBe('Task');
+    });
+
+    it('should detect image URLs as IMG type for https', async () => {
+      const t = {
+        ...TASK,
+        title: 'Task https://example.com/image.png',
+      };
+      const r = await shortSyntax(t, EXTRACT_CONFIG);
+      expect(r).toBeDefined();
+      expect(r?.attachments.length).toBe(1);
+      expect(r?.attachments[0].type).toBe('IMG');
+      expect(r?.attachments[0].icon).toBe('image');
+      expect(r?.taskChanges.title).toBe('Task');
+    });
+
+    it('should detect image URLs as IMG type for file://', async () => {
+      const t = {
+        ...TASK,
+        title: 'Task file:///path/to/image.jpg',
+      };
+      const r = await shortSyntax(t, EXTRACT_CONFIG);
+      expect(r).toBeDefined();
+      expect(r?.attachments.length).toBe(1);
+      expect(r?.attachments[0].type).toBe('IMG');
+      expect(r?.attachments[0].icon).toBe('image');
+      expect(r?.taskChanges.title).toBe('Task');
+    });
+
+    it('should work correctly with combined short syntax', async () => {
+      const t = {
+        ...TASK,
+        title: 'Task https://example.com @tomorrow #urgent 30m',
+      };
+      const r = await shortSyntax(t, EXTRACT_CONFIG, ALL_TAGS);
+      expect(r).toBeDefined();
+      expect(r?.attachments.length).toBe(1);
+      expect(r?.attachments[0].path).toBe('https://example.com');
+      expect(r?.taskChanges.title).toBe('Task');
+      expect(r?.taskChanges.timeEstimate).toBe(1800000);
+      expect(r?.newTagTitles).toContain('urgent');
+      expect(r?.taskChanges.dueWithTime).toBeDefined();
+    });
+
+    it('should clean URLs from title properly', async () => {
+      const t = {
+        ...TASK,
+        title: 'Task with https://example.com in middle',
+      };
+      const r = await shortSyntax(t, EXTRACT_CONFIG);
+      expect(r).toBeDefined();
+      expect(r?.taskChanges.title).toBe('Task with in middle');
+      expect(r?.attachments.length).toBe(1);
+    });
+
+    it('should handle Windows file paths', async () => {
+      const t = {
+        ...TASK,
+        title: 'Task file:///C:/Users/name/document.pdf',
+      };
+      const r = await shortSyntax(t, EXTRACT_CONFIG);
+      expect(r).toBeDefined();
+      expect(r?.attachments.length).toBe(1);
+      expect(r?.attachments[0].path).toBe('file:///C:/Users/name/document.pdf');
+      expect(r?.attachments[0].type).toBe('FILE');
+      expect(r?.taskChanges.title).toBe('Task');
+    });
+
+    it('should handle Unix file paths', async () => {
+      const t = {
+        ...TASK,
+        title: 'Task file:///home/user/document.txt',
+      };
+      const r = await shortSyntax(t, EXTRACT_CONFIG);
+      expect(r).toBeDefined();
+      expect(r?.attachments.length).toBe(1);
+      expect(r?.attachments[0].path).toBe('file:///home/user/document.txt');
+      expect(r?.attachments[0].type).toBe('FILE');
+      expect(r?.taskChanges.title).toBe('Task');
+    });
+
+    it('should not parse URLs for issue tasks', async () => {
+      const t = {
+        ...TASK,
+        title: 'Task https://example.com',
+        issueId: 'ISSUE-123',
+      };
+      const r = await shortSyntax(t, EXTRACT_CONFIG);
+      expect(r).toBeUndefined();
+    });
+
+    it('should handle URLs with trailing punctuation', async () => {
+      const t = {
+        ...TASK,
+        title: 'Check https://example.com.',
+      };
+      const r = await shortSyntax(t, EXTRACT_CONFIG);
+      expect(r).toBeDefined();
+      expect(r?.attachments.length).toBe(1);
+      expect(r?.attachments[0].path).toBe('https://example.com');
+      expect(r?.taskChanges.title).toBe('Check .');
+    });
+
+    it('should extract basename as attachment title', async () => {
+      const t = {
+        ...TASK,
+        title: 'Task https://example.com/path/to/file.pdf',
+      };
+      const r = await shortSyntax(t, EXTRACT_CONFIG);
+      expect(r).toBeDefined();
+      expect(r?.attachments.length).toBe(1);
+      expect(r?.attachments[0].title).toBe('file');
+    });
+
+    it('should extract basename correctly for URLs with trailing slash', async () => {
+      const t = {
+        ...TASK,
+        title: 'Task https://example.com/projects/',
+      };
+      const r = await shortSyntax(t, EXTRACT_CONFIG);
+      expect(r).toBeDefined();
+      expect(r?.attachments.length).toBe(1);
+      expect(r?.attachments[0].path).toBe('https://example.com/projects/');
+      expect(r?.attachments[0].title).toBe('projects');
+      expect(r?.taskChanges.title).toBe('Task');
+    });
+  });
+
+  describe('URL behavior modes', () => {
+    it('should remove URL from title when urlBehavior is "extract"', async () => {
+      const t = {
+        ...TASK,
+        title: 'Check https://example.com for details',
+      };
+      const r = await shortSyntax(t, { ...CONFIG, urlBehavior: 'extract' });
+      expect(r).toBeDefined();
+      expect(r?.attachments.length).toBe(1);
+      expect(r?.attachments[0].path).toBe('https://example.com');
+      expect(r?.taskChanges.title).toBe('Check for details');
+    });
+
+    it('should use attachment title as task name when pasting a bare URL with urlBehavior "extract"', async () => {
+      const t = {
+        ...TASK,
+        title: 'https://example.com/my-cool-page',
+      };
+      const r = await shortSyntax(t, { ...CONFIG, urlBehavior: 'extract' });
+      expect(r).toBeDefined();
+      expect(r?.attachments.length).toBe(1);
+      expect(r?.attachments[0].path).toBe('https://example.com/my-cool-page');
+      expect(r?.taskChanges.title).toBe('my-cool-page');
+    });
+
+    it('should use domain basename as task name when pasting a root URL with urlBehavior "extract"', async () => {
+      const t = {
+        ...TASK,
+        title: 'https://example.com',
+      };
+      const r = await shortSyntax(t, { ...CONFIG, urlBehavior: 'extract' });
+      expect(r).toBeDefined();
+      expect(r?.taskChanges.title).toBe('example');
+    });
+
+    it('should keep URL in title and add attachment when urlBehavior is "keep-and-attach"', async () => {
+      const t = {
+        ...TASK,
+        title: 'Check https://example.com for details',
+      };
+      const r = await shortSyntax(t, { ...CONFIG, urlBehavior: 'keep-and-attach' });
+      expect(r).toBeDefined();
+      expect(r?.attachments.length).toBe(1);
+      expect(r?.attachments[0].path).toBe('https://example.com');
+      expect(r?.taskChanges.title).toBe('Check https://example.com for details');
+    });
+
+    it('should keep URL in title without attachment when urlBehavior is "keep"', async () => {
+      const t = {
+        ...TASK,
+        title: 'Check https://example.com for details',
+      };
+      const r = await shortSyntax(t, { ...CONFIG, urlBehavior: 'keep' });
+      expect(r).toBeUndefined();
+    });
+
+    it('should keep multiple URLs in title and add attachments when urlBehavior is "keep-and-attach"', async () => {
+      const t = {
+        ...TASK,
+        title: 'Check https://example.com and www.test.org',
+      };
+      const r = await shortSyntax(t, { ...CONFIG, urlBehavior: 'keep-and-attach' });
+      expect(r).toBeDefined();
+      expect(r?.attachments.length).toBe(2);
+      expect(r?.attachments[0].path).toBe('https://example.com');
+      expect(r?.attachments[1].path).toBe('//www.test.org');
+      expect(r?.taskChanges.title).toBe('Check https://example.com and www.test.org');
+    });
+
+    it('should remove multiple URLs from title when urlBehavior is "extract"', async () => {
+      const t = {
+        ...TASK,
+        title: 'Check https://example.com and www.test.org',
+      };
+      const r = await shortSyntax(t, { ...CONFIG, urlBehavior: 'extract' });
+      expect(r).toBeDefined();
+      expect(r?.attachments.length).toBe(2);
+      expect(r?.taskChanges.title).toBe('Check and');
+    });
+
+    it('should work with keep-and-attach mode and other short syntax', async () => {
+      const t = {
+        ...TASK,
+        title: 'Task https://example.com @tomorrow #urgent 30m',
+      };
+      const r = await shortSyntax(
+        t,
+        { ...CONFIG, urlBehavior: 'keep-and-attach' },
+        ALL_TAGS,
+      );
+      expect(r).toBeDefined();
+      expect(r?.attachments.length).toBe(1);
+      expect(r?.attachments[0].path).toBe('https://example.com');
+      expect(r?.taskChanges.title).toBe('Task https://example.com');
+      expect(r?.taskChanges.timeEstimate).toBe(1800000);
+      expect(r?.newTagTitles).toContain('urgent');
+      expect(r?.taskChanges.dueWithTime).toBeDefined();
+    });
+
+    it('should work with keep mode and other short syntax', async () => {
+      const t = {
+        ...TASK,
+        title: 'Task https://example.com @tomorrow #urgent 30m',
+      };
+      const r = await shortSyntax(t, { ...CONFIG, urlBehavior: 'keep' }, ALL_TAGS);
+      expect(r).toBeDefined();
+      // In 'keep' mode, URL is not added as attachment, so attachments should be empty or undefined
+      expect(r?.attachments?.length || 0).toBe(0);
+      expect(r?.taskChanges.title).toBe('Task https://example.com');
+      expect(r?.taskChanges.timeEstimate).toBe(1800000);
+      expect(r?.newTagTitles).toContain('urgent');
+      expect(r?.taskChanges.dueWithTime).toBeDefined();
+    });
+
+    it('should create attachments in extract and keep-and-attach modes', async () => {
+      const t1 = {
+        ...TASK,
+        title: 'Task https://example.com',
+      };
+      const t2 = {
+        ...TASK,
+        title: 'Task https://example.com',
+      };
+
+      const extractResult = await shortSyntax(t1, { ...CONFIG, urlBehavior: 'extract' });
+      const keepAndAttachResult = await shortSyntax(t2, {
+        ...CONFIG,
+        urlBehavior: 'keep-and-attach',
+      });
+
+      expect(extractResult?.attachments.length).toBe(1);
+      expect(keepAndAttachResult?.attachments.length).toBe(1);
+      expect(extractResult?.attachments[0].path).toBe(
+        keepAndAttachResult?.attachments[0].path,
+      );
+      expect(extractResult?.attachments[0].type).toBe(
+        keepAndAttachResult?.attachments[0].type,
+      );
+    });
+
+    it('should use default urlBehavior "keep" from CONFIG', async () => {
+      const t = {
+        ...TASK,
+        title: 'Task https://example.com',
+      };
+      // CONFIG has urlBehavior: 'keep' as default (from updated default config)
+      const r = await shortSyntax(t, CONFIG);
+      // In 'keep' mode, URL stays in title but no attachment is created, so no changes
+      expect(r).toBeUndefined();
+    });
+
+    it('should use default urlBehavior "keep" when undefined', async () => {
+      const t = {
+        ...TASK,
+        title: 'Task https://example.com',
+      };
+      const r = await shortSyntax(t, { ...CONFIG, urlBehavior: undefined });
+      // When urlBehavior is undefined, defaults to 'keep' mode
+      expect(r).toBeUndefined();
+    });
+
+    it('should not create duplicate attachments in keep-and-attach mode', async () => {
+      const t = {
+        ...TASK,
+        title: 'Task https://example.com',
+        attachments: [
+          {
+            id: 'existing-1',
+            type: 'LINK' as const,
+            path: 'https://example.com',
+            title: 'example',
+            icon: 'bookmark',
+          },
+        ],
+      };
+      const r = await shortSyntax(t, { ...CONFIG, urlBehavior: 'keep-and-attach' });
+      // Should return undefined because URL already exists as attachment and title unchanged
+      expect(r).toBeUndefined();
+    });
+
+    it('should not create duplicate attachments in extract mode', async () => {
+      const t = {
+        ...TASK,
+        title: 'Task https://example.com',
+        attachments: [
+          {
+            id: 'existing-1',
+            type: 'LINK' as const,
+            path: 'https://example.com',
+            title: 'example',
+            icon: 'bookmark',
+          },
+        ],
+      };
+      const r = await shortSyntax(t, { ...CONFIG, urlBehavior: 'extract' });
+      // Should still remove URL from title but not create duplicate attachment
+      expect(r).toBeDefined();
+      expect(r?.attachments.length).toBe(0);
+      expect(r?.taskChanges.title).toBe('Task');
+    });
+
+    it('should create attachment for new URL even with existing attachments in keep-and-attach mode', async () => {
+      const t = {
+        ...TASK,
+        title: 'Task https://example.com https://newsite.com',
+        attachments: [
+          {
+            id: 'existing-1',
+            type: 'LINK' as const,
+            path: 'https://example.com',
+            title: 'example',
+            icon: 'bookmark',
+          },
+        ],
+      };
+      const r = await shortSyntax(t, { ...CONFIG, urlBehavior: 'keep-and-attach' });
+      expect(r).toBeDefined();
+      expect(r?.attachments.length).toBe(1);
+      expect(r?.attachments[0].path).toBe('https://newsite.com');
+      expect(r?.taskChanges.title).toBe('Task https://example.com https://newsite.com');
+    });
+
+    it('should not create any attachments in keep mode even with URLs', async () => {
+      const t = {
+        ...TASK,
+        title: 'Task https://example.com https://newsite.com',
+      };
+      const r = await shortSyntax(t, { ...CONFIG, urlBehavior: 'keep' });
+      expect(r).toBeUndefined();
+    });
+
+    describe('markdown links (issue #7032)', () => {
+      it('should not extract URL from markdown link in keep mode', async () => {
+        const t = {
+          ...TASK,
+          title: 'Add [Website](https://example.com/)',
+        };
+        const r = await shortSyntax(t, { ...CONFIG, urlBehavior: 'keep' });
+        expect(r).toBeUndefined();
+      });
+
+      it('should extract correct URL from markdown link in extract mode', async () => {
+        const t = {
+          ...TASK,
+          title: 'Add [Website](https://example.com/)',
+        };
+        const r = await shortSyntax(t, { ...CONFIG, urlBehavior: 'extract' });
+        expect(r).toBeDefined();
+        expect(r?.attachments.length).toBe(1);
+        expect(r?.attachments[0].path).toBe('https://example.com/');
+        expect(r?.taskChanges.title).toBe('Add Website');
+      });
+
+      it('should extract correct URL from markdown link in keep-and-attach mode', async () => {
+        const t = {
+          ...TASK,
+          title: 'Add [Website](https://example.com/)',
+        };
+        const r = await shortSyntax(t, {
+          ...CONFIG,
+          urlBehavior: 'keep-and-attach',
+        });
+        expect(r).toBeDefined();
+        expect(r?.attachments.length).toBe(1);
+        expect(r?.attachments[0].path).toBe('https://example.com/');
+        // keep-and-attach preserves the original title
+        expect(r?.taskChanges.title).toBe('Add [Website](https://example.com/)');
+      });
+
+      it('should handle markdown link with trailing text', async () => {
+        const t = {
+          ...TASK,
+          title: 'Check [docs](https://example.com/docs) for details',
+        };
+        const r = await shortSyntax(t, { ...CONFIG, urlBehavior: 'extract' });
+        expect(r).toBeDefined();
+        expect(r?.attachments.length).toBe(1);
+        expect(r?.attachments[0].path).toBe('https://example.com/docs');
+        expect(r?.taskChanges.title).toBe('Check docs for details');
+      });
+
+      it('should handle markdown link with parentheses in URL', async () => {
+        const t = {
+          ...TASK,
+          title: 'Read [article](https://en.wikipedia.org/wiki/C_(programming_language))',
+        };
+        const r = await shortSyntax(t, { ...CONFIG, urlBehavior: 'extract' });
+        expect(r).toBeDefined();
+        expect(r?.attachments.length).toBe(1);
+        expect(r?.attachments[0].path).toBe(
+          'https://en.wikipedia.org/wiki/C_(programming_language)',
+        );
+        expect(r?.taskChanges.title).toBe('Read article');
+      });
+
+      it('should handle multiple markdown links in extract mode', async () => {
+        const t = {
+          ...TASK,
+          title: '[Site1](https://a.com) and [Site2](https://b.com)',
+        };
+        const r = await shortSyntax(t, { ...CONFIG, urlBehavior: 'extract' });
+        expect(r).toBeDefined();
+        expect(r?.attachments.length).toBe(2);
+        expect(r?.attachments[0].path).toBe('https://a.com');
+        expect(r?.attachments[1].path).toBe('https://b.com');
+        expect(r?.taskChanges.title).toBe('Site1 and Site2');
+      });
+
+      it('should handle mixed markdown link and plain URL in extract mode', async () => {
+        const t = {
+          ...TASK,
+          title: '[docs](https://a.com) and https://b.com',
+        };
+        const r = await shortSyntax(t, { ...CONFIG, urlBehavior: 'extract' });
+        expect(r).toBeDefined();
+        expect(r?.attachments.length).toBe(2);
+        expect(r?.attachments[0].path).toBe('https://a.com');
+        expect(r?.attachments[1].path).toBe('https://b.com');
+        expect(r?.taskChanges.title).toBe('docs and');
+      });
+
+      // The stripped characters are the '[' and the '](url)' — the display
+      // text stays, so the highlight must cover the brackets, not the label.
+      it('should highlight the stripped markdown syntax around the display text', async () => {
+        const title = 'Check [docs](https://example.com/docs) for details';
+        const r = await shortSyntax(
+          { ...TASK, title },
+          { ...CONFIG, urlBehavior: 'extract' },
+        );
+        expect(r?.parsedRanges).toEqual([
+          { type: 'url', start: 6, end: 7 },
+          { type: 'url', start: 11, end: 38 },
+        ]);
+        expect(title.slice(6, 7)).toBe('[');
+        expect(title.slice(11, 38)).toBe('](https://example.com/docs)');
+      });
+
+      it('should highlight markdown syntax and a plain URL in the same title', async () => {
+        const title = '[docs](https://a.com) and https://b.com';
+        const r = await shortSyntax(
+          { ...TASK, title },
+          { ...CONFIG, urlBehavior: 'extract' },
+        );
+        expect(r?.parsedRanges).toEqual([
+          { type: 'url', start: 0, end: 1 },
+          { type: 'url', start: 5, end: 21 },
+          { type: 'url', start: 26, end: 39 },
+        ]);
+        expect(title.slice(5, 21)).toBe('](https://a.com)');
+        expect(title.slice(26, 39)).toBe('https://b.com');
+      });
+
+      it('should not touch the title when a markdown link carries no URL', async () => {
+        const r = await shortSyntax(
+          { ...TASK, title: 'Add [Website]()' },
+          { ...CONFIG, urlBehavior: 'extract' },
+        );
+        expect(r).toBeUndefined();
+      });
+
+      // A URL-less link must survive whether or not the title happens to hold
+      // another URL — otherwise unrelated text decides if the user keeps those
+      // characters, and nothing is extracted in exchange for dropping them.
+      it('should keep a URL-less markdown link when another URL is extracted', async () => {
+        const title = 'Add [Website]() https://a.com';
+        const r = await shortSyntax(
+          { ...TASK, title },
+          { ...CONFIG, urlBehavior: 'extract' },
+        );
+        expect(r?.attachments.length).toBe(1);
+        expect(r?.attachments[0].path).toBe('https://a.com');
+        expect(r?.taskChanges.title).toBe('Add [Website]()');
+        expect(r?.parsedRanges).toEqual([{ type: 'url', start: 16, end: 29 }]);
+        expect(title.slice(16, 29)).toBe('https://a.com');
+      });
+
+      it('should collapse only the markdown links that carry a URL', async () => {
+        const title = '[a]() [b](https://b.com)';
+        const r = await shortSyntax(
+          { ...TASK, title },
+          { ...CONFIG, urlBehavior: 'extract' },
+        );
+        expect(r?.attachments.length).toBe(1);
+        expect(r?.attachments[0].path).toBe('https://b.com');
+        expect(r?.taskChanges.title).toBe('[a]() b');
+        expect(r?.parsedRanges).toEqual([
+          { type: 'url', start: 6, end: 7 },
+          { type: 'url', start: 8, end: 24 },
+        ]);
+        expect(title.slice(8, 24)).toBe('](https://b.com)');
+      });
+    });
+  });
+
+  // Positions come from the parser's offset map, not from searching the raw
+  // text — these inputs are exactly the ones where searching guesses wrong
+  describe('parsedRanges position tracking', () => {
+    it('should not highlight an estimate inside a tag', async () => {
+      const t = {
+        ...TASK,
+        title: '#1h retro 1h',
+      };
+      const r = await shortSyntax(t, CONFIG, ALL_TAGS);
+      expect(r?.taskChanges.title).toBe('retro');
+      expect(r?.newTagTitles).toEqual(['1h']);
+      expect(r?.parsedRanges).toEqual([
+        { type: 'tag', start: 0, end: 3 },
+        { type: 'estimate', start: 10, end: 12 },
+      ]);
+    });
+
+    it('should not highlight an estimate inside a URL', async () => {
+      const t = {
+        ...TASK,
+        title: 'Read https://ex.com/30m-guide later 30m',
+      };
+      const r = await shortSyntax(t, { ...CONFIG, urlBehavior: 'extract' });
+      expect(r?.taskChanges.title).toBe('Read later');
+      expect(r?.parsedRanges).toEqual([
+        { type: 'url', start: 5, end: 29 },
+        { type: 'estimate', start: 36, end: 39 },
+      ]);
+    });
+
+    it('should split a due range around an earlier estimate removal', async () => {
+      const t = {
+        ...TASK,
+        title: 'Call Bob @tomorrow 1h evening',
+      };
+      const now = new Date(2024, 0, 15, 10, 0, 0, 0);
+      const r = await shortSyntax(t, CONFIG, undefined, undefined, now);
+      expect(r?.taskChanges.title).toBe('Call Bob');
+      expect(r?.parsedRanges).toEqual([
+        { type: 'due', start: 9, end: 18 },
+        { type: 'estimate', start: 19, end: 21 },
+        { type: 'due', start: 22, end: 29 },
+      ]);
+    });
+
+    it('should locate duplicate tag texts at distinct positions', async () => {
+      const t = {
+        ...TASK,
+        title: 'A #blu #blu',
+      };
+      const r = await shortSyntax(t, CONFIG, ALL_TAGS);
+      expect(r?.parsedRanges).toEqual([
+        { type: 'tag', start: 2, end: 6 },
+        { type: 'tag', start: 7, end: 11 },
+      ]);
+    });
+  });
+});
+
+describe('parseTimeSpentChanges', () => {
+  it('should parse time estimate from title', () => {
+    const result = parseTimeSpentChanges({ title: 'Subtask 30m' });
+    expect(result.timeEstimate).toBe(30 * 60 * 1000);
+    expect(result.title).toBe('Subtask');
+  });
+
+  it('should parse time spent and estimate from title', () => {
+    const result = parseTimeSpentChanges({ title: 'Subtask 10m/1h' });
+    expect(result.timeEstimate).toBe(60 * 60 * 1000);
+    expect(result.timeSpentOnDay?.[getDbDateStr()]).toBe(10 * 60 * 1000);
+    expect(result.title).toBe('Subtask');
+  });
+
+  it('should return empty object for title without time syntax', () => {
+    const result = parseTimeSpentChanges({ title: 'Just a regular subtask' });
+    expect(result).toEqual({});
+  });
+
+  it('should return empty object when title is undefined', () => {
+    const result = parseTimeSpentChanges({});
+    expect(result).toEqual({});
+  });
+
+  it('should return empty object for empty string title', () => {
+    const result = parseTimeSpentChanges({ title: '' });
+    expect(result).toEqual({});
+  });
+
+  it('should handle time-only title', () => {
+    const result = parseTimeSpentChanges({ title: '2h' });
+    expect(result.timeEstimate).toBe(2 * 60 * 60 * 1000);
+    expect(result.title).toBe('');
+  });
+
+  it('should work without timeSpentOnDay on the input', () => {
+    const result = parseTimeSpentChanges({ title: 'Task 15m/' });
+    expect(result.timeSpentOnDay?.[getDbDateStr()]).toBe(15 * 60 * 1000);
+    expect(result.title).toBe('Task');
+  });
+});
+
+describe('shortSyntax recurrence', () => {
+  // Wed Jan 17 2024, 10:00 local time
+  const NOW = new Date(2024, 0, 17, 10, 0, 0, 0);
+
+  const parse = async (title: string, now: Date = NOW): ReturnType<typeof shortSyntax> =>
+    shortSyntax({ ...TASK, title }, CONFIG, [], [], now, 'combine', true);
+
+  // Quick setting of a parsed preset recurrence; null for anything else (no
+  // recurrence at all, or an interval — which has no preset by definition)
+  const presetOf = (
+    r: Awaited<ReturnType<typeof shortSyntax>>,
+  ): RepeatQuickSetting | null =>
+    r?.repeat?.type === 'PRESET' ? r.repeat.quickSetting : null;
+
+  it('should parse "@every friday" as weekly repeat anchored to next friday', async () => {
+    const r = await parse('Water plants @every friday');
+    expect(presetOf(r)).toBe('WEEKLY_CURRENT_WEEKDAY');
+    expect(r?.taskChanges.title).toBe('Water plants');
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDay()).toBe(5);
+    expect(due.getTime()).toBeGreaterThan(NOW.getTime());
+    expect(r?.taskChanges.hasPlannedTime).toBe(false);
+  });
+
+  it('should keep today as anchor when "@every wednesday" matches the current weekday', async () => {
+    const r = await parse('Standup @every wednesday');
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDay()).toBe(3);
+    expect(due.getDate()).toBe(17);
+  });
+
+  it('should parse weekday abbreviations and plurals', async () => {
+    for (const syntax of ['@every fri', '@every fridays', '@every Fri']) {
+      const r = await parse(`Water plants ${syntax}`);
+      expect(presetOf(r)).toBe('WEEKLY_CURRENT_WEEKDAY');
+      const due = new Date(r?.taskChanges.dueWithTime as number);
+      expect(due.getDay()).toBe(5);
+    }
+  });
+
+  it('should parse "@every friday 3pm" with a start time', async () => {
+    const r = await parse('Team call @every friday 3pm');
+    expect(presetOf(r)).toBe('WEEKLY_CURRENT_WEEKDAY');
+    expect(r?.taskChanges.title).toBe('Team call');
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDay()).toBe(5);
+    expect(due.getHours()).toBe(15);
+    expect(r?.taskChanges.hasPlannedTime).toBeUndefined();
+  });
+
+  it('should parse "@daily" as daily repeat without an anchor date', async () => {
+    const r = await parse('Journal @daily');
+    expect(presetOf(r)).toBe('DAILY');
+    expect(r?.taskChanges.title).toBe('Journal');
+    expect(r?.taskChanges.dueWithTime).toBeUndefined();
+  });
+
+  it('should parse "@daily 6am" with a time anchor', async () => {
+    const r = await parse('Journal @daily 6am');
+    expect(presetOf(r)).toBe('DAILY');
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getHours()).toBe(6);
+  });
+
+  it('should parse interval phrases as an interval recurrence', async () => {
+    const expected: [string, string, number][] = [
+      ['Water flowers @every 3 days', 'DAILY', 3],
+      ['Review @every 2 weeks', 'WEEKLY', 2],
+      ['Invoice @every 2 months', 'MONTHLY', 2],
+      ['Checkup @every 2 years', 'YEARLY', 2],
+      ['Deploy @every 10 day', 'DAILY', 10],
+    ];
+    for (const [title, repeatCycle, repeatEvery] of expected) {
+      const r = await parse(title);
+      expect(r?.repeat)
+        .withContext(title)
+        .toEqual({ type: 'INTERVAL', repeatCycle, repeatEvery } as never);
+    }
+  });
+
+  it('should strip the whole interval phrase from the title', async () => {
+    const r = await parse('Review @every 2 weeks');
+    expect(r?.taskChanges.title).toBe('Review');
+  });
+
+  it('should parse "@every 2 fridays" as a weekly interval anchored to next friday', async () => {
+    const r = await parse('Water plants @every 2 fridays');
+    expect(r?.repeat).toEqual({
+      type: 'INTERVAL',
+      repeatCycle: 'WEEKLY',
+      repeatEvery: 2,
+    } as never);
+    expect(r?.taskChanges.title).toBe('Water plants');
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDay()).toBe(5);
+    expect(due.getDate()).toBe(19);
+    expect(r?.taskChanges.hasPlannedTime).toBe(false);
+  });
+
+  it('should parse weekday interval abbreviations and singulars', async () => {
+    for (const syntax of ['@every 3 fri', '@every 3 friday', '@every 3 Fridays']) {
+      const r = await parse(`Water plants ${syntax}`);
+      expect(r?.repeat)
+        .withContext(syntax)
+        .toEqual({ type: 'INTERVAL', repeatCycle: 'WEEKLY', repeatEvery: 3 } as never);
+      const due = new Date(r?.taskChanges.dueWithTime as number);
+      expect(due.getDay()).withContext(syntax).toBe(5);
+    }
+  });
+
+  it('should collapse "@every 1 friday" to the weekly preset on friday', async () => {
+    const r = await parse('Water plants @every 1 friday');
+    expect(presetOf(r)).toBe('WEEKLY_CURRENT_WEEKDAY');
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDay()).toBe(5);
+  });
+
+  it('should advance a weekday interval one week when the time today is already past', async () => {
+    // Friday 17:00 — "@every 2 fridays 3pm" must not be due 2h in the past
+    const r = await parse('Team call @every 2 fridays 3pm', new Date(2024, 0, 19, 17, 0));
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDate()).toBe(26);
+    expect(due.getHours()).toBe(15);
+  });
+
+  it('should NOT parse "@every 2 weekdays" as recurrence', async () => {
+    // Every other workday is not expressible as a weekly cycle — five weekday
+    // flags plus an interval means every other *week*, all five days
+    const r = await parse('Standup @every 2 weekdays');
+    expect(r?.repeat ?? null).toBeNull();
+  });
+
+  it('should collapse an interval of 1 to the equivalent preset', async () => {
+    const expected: [string, RepeatQuickSetting][] = [
+      ['Journal @every 1 day', 'DAILY'],
+      ['Review @every 1 week', 'WEEKLY_CURRENT_WEEKDAY'],
+      ['Invoice @every 1 month', 'MONTHLY_CURRENT_DATE'],
+      ['Checkup @every 1 year', 'YEARLY_CURRENT_DATE'],
+    ];
+    for (const [title, quickSetting] of expected) {
+      const r = await parse(title);
+      expect(presetOf(r)).withContext(title).toBe(quickSetting);
+    }
+  });
+
+  it('should not treat a zero or oversized interval as recurrence', async () => {
+    for (const title of ['Review @every 0 days', 'Review @every 1000 days']) {
+      const r = await parse(title);
+      expect(r?.repeat ?? null)
+        .withContext(title)
+        .toBeNull();
+    }
+  });
+
+  it('should not treat a bare ordinal interval as an interval', async () => {
+    // "@every 2nd" stays monthly-on-the-2nd, not "every 2 <cycle>"
+    const r = await parse('Pay rent @every 2nd', new Date(2024, 0, 20, 10, 0));
+    expect(presetOf(r)).toBe('MONTHLY_CURRENT_DATE');
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDate()).toBe(2);
+  });
+
+  it('should not anchor a plain interval to a date', async () => {
+    // No time given → the add-task bar seeds today as the first occurrence
+    const r = await parse('Review @every 2 weeks');
+    expect(r?.taskChanges.dueWithTime).toBeUndefined();
+  });
+
+  it('should keep today as the anchor weekday for "@every 2 weeks 6am" after 6am', async () => {
+    // Wed Jan 17 10:00 — chrono alone would slide 6am to Thursday, silently
+    // moving the recurrence one weekday over
+    const r = await parse('Review @every 2 weeks 6am');
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDay()).toBe(3);
+    expect(due.getDate()).toBe(24);
+    expect(due.getHours()).toBe(6);
+  });
+
+  it("should let a daily interval take chrono's next occurrence of a passed time", async () => {
+    // Every day is an occurrence, so tomorrow 6am is the correct first one
+    const r = await parse('Water plants @every 2 days 6am');
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDate()).toBe(18);
+    expect(due.getHours()).toBe(6);
+  });
+
+  it('should keep the day-of-month anchor for "@every 3 months 6am" after 6am', async () => {
+    const r = await parse('Invoice @every 3 months 6am');
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDate()).toBe(17);
+    expect(due.getMonth()).toBe(1);
+    expect(due.getHours()).toBe(6);
+  });
+
+  it('should parse "@every weekday" as monday through friday', async () => {
+    const r = await parse('Standup @every weekday');
+    expect(presetOf(r)).toBe('MONDAY_TO_FRIDAY');
+  });
+
+  it('should not anchor "@every weekday 6am" to today\'s weekday', async () => {
+    // Wed Jan 17 10:00 — every workday is an occurrence, so tomorrow 6am is the
+    // right first one. Anchoring it the way the *_CURRENT_* presets are would
+    // roll a whole week instead, to Wed the 24th.
+    const r = await parse('Standup @every weekday 6am');
+    expect(presetOf(r)).toBe('MONDAY_TO_FRIDAY');
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDate()).toBe(18);
+    expect(due.getHours()).toBe(6);
+  });
+
+  it('should skip the weekend for "@every weekday 6am" typed on a Friday after 6am', async () => {
+    // Fri Jan 19 08:00 — chrono slides the passed 6am to Saturday, which the
+    // workday preset excludes. getFirstRepeatOccurrence would put the task on
+    // Monday off the config's weekday flags, so previewing Saturday would show
+    // a first occurrence the task never gets.
+    const r = await parse('Standup @every weekday 6am', new Date(2024, 0, 19, 8, 0));
+    expect(presetOf(r)).toBe('MONDAY_TO_FRIDAY');
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDate()).toBe(22);
+    expect(due.getDay()).toBe(1);
+    expect(due.getHours()).toBe(6);
+  });
+
+  it('should skip the weekend for "@every weekday 6am" typed on a Saturday', async () => {
+    // Sat Jan 20 05:00 — 6am is still ahead, so chrono keeps today; the whole
+    // weekend has to be skipped, not just the slid day.
+    const r = await parse('Standup @every weekday 6am', new Date(2024, 0, 20, 5, 0));
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDate()).toBe(22);
+    expect(due.getDay()).toBe(1);
+    expect(due.getHours()).toBe(6);
+  });
+
+  it('should keep the typed time when the skipped-over sunday springs forward', async () => {
+    // The weekend skip steps through Sunday, which is the day DST changes. If
+    // the typed time falls in the spring-forward gap, setDate normalizes it and
+    // the shift sticks — and this one is not preview-only: the time is read back
+    // off the parsed timestamp into the repeat config's startTime, so the task
+    // would recur an hour late every workday.
+    const gap = findSpringForwardSunday(2026);
+    if (!gap) {
+      // Timezone without a spring-forward transition (UTC, Tokyo).
+      return;
+    }
+    const friday = new Date(gap.sunday);
+    friday.setDate(friday.getDate() - 2);
+    friday.setHours(gap.missingHour + 6, 0);
+    const r = await parse(`Standup @every weekday ${gap.missingHour}:30am`, friday);
+    expect(presetOf(r)).toBe('MONDAY_TO_FRIDAY');
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDay()).toBe(1);
+    expect(due.getHours()).toBe(gap.missingHour);
+    expect(due.getMinutes()).toBe(30);
+    expect(r?.taskChanges.dueTimeStr).toBe(`0${gap.missingHour}:30`);
+  });
+
+  it('should carry the typed time when the anchor day itself springs forward', async () => {
+    // Unlike the weekend skip, an anchor landing ON the transition day cannot
+    // be repaired on the timestamp: the typed time does not exist that day, so
+    // the Date can only hold the shifted hour. The typed wall-clock time must
+    // travel separately (dueTimeStr) or the repeat config's startTime is wrong
+    // for every later occurrence, where the time does exist.
+    const gap = findSpringForwardSunday(2026);
+    if (!gap) {
+      // Timezone without a spring-forward transition (UTC, Tokyo).
+      return;
+    }
+    const friday = new Date(gap.sunday);
+    friday.setDate(friday.getDate() - 2);
+    friday.setHours(10, 0);
+    const r = await parse(`Backup @every sunday ${gap.missingHour}:30am`, friday);
+    expect(presetOf(r)).toBe('WEEKLY_CURRENT_WEEKDAY');
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDay()).toBe(0);
+    expect(r?.taskChanges.dueTimeStr).toBe(`0${gap.missingHour}:30`);
+  });
+
+  it('should carry the typed time when the monthly anchor day springs forward', async () => {
+    const gap = findSpringForwardSunday(2026);
+    if (!gap) {
+      return;
+    }
+    const twoDaysBefore = new Date(gap.sunday);
+    twoDaysBefore.setDate(twoDaysBefore.getDate() - 2);
+    twoDaysBefore.setHours(10, 0);
+    const dayOfMonth = gap.sunday.getDate();
+    const suffix = [1, 21, 31].includes(dayOfMonth)
+      ? 'st'
+      : [2, 22].includes(dayOfMonth)
+        ? 'nd'
+        : [3, 23].includes(dayOfMonth)
+          ? 'rd'
+          : 'th';
+    const r = await parse(
+      `Pay rent @every ${dayOfMonth}${suffix} ${gap.missingHour}:30am`,
+      twoDaysBefore,
+    );
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDate()).toBe(gap.sunday.getDate());
+    expect(r?.taskChanges.dueTimeStr).toBe(`0${gap.missingHour}:30`);
+  });
+
+  it('should carry the typed time when the weekly roll lands on the spring-forward sunday', async () => {
+    // Typed on a Sunday after the typed time has passed, the anchor rolls +7
+    // and lands on the transition Sunday, where the typed time does not exist.
+    const gap = findSpringForwardSunday(2026);
+    if (!gap) {
+      return;
+    }
+    const prevSunday = new Date(gap.sunday);
+    prevSunday.setDate(prevSunday.getDate() - 7);
+    prevSunday.setHours(15, 0);
+    const r = await parse(`Backup @every sunday ${gap.missingHour}:30am`, prevSunday);
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDay()).toBe(0);
+    expect(due.getTime()).toBeGreaterThan(prevSunday.getTime());
+    expect(r?.taskChanges.dueTimeStr).toBe(`0${gap.missingHour}:30`);
+  });
+
+  it('should parse "@every 15th" as monthly on next 15th', async () => {
+    const r = await parse('Pay rent @every 15th', new Date(2024, 0, 20, 10, 0));
+    expect(presetOf(r)).toBe('MONTHLY_CURRENT_DATE');
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDate()).toBe(15);
+    expect(due.getMonth()).toBe(1);
+  });
+
+  it('should anchor "@every 15th" to the current month when still upcoming', async () => {
+    const r = await parse('Pay rent @every 15th', new Date(2024, 0, 10, 10, 0));
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDate()).toBe(15);
+    expect(due.getMonth()).toBe(0);
+  });
+
+  it('should parse "@every month" and "@monthly" as monthly without anchor', async () => {
+    for (const syntax of ['@every month', '@monthly']) {
+      const r = await parse(`Backup ${syntax}`);
+      expect(presetOf(r)).toBe('MONTHLY_CURRENT_DATE');
+      expect(r?.taskChanges.dueWithTime).toBeUndefined();
+    }
+  });
+
+  it('should parse "@yearly" and "@every year" as yearly', async () => {
+    for (const syntax of ['@yearly', '@every year', '@annually']) {
+      const r = await parse(`Checkup ${syntax}`);
+      expect(presetOf(r)).toBe('YEARLY_CURRENT_DATE');
+    }
+  });
+
+  it('should work combined with tags', async () => {
+    const r = await shortSyntax(
+      { ...TASK, title: 'Water plants #blu @every sunday' },
+      CONFIG,
+      ALL_TAGS,
+      [],
+      NOW,
+      'combine',
+      true,
+    );
+    expect(presetOf(r)).toBe('WEEKLY_CURRENT_WEEKDAY');
+    expect(r?.taskChanges.tagIds).toEqual(['blu_id']);
+    expect(r?.taskChanges.title).toBe('Water plants');
+  });
+
+  it('should NOT parse recurrence when isParseRepeat is false (title-edit path)', async () => {
+    const r = await shortSyntax(
+      { ...TASK, title: 'Water plants @every friday' },
+      CONFIG,
+      [],
+      [],
+      NOW,
+    );
+    expect(r?.repeat).toBeNull();
+    // chrono still finds the date within the phrase, as before this feature
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDay()).toBe(5);
+  });
+
+  it('should NOT parse a plain "@friday" as recurrence', async () => {
+    const r = await parse('Water plants @friday');
+    expect(r?.repeat).toBeNull();
+    expect(r?.taskChanges.dueWithTime).toBeDefined();
+  });
+
+  it('should NOT parse deadline syntax "!every friday" as recurrence', async () => {
+    const r = await shortSyntax(
+      { ...TASK, title: 'Taxes !every friday' },
+      DEADLINE_CONFIG,
+      [],
+      [],
+      NOW,
+      'combine',
+      true,
+    );
+    expect(r?.repeat).toBeNull();
+  });
+
+  it('should NOT treat a recurrence phrase mid-match as recurrence', async () => {
+    const r = await parse('Meet @friday every week');
+    expect(r?.repeat).toBeNull();
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDay()).toBe(5);
+  });
+
+  it('should NOT match an incomplete "@every"', async () => {
+    const r = await parse('Task @every');
+    expect(r?.repeat ?? null).toBeNull();
+  });
+
+  it('should NOT match words merely starting with a frequency word', async () => {
+    const r = await parse('Meet @dailystandup');
+    expect(r?.repeat ?? null).toBeNull();
+  });
+
+  it('should tolerate trailing punctuation after the phrase', async () => {
+    for (const title of [
+      'Water plants @every friday.',
+      'Water plants @every friday,',
+      'Journal @daily.',
+    ]) {
+      const r = await parse(title);
+      expect(presetOf(r))
+        .withContext(title)
+        .toBe(title.includes('daily') ? 'DAILY' : 'WEEKLY_CURRENT_WEEKDAY');
+    }
+  });
+
+  it('should join tolerated trailing punctuation to the preceding word', async () => {
+    const expected: [string, string][] = [
+      ['Water plants @every friday.', 'Water plants.'],
+      ['Water plants @every friday,', 'Water plants,'],
+      ['Buy milk @every friday, then rest', 'Buy milk, then rest'],
+    ];
+    for (const [title, cleaned] of expected) {
+      const r = await parse(title);
+      expect(r?.taskChanges.title).withContext(title).toBe(cleaned);
+    }
+  });
+
+  it('should only absorb a chrono match directly following the phrase', async () => {
+    const r = await parse('@every friday call mom tomorrow');
+    expect(presetOf(r)).toBe('WEEKLY_CURRENT_WEEKDAY');
+    expect(r?.taskChanges.title).toBe('call mom tomorrow');
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDay()).toBe(5);
+  });
+
+  it('should keep words between the phrase and a later date expression', async () => {
+    const r = await parse('Standup @every monday and friday');
+    expect(presetOf(r)).toBe('WEEKLY_CURRENT_WEEKDAY');
+    expect(r?.taskChanges.title).toBe('Standup and friday');
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDay()).toBe(1);
+  });
+
+  it('should not leave a double space when absorbing an adjacent date mid-title', async () => {
+    const r = await parse('Review @every week monday notes');
+    expect(presetOf(r)).toBe('WEEKLY_CURRENT_WEEKDAY');
+    expect(r?.taskChanges.title).toBe('Review notes');
+  });
+
+  it('should advance a weekly anchor one week when the time today is already past', async () => {
+    // Friday 17:00 — "@every friday 3pm" must not be due 2h in the past
+    const r = await parse('Team call @every friday 3pm', new Date(2024, 0, 19, 17, 0));
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDate()).toBe(26);
+    expect(due.getDay()).toBe(5);
+    expect(due.getHours()).toBe(15);
+  });
+
+  it('should keep a same-day weekly anchor when the time is still ahead', async () => {
+    const r = await parse('Team call @every friday 3pm', new Date(2024, 0, 19, 10, 0));
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDate()).toBe(19);
+    expect(due.getHours()).toBe(15);
+  });
+
+  it('should advance a monthly anchor one month when the time today is already past', async () => {
+    const r = await parse('Pay rent @every 15th 3pm', new Date(2024, 0, 15, 17, 0));
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getMonth()).toBe(1);
+    expect(due.getDate()).toBe(15);
+    expect(due.getHours()).toBe(15);
+  });
+
+  // The *_CURRENT_* presets take their recurring weekday / day-of-month from
+  // the first occurrence, so an already-passed time must roll a whole period —
+  // letting chrono's forwardDate move it to tomorrow would silently change what
+  // "@weekly" recurs on, depending only on the time of day it was typed.
+  it('should keep today\'s weekday for "@weekly 6am" typed after 6am', async () => {
+    // Wed Jan 17 10:00
+    const r = await parse('Journal @weekly 6am');
+    expect(presetOf(r)).toBe('WEEKLY_CURRENT_WEEKDAY');
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDay()).toBe(3);
+    expect(due.getDate()).toBe(24);
+    expect(due.getHours()).toBe(6);
+  });
+
+  it('should keep today as the "@weekly 6am" anchor when 6am is still ahead', async () => {
+    const r = await parse('Journal @weekly 6am', new Date(2024, 0, 17, 3, 0));
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDay()).toBe(3);
+    expect(due.getDate()).toBe(17);
+    expect(due.getHours()).toBe(6);
+  });
+
+  it('should keep today\'s day-of-month for "@monthly 6am" typed after 6am', async () => {
+    const r = await parse('Report @monthly 6am');
+    expect(presetOf(r)).toBe('MONTHLY_CURRENT_DATE');
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getMonth()).toBe(1);
+    expect(due.getDate()).toBe(17);
+    expect(due.getHours()).toBe(6);
+  });
+
+  it('should keep today\'s date for "@yearly 6am" typed after 6am', async () => {
+    const r = await parse('Renew domain @yearly 6am');
+    expect(presetOf(r)).toBe('YEARLY_CURRENT_DATE');
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getFullYear()).toBe(2025);
+    expect(due.getMonth()).toBe(0);
+    expect(due.getDate()).toBe(17);
+    expect(due.getHours()).toBe(6);
+  });
+
+  it('should skip a month lacking the anchor day when rolling "@monthly 6am" forward', async () => {
+    // Wed Jan 31 12:00 — February has no 31st, and clamping to Feb 29 would
+    // make the repeat engine recur on the 29th from then on
+    const r = await parse('Report @monthly 6am', new Date(2024, 0, 31, 12, 0));
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getMonth()).toBe(2);
+    expect(due.getDate()).toBe(31);
+    expect(due.getHours()).toBe(6);
+  });
+
+  it('should still let an explicit day beat the implied "@weekly" anchor', async () => {
+    const r = await parse('Journal @weekly monday');
+    expect(presetOf(r)).toBe('WEEKLY_CURRENT_WEEKDAY');
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDay()).toBe(1);
+  });
+
+  it('should leave "@daily 6am" on chrono\'s next-day roll', async () => {
+    const r = await parse('Journal @daily 6am');
+    expect(presetOf(r)).toBe('DAILY');
+    const due = new Date(r?.taskChanges.dueWithTime as number);
+    expect(due.getDate()).toBe(18);
+    expect(due.getHours()).toBe(6);
+  });
+});
+
+describe('shortSyntax nth weekday (@2monday)', () => {
+  // Wed Jan 17 2024, 10:00 local time
+  const NOW = new Date(2024, 0, 17, 10, 0, 0, 0);
+
+  const parse = async (
+    title: string,
+    now: Date = NOW,
+    mode: 'combine' | 'replace' = 'combine',
+  ): ReturnType<typeof shortSyntax> =>
+    shortSyntax({ ...TASK, title }, CONFIG, [], [], now, mode);
+
+  const dueOf = (r: Awaited<ReturnType<typeof shortSyntax>>): Date =>
+    new Date(r?.taskChanges.dueWithTime as number);
+
+  // The nth occurrence of a weekday counting from today, n=1 being the next one
+  const nthWeekdayFrom = (from: Date, weekday: number, nth: number): Date => {
+    const diff = (weekday - from.getDay() + 7) % 7;
+    const extraWeeks = (nth - 1) * 7;
+    return new Date(
+      from.getFullYear(),
+      from.getMonth(),
+      from.getDate() + diff + extraWeeks,
+      12,
+      0,
+    );
+  };
+
+  const expectNthWeekday = (
+    r: Awaited<ReturnType<typeof shortSyntax>>,
+    weekday: number,
+    nth: number,
+    now: Date = NOW,
+  ): void => {
+    const expected = nthWeekdayFrom(now, weekday, nth);
+    expect(formatDateToISO(dueOf(r))).toBe(formatDateToISO(expected));
+    expect(dueOf(r).getDay()).toBe(weekday);
+  };
+
+  it('should parse "@2monday" as the Monday after next', async () => {
+    const r = await parse('Water plants @2monday');
+    expect(r?.taskChanges.title).toBe('Water plants');
+    expectNthWeekday(r, 1, 2); // Mon Jan 22 + 7 = Mon Jan 29
+    expect(dueOf(r).getDate()).toBe(29);
+    expect(r?.taskChanges.hasPlannedTime).toBe(false);
+    expect(r?.repeat ?? null).toBeNull();
+  });
+
+  it('should parse "@4tuesday" as the fourth Tuesday', async () => {
+    const r = await parse('Review @4tuesday');
+    expect(r?.taskChanges.title).toBe('Review');
+    expectNthWeekday(r, 2, 4); // Tue Jan 23 + 3 weeks = Tue Feb 13
+    expect(dueOf(r).getDate()).toBe(13);
+    expect(dueOf(r).getMonth()).toBe(1);
+  });
+
+  it('should treat "@1monday" exactly like "@monday"', async () => {
+    const nth = await parse('Standup @1monday');
+    const plain = await parse('Standup @monday');
+    expect(nth?.taskChanges.title).toBe('Standup');
+    expect(nth?.taskChanges.dueWithTime).toBe(plain?.taskChanges.dueWithTime);
+    expect(nth?.taskChanges.hasPlannedTime).toBe(false);
+  });
+
+  for (const trigger of ['@', '!']) {
+    for (const hour of [10, 12, 17]) {
+      it(`should match plain ${trigger}monday without a time at ${hour}:00 on Monday`, async () => {
+        const now = new Date(2024, 0, 22, hour, 0, 0, 0);
+        const nth = await shortSyntax(
+          { ...TASK, title: `Task ${trigger}1monday` },
+          DEADLINE_CONFIG,
+          [],
+          [],
+          now,
+        );
+        const plain = await shortSyntax(
+          { ...TASK, title: `Task ${trigger}monday` },
+          DEADLINE_CONFIG,
+          [],
+          [],
+          now,
+        );
+        const expected = new Date(2024, 0, hour > 12 ? 29 : 22, 12);
+
+        expect(nth?.taskChanges.title).toBe('Task');
+        if (trigger === '@') {
+          expect(nth?.taskChanges.dueWithTime).toBe(expected.getTime());
+          expect(nth?.taskChanges.dueWithTime).toBe(plain?.taskChanges.dueWithTime);
+          expect(nth?.taskChanges.hasPlannedTime).toBe(false);
+        } else {
+          expect(nth?.taskChanges.deadlineWithTime).toBe(expected.getTime());
+          expect(nth?.taskChanges.deadlineWithTime).toBe(
+            plain?.taskChanges.deadlineWithTime,
+          );
+          expect(nth?.taskChanges.hasDeadlineTime).toBe(false);
+        }
+      });
+    }
+
+    for (const [hour, expectedDay] of [
+      [10, 29],
+      [17, 5],
+    ]) {
+      it(`should count ${trigger}2monday on from ${trigger}1monday at ${hour}:00 on Monday`, async () => {
+        // Before noon the first Monday is today, after noon it is Jan 29; the
+        // second Monday is always the one after it, never the same day.
+        const r = await shortSyntax(
+          { ...TASK, title: `Task ${trigger}2monday` },
+          DEADLINE_CONFIG,
+          [],
+          [],
+          new Date(2024, 0, 22, hour),
+        );
+        const expected = new Date(2024, hour > 12 ? 1 : 0, expectedDay, 12);
+        expect(
+          trigger === '@' ? r?.taskChanges.dueWithTime : r?.taskChanges.deadlineWithTime,
+        ).toBe(expected.getTime());
+      });
+    }
+
+    it(`should keep ${trigger}1monday's explicitly timed occurrence exactly at now`, async () => {
+      const now = new Date(2024, 0, 22, 15, 0, 0, 0);
+      const nth = await shortSyntax(
+        { ...TASK, title: `Task ${trigger}1monday 3pm` },
+        DEADLINE_CONFIG,
+        [],
+        [],
+        now,
+      );
+      const plain = await shortSyntax(
+        { ...TASK, title: `Task ${trigger}monday 3pm` },
+        DEADLINE_CONFIG,
+        [],
+        [],
+        now,
+      );
+      const timestamp =
+        trigger === '@'
+          ? nth?.taskChanges.dueWithTime
+          : nth?.taskChanges.deadlineWithTime;
+      expect(timestamp).toBe(now.getTime());
+      expect(timestamp).toBe(
+        trigger === '@'
+          ? plain?.taskChanges.dueWithTime
+          : plain?.taskChanges.deadlineWithTime,
+      );
+    });
+  }
+
+  it('should support weekday abbreviations, plurals and casing', async () => {
+    for (const title of ['Task @2mon', 'Task @2mondays', 'Task @2MON', 'Task @2Mon']) {
+      const r = await parse(title);
+      expect(r?.taskChanges.title).withContext(title).toBe('Task');
+      expectNthWeekday(r, 1, 2);
+    }
+    for (const title of ['Task @4TUE', 'Task @4tues', 'Task @4tuesdays']) {
+      const r = await parse(title);
+      expect(r?.taskChanges.title).withContext(title).toBe('Task');
+      expectNthWeekday(r, 2, 4);
+    }
+  });
+
+  it('should accept whitespace between the number and the weekday', async () => {
+    const r = await parse('Task @2 monday');
+    expect(r?.taskChanges.title).toBe('Task');
+    expectNthWeekday(r, 1, 2);
+  });
+
+  it('should support the full range of n (1..5)', async () => {
+    for (const nth of [1, 2, 3, 4, 5]) {
+      const r = await parse(`Task @${nth}monday`);
+      expect(r?.taskChanges.title).withContext(`n=${nth}`).toBe('Task');
+      expectNthWeekday(r, 1, nth);
+    }
+  });
+
+  it('should anchor the date no matter what time of day it is typed', async () => {
+    // 23:00 is past the 12:00 anchor; the result must still be the plain nth
+    // weekday at noon, not rolled forward a week the way a passed *time* is.
+    const late = new Date(2024, 0, 17, 23, 0, 0, 0);
+    const r = await parse('Task @2monday', late);
+    expectNthWeekday(r, 1, 2, late);
+  });
+
+  it('should parse a trailing time ("@2monday 3pm")', async () => {
+    const r = await parse('Team call @2monday 3pm');
+    expect(r?.taskChanges.title).toBe('Team call');
+    expectNthWeekday(r, 1, 2);
+    expect(dueOf(r).getHours()).toBe(15);
+    expect(dueOf(r).getMinutes()).toBe(0);
+    expect(r?.taskChanges.hasPlannedTime).toBeUndefined();
+  });
+
+  it('should DST-safely carry the typed time', async () => {
+    const gap = findSpringForwardSunday(2026);
+    if (!gap) {
+      // Timezone without a spring-forward transition (UTC, Tokyo).
+      return;
+    }
+    // The typed time is on a normal day, but the resolved day is the transition
+    // Sunday: the timestamp cannot hold the wall-clock time, so it travels as
+    // dueTimeStr, exactly like "@every friday 3pm".
+    const wednesday = new Date(gap.sunday);
+    wednesday.setDate(wednesday.getDate() - 4);
+    wednesday.setHours(10, 0);
+    const r = await parse(`Backup @1sunday ${gap.missingHour}:30am`, wednesday);
+    expect(formatDateToISO(dueOf(r))).toBe(formatDateToISO(gap.sunday));
+    expect(dueOf(r).getDay()).toBe(0);
+    expect(r?.taskChanges.dueTimeStr).toBe(`0${gap.missingHour}:30`);
+  });
+
+  for (const trigger of ['@', '!']) {
+    for (const suffix of ['', 'am']) {
+      it(`should retain ${trigger}1monday's valid time when today has a DST gap (${suffix || '24-hour'})`, async () => {
+        const gap = findSpringForwardSunday(2026);
+        if (!gap) {
+          return;
+        }
+        const now = new Date(gap.sunday);
+        now.setHours(0, 30);
+        const token = `${trigger}1monday ${gap.missingHour}:30${suffix}`;
+        const title = `Task ${token}`;
+        const r = await shortSyntax({ ...TASK, title }, DEADLINE_CONFIG, [], [], now);
+        const expected = new Date(gap.sunday);
+        expected.setDate(expected.getDate() + 1);
+        expected.setHours(gap.missingHour, 30, 0, 0);
+
+        expect(r?.taskChanges.title).toBe('Task');
+        expect(r?.parsedRanges).toEqual(
+          expectedRanges(title, [[trigger === '@' ? 'due' : 'deadline', token]]),
+        );
+        if (trigger === '@') {
+          expect(r?.taskChanges.dueWithTime).toBe(expected.getTime());
+          expect(r?.taskChanges.hasPlannedTime).toBeUndefined();
+          expect(r?.taskChanges.dueTimeStr).toBe(`0${gap.missingHour}:30`);
+        } else {
+          expect(r?.taskChanges.deadlineWithTime).toBe(expected.getTime());
+          expect(r?.taskChanges.hasDeadlineTime).toBe(true);
+        }
+      });
+    }
+
+    it(`should normalize ${trigger}1sunday's missing time on the target DST day`, async () => {
+      const gap = findSpringForwardSunday(2026);
+      if (!gap) {
+        return;
+      }
+      const now = new Date(gap.sunday);
+      now.setHours(0, 30);
+      const r = await shortSyntax(
+        { ...TASK, title: `Task ${trigger}1sunday ${gap.missingHour}:30am` },
+        DEADLINE_CONFIG,
+        [],
+        [],
+        now,
+      );
+      const expected = new Date(gap.sunday);
+      expected.setHours(gap.missingHour, 30, 0, 0);
+
+      expect(r?.taskChanges.title).toBe('Task');
+      if (trigger === '@') {
+        expect(r?.taskChanges.dueWithTime).toBe(expected.getTime());
+        expect(r?.taskChanges.hasPlannedTime).toBeUndefined();
+        expect(r?.taskChanges.dueTimeStr).toBe(`0${gap.missingHour}:30`);
+      } else {
+        expect(r?.taskChanges.deadlineWithTime).toBe(expected.getTime());
+        expect(r?.taskChanges.hasDeadlineTime).toBe(true);
+      }
+    });
+
+    it(`should restore ${trigger}1sunday's typed time after advancing past a DST gap`, async () => {
+      const gap = findSpringForwardSunday(2026);
+      if (!gap) {
+        return;
+      }
+      const now = new Date(gap.sunday);
+      now.setHours(gap.missingHour + 2, 0);
+      const r = await shortSyntax(
+        { ...TASK, title: `Task ${trigger}1sunday ${gap.missingHour}:30am` },
+        DEADLINE_CONFIG,
+        [],
+        [],
+        now,
+      );
+      const expected = new Date(gap.sunday);
+      expected.setDate(expected.getDate() + 7);
+      expected.setHours(gap.missingHour, 30, 0, 0);
+
+      expect(r?.taskChanges.title).toBe('Task');
+      expect(
+        trigger === '@' ? r?.taskChanges.dueWithTime : r?.taskChanges.deadlineWithTime,
+      ).toBe(expected.getTime());
+    });
+  }
+
+  it('should retain the clock time on the second Sunday when today has a DST gap', async () => {
+    const gap = findSpringForwardSunday(2026);
+    if (!gap) {
+      return;
+    }
+    const now = new Date(gap.sunday);
+    now.setHours(0, 30);
+    const r = await parse(`Task @2sunday ${gap.missingHour}:30am`, now);
+    const expected = new Date(gap.sunday);
+    expected.setDate(expected.getDate() + 7);
+    expected.setHours(gap.missingHour, 30, 0, 0);
+
+    expect(r?.taskChanges.title).toBe('Task');
+    expect(r?.taskChanges.dueWithTime).toBe(expected.getTime());
+    expect(r?.taskChanges.dueTimeStr).toBe(`0${gap.missingHour}:30`);
+  });
+
+  it('should not reinterpret a rejected relative date during the clock-time retry', async () => {
+    const gap = findSpringForwardSunday(2026);
+    if (!gap) {
+      return;
+    }
+    const saturday = new Date(gap.sunday);
+    saturday.setDate(saturday.getDate() - 1);
+    saturday.setHours(0, 30);
+    const remainder = `tomorrow ${gap.missingHour}:30am`;
+    const r = await parse(`Task @1monday ${remainder}`, saturday);
+    const expected = new Date(gap.sunday);
+    expected.setDate(expected.getDate() + 1);
+    expected.setHours(12, 0, 0, 0);
+
+    expect(r?.taskChanges.title).toBe(`Task ${remainder}`);
+    expect(r?.taskChanges.dueWithTime).toBe(expected.getTime());
+    expect(r?.taskChanges.hasPlannedTime).toBe(false);
+  });
+
+  it('should not leave the weekday in the title (regression for #10285)', async () => {
+    for (const title of ['Task @2monday', 'Task @9monday', 'Task @0monday']) {
+      const r = await parse(title);
+      expect(r?.taskChanges.title).withContext(title).toBe('Task');
+    }
+  });
+
+  it('should not silently turn an out-of-range n into a time', async () => {
+    // "@9monday" is not a valid nth weekday. Before this feature the numeric
+    // fallback scheduled 09:00 and left "monday" behind. The weekday must be
+    // consumed and no time invented.
+    for (const title of ['Task @9monday', 'Task @0monday']) {
+      const r = await parse(title);
+      expect(r?.taskChanges.title).withContext(title).toBe('Task');
+      expect(r?.taskChanges.dueWithTime).withContext(title).toBeUndefined();
+      expect(r?.taskChanges.hasPlannedTime).withContext(title).toBeUndefined();
+    }
+  });
+
+  it('should not mis-parse "@2m" as an nth weekday', async () => {
+    // "@2m" stays a 2-minute estimate; the bare "@" is a 2-minute due time
+    const r = await parse('Task @2m');
+    expect(r?.taskChanges.title).toBe('Task');
+    const due = dueOf(r);
+    expect(due.getHours()).toBe(10);
+    expect(due.getMinutes()).toBe(2);
+  });
+
+  it('should not mis-parse "@2" as an nth weekday', async () => {
+    const r = await parse('Task @2');
+    expect(r?.taskChanges.title).toBe('Task');
+    expect(r?.taskChanges.dueWithTime).toBeDefined();
+  });
+
+  it('should not shadow the "@every 2 fridays" recurrence', async () => {
+    const r = await shortSyntax(
+      { ...TASK, title: 'Water plants @every 2 fridays' },
+      CONFIG,
+      [],
+      [],
+      NOW,
+      'combine',
+      true,
+    );
+    expect(r?.repeat).toEqual({
+      type: 'INTERVAL',
+      repeatCycle: 'WEEKLY',
+      repeatEvery: 2,
+    } as never);
+    expect(r?.taskChanges.title).toBe('Water plants');
+  });
+
+  it('should highlight the whole token and support the clear path (replace mode)', async () => {
+    const title = 'Water plants @2monday';
+    const r = await parse(title);
+    expect(r?.parsedRanges).toEqual(expectedRanges(title, [['due', '@2monday']]));
+
+    const cleared = await parse(title, NOW, 'replace');
+    expect(cleared?.taskChanges.title).toBe('Water plants');
+  });
+
+  it('should work in a title edit (isParseRepeat false, the default)', async () => {
+    // Nothing in the nth-weekday parser may depend on isParseRepeat
+    const r = await parse('Standup @2friday');
+    expect(r?.taskChanges.title).toBe('Standup');
+    expectNthWeekday(r, 5, 2);
+  });
+
+  it('should coexist with a following time estimate', async () => {
+    const r = await parse('Call @2monday 25m');
+    expect(r?.taskChanges.title).toBe('Call');
+    expectNthWeekday(r, 1, 2);
+    expect(r?.taskChanges.timeEstimate).toBe(25 * 60 * 1000);
+  });
+
+  it('should strip trailing punctuation with the token', async () => {
+    const r = await parse('Dinner @2mondays.');
+    expect(r?.taskChanges.title).toBe('Dinner.');
+    expectNthWeekday(r, 1, 2);
+  });
+
+  it('should leave a trailing date in the title instead of swallowing it', async () => {
+    // The date comes from the phrase; only a trailing clock time is absorbed
+    const r = await parse('Task @2friday tomorrow');
+    expect(r?.taskChanges.title).toBe('Task tomorrow');
+    expectNthWeekday(r, 5, 2);
+    expect(r?.taskChanges.hasPlannedTime).toBe(false);
+  });
+
+  it('should read a spaced hour and weekday as a time, not an nth weekday', async () => {
+    // Only "@<1..5> <weekday>" is the spaced nth form; "@10 fri" is Friday 10:00
+    for (const [title, hour] of [
+      ['Call @10 fri', 10],
+      ['Call @15 friday', 15],
+    ] as const) {
+      const r = await parse(title);
+      expect(r?.taskChanges.title).withContext(title).toBe('Call');
+      const due = dueOf(r);
+      expect(due.getDay()).withContext(title).toBe(5);
+      expect(formatDateToISO(due)).withContext(title).toBe('2024-01-19');
+      expect(due.getHours()).withContext(title).toBe(hour);
+    }
+  });
+
+  it('should not claim a spaced count with a leading zero ("@05 fri")', async () => {
+    const r = await parse('Call @05 fri');
+    expect(dueOf(r).getDay()).toBe(5);
+    expect(formatDateToISO(dueOf(r))).toBe('2024-01-19');
+  });
+
+  it('should not absorb a chrono match further into the remainder', async () => {
+    // "tomorrow" belongs to the title; only the token itself is the due date
+    const r = await parse('Standup @2monday and friday');
+    expect(r?.taskChanges.title).toBe('Standup and friday');
+    expectNthWeekday(r, 1, 2);
+  });
+
+  it('should still parse "@every monday" as a recurrence', async () => {
+    const r = await shortSyntax(
+      { ...TASK, title: 'Standup @every monday' },
+      CONFIG,
+      [],
+      [],
+      NOW,
+      'combine',
+      true,
+    );
+    expect(r?.repeat?.type).toBe('PRESET');
+    expect(r?.taskChanges.title).toBe('Standup');
+  });
+
+  it('should not consume a word the weekday only prefixes ("@2monx")', async () => {
+    const r = await parse('Task @2monx');
+    // Not an nth weekday; the numeric fallback still handles it as before
+    expect(r?.taskChanges.title).toBe('Task monx');
+  });
+
+  it('should also support the deadline form ("!2monday")', async () => {
+    const r = await shortSyntax(
+      { ...TASK, title: 'Taxes !2monday' },
+      DEADLINE_CONFIG,
+      [],
+      [],
+      NOW,
+    );
+    expect(r?.taskChanges.title).toBe('Taxes');
+    const deadline = new Date(r?.taskChanges.deadlineWithTime as number);
+    expect(deadline.getDay()).toBe(1);
+    expect(deadline.getDate()).toBe(29);
+    expect(r?.taskChanges.hasDeadlineTime).toBe(false);
+  });
+
+  it('should support a trailing time on the deadline form ("!2monday 3pm")', async () => {
+    const r = await shortSyntax(
+      { ...TASK, title: 'Taxes !2monday 3pm' },
+      DEADLINE_CONFIG,
+      [],
+      [],
+      NOW,
+    );
+    expect(r?.taskChanges.title).toBe('Taxes');
+    const deadline = new Date(r?.taskChanges.deadlineWithTime as number);
+    expect(deadline.getDate()).toBe(29);
+    expect(deadline.getHours()).toBe(15);
+    expect(r?.taskChanges.hasDeadlineTime).toBe(true);
+  });
+
+  it('should advance one week when the explicitly typed time today is already past', async () => {
+    // Mon Jan 22 2024, 17:00 local: the typed 15:00 is two hours in the past,
+    // so today no longer counts as the first occurrence.
+    const mondayEvening = new Date(2024, 0, 22, 17, 0, 0, 0);
+    const r = await parse('Team call @1monday 3pm', mondayEvening);
+    expect(r?.taskChanges.title).toBe('Team call');
+    const due = dueOf(r);
+    expect(due.getDay()).toBe(1);
+    expect(formatDateToISO(due)).toBe('2024-01-29');
+    expect(due.getHours()).toBe(15);
+    expect(due.getMinutes()).toBe(0);
+    expect(r?.taskChanges.hasPlannedTime).toBeUndefined();
+  });
+
+  it('should keep "@1monday 3pm" equivalent to "@monday 3pm" when the same-day time is past', async () => {
+    const mondayEvening = new Date(2024, 0, 22, 17, 0, 0, 0);
+    const nth = await parse('Team call @1monday 3pm', mondayEvening);
+    const plain = await parse('Team call @monday 3pm', mondayEvening);
+    expect(nth?.taskChanges.dueWithTime).toBe(plain?.taskChanges.dueWithTime);
+  });
+
+  it('should count a timed nth>1 on from the advanced first occurrence', async () => {
+    // Mon Jan 22 2024, 17:00: today's 15:00 has passed, so "@1monday 3pm" is
+    // Jan 29 and "@2monday 3pm" the Monday after it.
+    const mondayEvening = new Date(2024, 0, 22, 17, 0, 0, 0);
+    const r = await parse('Team call @2monday 3pm', mondayEvening);
+    expect(formatDateToISO(dueOf(r))).toBe('2024-02-05');
+    expect(dueOf(r).getHours()).toBe(15);
+  });
+
+  it('should keep a timed nth>1 one week after a first occurrence still ahead today', async () => {
+    const mondayAfternoon = new Date(2024, 0, 22, 14, 0, 0, 0);
+    const r = await parse('Team call @2monday 3pm', mondayAfternoon);
+    expect(formatDateToISO(dueOf(r))).toBe('2024-01-29');
+    expect(dueOf(r).getHours()).toBe(15);
+  });
+
+  it('should keep today when the typed time is still ahead of now', async () => {
+    const mondayAfternoon = new Date(2024, 0, 22, 14, 0, 0, 0);
+    const r = await parse('Team call @1monday 3pm', mondayAfternoon);
+    expect(formatDateToISO(dueOf(r))).toBe('2024-01-22');
+    expect(dueOf(r).getHours()).toBe(15);
+    expect(r?.taskChanges.hasPlannedTime).toBeUndefined();
+  });
+
+  it('should advance a deadline one week when the explicitly typed time is already past', async () => {
+    const mondayEvening = new Date(2024, 0, 22, 17, 0, 0, 0);
+    const r = await shortSyntax(
+      { ...TASK, title: 'Taxes !1monday 3pm' },
+      DEADLINE_CONFIG,
+      [],
+      [],
+      mondayEvening,
+    );
+    expect(r?.taskChanges.title).toBe('Taxes');
+    const deadline = new Date(r?.taskChanges.deadlineWithTime as number);
+    expect(deadline.getDay()).toBe(1);
+    expect(formatDateToISO(deadline)).toBe('2024-01-29');
+    expect(deadline.getHours()).toBe(15);
+    expect(r?.taskChanges.hasDeadlineTime).toBe(true);
+  });
+
+  it('should keep a deadline today when its typed time is still ahead', async () => {
+    const mondayAfternoon = new Date(2024, 0, 22, 14, 0, 0, 0);
+    const r = await shortSyntax(
+      { ...TASK, title: 'Taxes !1monday 3pm' },
+      DEADLINE_CONFIG,
+      [],
+      [],
+      mondayAfternoon,
+    );
+    const deadline = new Date(r?.taskChanges.deadlineWithTime as number);
+    expect(formatDateToISO(deadline)).toBe('2024-01-22');
+    expect(deadline.getHours()).toBe(15);
+    expect(r?.taskChanges.hasDeadlineTime).toBe(true);
+  });
+
+  it('should remove the selected deadline token, not an earlier duplicate', async () => {
+    // Regression: the deadline scanner skips the "!" glued to "wow" and
+    // selects the second token. Removal and highlighting must target that
+    // exact span — an unanchored text search would consume the first copy
+    // and leave the title as "wow !2monday".
+    const r = await shortSyntax(
+      { ...TASK, title: 'wow!2monday !2monday' },
+      DEADLINE_CONFIG,
+      [],
+      [],
+      NOW,
+    );
+    expect(r?.taskChanges.title).toBe('wow!2monday');
+    const deadline = new Date(r?.taskChanges.deadlineWithTime as number);
+    expect(deadline.getDay()).toBe(1);
+    expect(deadline.getDate()).toBe(29);
+    // Literal positions: expectedRanges() would find the first copy of the
+    // token text, which is exactly the ambiguity under test.
+    expect(r?.parsedRanges).toEqual([{ type: 'deadline', start: 12, end: 20 }]);
+  });
+});

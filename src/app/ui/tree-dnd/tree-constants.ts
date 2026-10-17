@@ -1,0 +1,4 @@
+export const TREE_CONSTANTS = {
+  DROP_FLASH_DURATION: 300,
+  DEFAULT_INDENT: 16,
+} as const;

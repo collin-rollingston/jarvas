@@ -1,0 +1,26 @@
+{
+  "name": "doc-mode",
+  "version": "0.1.0",
+  "description": "Document-style editor for projects and Today using TipTap",
+  "private": true,
+  "scripts": {
+    "build": "node scripts/build.js",
+    "deploy": "npm run build && node scripts/deploy.js",
+    "lint": "tsc --noEmit",
+    "test": "node scripts/test.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.33",
+    "esbuild": "^0.28.1",
+    "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "@super-productivity/plugin-api": "file:../../plugin-api",
+    "@tiptap/core": "^3.31.4",
+    "@tiptap/extension-bubble-menu": "^3.31.4",
+    "@tiptap/extensions": "^3.31.4",
+    "@tiptap/pm": "^3.31.4",
+    "@tiptap/starter-kit": "^3.31.4"
+  }
+}

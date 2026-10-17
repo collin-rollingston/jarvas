@@ -1,0 +1,48 @@
+@use '../../_common';
+@use '../mixins/_media-queries';
+
+// Shared duration typography for planner tasks, events, and task previews.
+.planner-time-remaining-shared {
+  min-width: 44px;
+  text-align: right;
+  padding-left: var(--s-half);
+  padding-right: var(--s);
+  font-variant-numeric: tabular-nums;
+  line-height: var(--line-height-snug);
+  margin-left: auto;
+  font-size: var(--font-size-md);
+  color: var(--text-color-muted);
+
+  mat-icon {
+    vertical-align: middle;
+    margin-top: -2px;
+    height: 14px !important;
+
+    @include media-queries.mq(xs) {
+      height: 16px !important;
+      font-size: var(--planner-font-size);
+    }
+  }
+}
+
+// tag chips on planner-style rows (planner-task, planner-repeat-projection,
+// repeat-cfg-preview); we target .tags-container, since we don't want margins
+// for an empty list
+tag-list.planner-tag-list-shared .tags-container {
+  margin-top: var(--s-quarter);
+  margin-bottom: var(--s-quarter);
+}
+
+tag-list.planner-tag-list-shared .tag-title {
+  @include media-queries.mq(xs) {
+    font-size: var(--planner-font-size-smaller) !important;
+  }
+}
+
+.planner-drag-place-holder-shared {
+  min-height: var(--planner-item-height);
+  margin-bottom: 4px;
+  border-radius: 6px;
+  // NOTE bg color is set in material overwrite file since otherwise it does not seem to work
+  background: var(--c-light-05) !important;
+}
