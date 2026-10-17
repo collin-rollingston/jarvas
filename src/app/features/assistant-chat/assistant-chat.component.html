@@ -1,8 +1,20 @@
-<a class="return-link" routerLink="/" [attr.aria-label]="T.AUI.RETURN_TO_APP | translate">
-  {{ T.AUI.RETURN_TO_APP | translate }}
-</a>
-<assistant-chat-ui #chatUi></assistant-chat-ui>
+<assistant-chat-ui #chatUi>
+  <a
+    slot="return-link"
+    class="return-link"
+    routerLink="/"
+    [attr.aria-label]="T.AUI.RETURN_TO_APP | translate"
+  >
+    <span aria-hidden="true">&#8592;</span>
+    {{ T.AUI.RETURN_TO_APP | translate }}
+  </a>
+</assistant-chat-ui>
 
 @if (loadError()) {
-  <p class="load-error" role="alert">{{ loadError() }}</p>
+  <p
+    class="load-error"
+    role="alert"
+  >
+    {{ loadError() }}
+  </p>
 }

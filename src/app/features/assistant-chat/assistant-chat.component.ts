@@ -16,18 +16,22 @@ import { T } from '../../t.const';
 import { AssistantChatAdapter } from './assistant-chat.model';
 
 interface AssistantChatLabels {
-  ready: string;
-  connectAgent: string;
   connected: string;
   notConnected: string;
-  cardTitle: string;
-  cardBody: string;
+  threads: string;
+  newThread: string;
+  currentThread: string;
   emptyTitle: string;
   emptyBody: string;
+  promptLabel: string;
+  suggestions: string[];
   inputLabel: string;
   inputPlaceholder: string;
   send: string;
-  composerNote: string;
+  voiceInput: string;
+  stopVoiceInput: string;
+  voiceInputNotice: string;
+  voiceUnsupported: string;
 }
 
 interface AssistantChatElement extends HTMLElement {
@@ -127,18 +131,27 @@ export class AssistantChatComponent implements AfterViewInit {
 
   private _getLabels(): AssistantChatLabels {
     return {
-      ready: this._translate.instant(T.AUI.READY),
-      connectAgent: this._translate.instant(T.AUI.CONNECT_AGENT),
       connected: this._translate.instant(T.AUI.CONNECTED),
       notConnected: this._translate.instant(T.AUI.NOT_CONNECTED),
-      cardTitle: this._translate.instant(T.AUI.CARD_TITLE),
-      cardBody: this._translate.instant(T.AUI.CARD_BODY),
+      threads: this._translate.instant(T.AUI.THREADS),
+      newThread: this._translate.instant(T.AUI.NEW_THREAD),
+      currentThread: this._translate.instant(T.AUI.CURRENT_THREAD),
       emptyTitle: this._translate.instant(T.AUI.EMPTY_TITLE),
       emptyBody: this._translate.instant(T.AUI.EMPTY_BODY),
+      promptLabel: this._translate.instant(T.AUI.PROMPT_LABEL),
+      suggestions: [
+        this._translate.instant(T.AUI.SUGGESTION_PLAN_DAY),
+        this._translate.instant(T.AUI.SUGGESTION_BREAK_DOWN_TASK),
+        this._translate.instant(T.AUI.SUGGESTION_PRIORITIZE),
+        this._translate.instant(T.AUI.SUGGESTION_CAPTURE_TASK),
+      ],
       inputLabel: this._translate.instant(T.AUI.INPUT_LABEL),
       inputPlaceholder: this._translate.instant(T.AUI.INPUT_PLACEHOLDER),
       send: this._translate.instant(T.AUI.SEND),
-      composerNote: this._translate.instant(T.AUI.COMPOSER_NOTE),
+      voiceInput: this._translate.instant(T.AUI.VOICE_INPUT),
+      stopVoiceInput: this._translate.instant(T.AUI.STOP_VOICE_INPUT),
+      voiceInputNotice: this._translate.instant(T.AUI.VOICE_INPUT_NOTICE),
+      voiceUnsupported: this._translate.instant(T.AUI.VOICE_UNSUPPORTED),
     };
   }
 }
