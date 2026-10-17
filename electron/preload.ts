@@ -330,6 +330,8 @@ const ea: ElectronAPI = {
       messages,
       tools,
     ) as Promise<AssistantChatCompletion>,
+  assistantChatTranscribe: (audio: Uint8Array) =>
+    _invoke(IPC.ASSISTANT_CHAT_TRANSCRIBE, audio) as Promise<string>,
 };
 
 // Expose ea to window for ipc-event.ts using contextBridge for context isolation

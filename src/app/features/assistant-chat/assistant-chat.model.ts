@@ -1,7 +1,23 @@
 export interface AssistantChatMessage {
   role: 'user' | 'assistant';
   content: string;
+  images?: AssistantChatImage[];
 }
+
+export interface AssistantChatImage {
+  dataUrl: string;
+  filename: string;
+}
+
+export type AssistantChatContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } };
+
+export const MAX_ASSISTANT_AUDIO_BYTES = 8 * 1024 * 1024;
+export const MAX_ASSISTANT_IMAGE_BYTES = 5 * 1024 * 1024;
+export const MAX_ASSISTANT_IMAGES_PER_MESSAGE = 3;
+export const MAX_ASSISTANT_IMAGES_PER_REQUEST = 4;
+export const MAX_ASSISTANT_IMAGE_BYTES_PER_MESSAGE = 12 * 1024 * 1024;
 
 export interface AssistantChatToolCall {
   id: string;
@@ -13,7 +29,8 @@ export interface AssistantChatToolCall {
 }
 
 export type AssistantChatRequestMessage =
-  | { role: 'system' | 'user'; content: string }
+  | { role: 'system'; content: string }
+  | { role: 'user'; content: string | AssistantChatContentPart[] }
   | {
       role: 'assistant';
       content: string | null;
@@ -46,4 +63,5 @@ export interface AssistantChatAdapter {
     messages: readonly AssistantChatMessage[];
     signal: AbortSignal;
   }): AsyncIterable<string>;
+  transcribeAudio(input: { audio: Uint8Array }): Promise<string>;
 }

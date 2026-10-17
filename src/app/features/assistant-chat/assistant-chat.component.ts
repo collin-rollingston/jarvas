@@ -34,6 +34,22 @@ interface AssistantChatLabels {
   stopVoiceInput: string;
   voiceInputNotice: string;
   voiceUnsupported: string;
+  voiceRequestingPermission: string;
+  voiceRecording: string;
+  voiceTranscribing: string;
+  voiceNoAudio: string;
+  voicePermissionDenied: string;
+  voiceMicrophoneMissing: string;
+  voiceRecordingFailed: string;
+  voiceTranscriptionFailed: string;
+  addImages: string;
+  imageUploadNotice: string;
+  imageUploadTooLarge: string;
+  imageUploadUnsupported: string;
+  imageUploadLimit: string;
+  imageUploadFailed: string;
+  removeAttachment: string;
+  attachedImage: string;
 }
 
 interface AssistantChatElement extends HTMLElement {
@@ -163,6 +179,24 @@ export class AssistantChatComponent implements AfterViewInit {
       stopVoiceInput: this._translate.instant(T.AUI.STOP_VOICE_INPUT),
       voiceInputNotice: this._translate.instant(T.AUI.VOICE_INPUT_NOTICE),
       voiceUnsupported: this._translate.instant(T.AUI.VOICE_UNSUPPORTED),
+      voiceRequestingPermission: this._translate.instant(
+        T.AUI.VOICE_REQUESTING_PERMISSION,
+      ),
+      voiceRecording: this._translate.instant(T.AUI.VOICE_RECORDING),
+      voiceTranscribing: this._translate.instant(T.AUI.VOICE_TRANSCRIBING),
+      voiceNoAudio: this._translate.instant(T.AUI.VOICE_NO_AUDIO),
+      voicePermissionDenied: this._translate.instant(T.AUI.VOICE_PERMISSION_DENIED),
+      voiceMicrophoneMissing: this._translate.instant(T.AUI.VOICE_MICROPHONE_MISSING),
+      voiceRecordingFailed: this._translate.instant(T.AUI.VOICE_RECORDING_FAILED),
+      voiceTranscriptionFailed: this._translate.instant(T.AUI.VOICE_TRANSCRIPTION_FAILED),
+      addImages: this._translate.instant(T.AUI.ADD_IMAGES),
+      imageUploadNotice: this._translate.instant(T.AUI.IMAGE_UPLOAD_NOTICE),
+      imageUploadTooLarge: this._translate.instant(T.AUI.IMAGE_UPLOAD_TOO_LARGE),
+      imageUploadUnsupported: this._translate.instant(T.AUI.IMAGE_UPLOAD_UNSUPPORTED),
+      imageUploadLimit: this._translate.instant(T.AUI.IMAGE_UPLOAD_LIMIT),
+      imageUploadFailed: this._translate.instant(T.AUI.IMAGE_UPLOAD_FAILED),
+      removeAttachment: this._translate.instant(T.AUI.REMOVE_ATTACHMENT),
+      attachedImage: this._translate.instant(T.AUI.ATTACHED_IMAGE),
     };
   }
 }

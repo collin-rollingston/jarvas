@@ -2,9 +2,17 @@ import { inject, Injectable } from '@angular/core';
 import { IS_ELECTRON } from '../../app.constants';
 import { DateService } from '../../core/date/date.service';
 import {
+  AssistantChatContentPart,
   AssistantChatCompletion,
+  AssistantChatImage,
+  AssistantChatMessage,
   AssistantChatRequestMessage,
   AssistantChatToolCall,
+  MAX_ASSISTANT_AUDIO_BYTES,
+  MAX_ASSISTANT_IMAGE_BYTES,
+  MAX_ASSISTANT_IMAGE_BYTES_PER_MESSAGE,
+  MAX_ASSISTANT_IMAGES_PER_MESSAGE,
+  MAX_ASSISTANT_IMAGES_PER_REQUEST,
 } from './assistant-chat.model';
 import { ASSISTANT_CHAT_TOOLS } from './assistant-chat.tools';
 import { AssistantChatToolService } from './assistant-chat-tool.service';
@@ -12,16 +20,76 @@ import { AssistantChatToolService } from './assistant-chat-tool.service';
 const MODEL = '@cf/google/gemma-4-26b-a4b-it';
 const MAX_TOOL_ROUNDS = 6;
 const MAX_TOOL_CALLS = 8;
+const DATA_IMAGE_URL =
+  /^data:image\/(?:png|jpeg|webp|gif);base64,([A-Za-z0-9+/]+={0,2})$/;
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  !!value && typeof value === 'object' && !Array.isArray(value);
+
+const getDataImageBytes = (dataUrl: string): number | null => {
+  const match = DATA_IMAGE_URL.exec(dataUrl);
+  if (!match) return null;
+  const base64 = match[1];
+  const padding = base64.endsWith('==') ? 2 : base64.endsWith('=') ? 1 : 0;
+  const byteLength = Math.floor((base64.length * 3) / 4) - padding;
+  return byteLength > 0 && byteLength <= MAX_ASSISTANT_IMAGE_BYTES ? byteLength : null;
+};
 
 @Injectable({ providedIn: 'root' })
 export class CloudflareAssistantChatAdapter {
   private readonly _tools = inject(AssistantChatToolService);
   private readonly _dateService = inject(DateService);
 
+  async transcribeAudio(input: { audio: Uint8Array }): Promise<string> {
+    if (
+      input.audio.byteLength === 0 ||
+      input.audio.byteLength > MAX_ASSISTANT_AUDIO_BYTES
+    ) {
+      throw new Error('The recording is empty or too large to transcribe.');
+    }
+
+    if (IS_ELECTRON) {
+      return window.ea.assistantChatTranscribe(input.audio);
+    }
+
+    const headers = new Headers();
+    headers.set('Content-Type', 'application/json');
+    const response = await fetch('/api/assistant/transcribe', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        audio: this._toBase64(input.audio),
+        task: 'transcribe',
+      }),
+    });
+
+    if (!response.ok) {
+      if (response.status === 401 || response.status === 403) {
+        throw new Error(
+          'Cloudflare rejected the recording. Check the API token and Workers AI permissions in .env.local.',
+        );
+      }
+      throw new Error(
+        'Cloudflare Workers AI transcription failed (' + response.status + ').',
+      );
+    }
+
+    const payload: unknown = await response.json();
+    if (!isRecord(payload)) {
+      throw new Error('Cloudflare Workers AI returned an invalid transcription.');
+    }
+    const result = isRecord(payload.result) ? payload.result : payload;
+    if (typeof result.text !== 'string') {
+      throw new Error('Cloudflare Workers AI returned an empty transcription.');
+    }
+    return result.text;
+  }
+
   async *run(input: {
-    messages: readonly { role: 'user' | 'assistant'; content: string }[];
+    messages: readonly AssistantChatMessage[];
     signal: AbortSignal;
   }): AsyncIterable<string> {
+    this._validateImages(input.messages);
     const latestUserMessage = [...input.messages]
       .reverse()
       .find((message) => message.role === 'user');
@@ -47,7 +115,7 @@ export class CloudflareAssistantChatAdapter {
   }
 
   private async *_runCloudflare(input: {
-    messages: readonly { role: 'user' | 'assistant'; content: string }[];
+    messages: readonly AssistantChatMessage[];
     signal: AbortSignal;
   }): AsyncIterable<string> {
     const messages: AssistantChatRequestMessage[] = [
@@ -55,7 +123,12 @@ export class CloudflareAssistantChatAdapter {
         role: 'system',
         content: this._systemInstructions(),
       },
-      ...input.messages,
+      ...input.messages.map(
+        (message): AssistantChatRequestMessage =>
+          message.role === 'user'
+            ? { role: 'user', content: this._requestContent(message) }
+            : { role: 'assistant', content: message.content },
+      ),
     ];
     let toolCallCount = 0;
 
@@ -106,12 +179,63 @@ export class CloudflareAssistantChatAdapter {
     yield 'I reached the tool-call limit for one message. Please continue with the remaining steps.';
   }
 
+  private _validateImages(messages: readonly AssistantChatMessage[]): void {
+    let requestImageCount = 0;
+    for (const message of messages) {
+      if (!message.images?.length) continue;
+      if (
+        message.role !== 'user' ||
+        message.images.length > MAX_ASSISTANT_IMAGES_PER_MESSAGE
+      ) {
+        throw new Error('Attach up to three images to a message.');
+      }
+      let messageImageBytes = 0;
+      for (const image of message.images) {
+        const imageBytes = getDataImageBytes(image.dataUrl);
+        if (imageBytes === null) {
+          throw new Error('This image is unsupported or exceeds the 5 MB upload limit.');
+        }
+        messageImageBytes += imageBytes;
+      }
+      if (messageImageBytes > MAX_ASSISTANT_IMAGE_BYTES_PER_MESSAGE) {
+        throw new Error('The combined images in a message must be 12 MB or smaller.');
+      }
+      requestImageCount += message.images.length;
+    }
+    if (requestImageCount > MAX_ASSISTANT_IMAGES_PER_REQUEST) {
+      throw new Error('Only the four most recent images can be sent with one request.');
+    }
+  }
+
+  private _requestContent(
+    message: AssistantChatMessage,
+  ): string | AssistantChatContentPart[] {
+    if (!message.images?.length) return message.content;
+    const text = message.content.trim() || 'Please analyze the attached image(s).';
+    return [
+      ...message.images.map((image: AssistantChatImage) => ({
+        type: 'image_url' as const,
+        image_url: { url: image.dataUrl },
+      })),
+      { type: 'text', text },
+    ];
+  }
+
   private _redactConfirmationCode(content: string, code: string): string {
     const escapedCode = code.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     return content.replace(
       new RegExp('\\bCONFIRM\\s+' + escapedCode + '\\b', 'gi'),
       '[local confirmation code]',
     );
+  }
+
+  private _toBase64(bytes: Uint8Array): string {
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+    }
+    return btoa(binary);
   }
 
   private _systemInstructions(): string {

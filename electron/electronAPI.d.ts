@@ -115,6 +115,7 @@ export interface ElectronAPI {
     messages: AssistantChatRequestMessage[],
     tools: AssistantChatTool[],
   ): Promise<AssistantChatCompletion>;
+  assistantChatTranscribe(audio: Uint8Array): Promise<string>;
 
   showOpenDialog(options: {
     properties: string[];
