@@ -13,7 +13,9 @@ import { DOCUMENT } from '@angular/common';
 import { RouterLink } from '@angular/router';
 import { TranslatePipe, TranslateService } from '@ngx-translate/core';
 import { T } from '../../t.const';
-import { AssistantChatAdapter } from './assistant-chat.model';
+import { CloudflareAssistantChatAdapter } from './cloudflare-assistant-chat-adapter.service';
+import { getEnvOptional } from '../../util/env';
+import type { AssistantChatAdapter } from './assistant-chat.model';
 
 interface AssistantChatLabels {
   connected: string;
@@ -32,6 +34,22 @@ interface AssistantChatLabels {
   stopVoiceInput: string;
   voiceInputNotice: string;
   voiceUnsupported: string;
+  voiceRequestingPermission: string;
+  voiceRecording: string;
+  voiceTranscribing: string;
+  voiceNoAudio: string;
+  voicePermissionDenied: string;
+  voiceMicrophoneMissing: string;
+  voiceRecordingFailed: string;
+  voiceTranscriptionFailed: string;
+  addImages: string;
+  imageUploadNotice: string;
+  imageUploadTooLarge: string;
+  imageUploadUnsupported: string;
+  imageUploadLimit: string;
+  imageUploadFailed: string;
+  removeAttachment: string;
+  attachedImage: string;
 }
 
 interface AssistantChatElement extends HTMLElement {
@@ -54,6 +72,15 @@ export const ASSISTANT_CHAT_ADAPTER = new InjectionToken<AssistantChatAdapter | 
   changeDetection: ChangeDetectionStrategy.OnPush,
   schemas: [CUSTOM_ELEMENTS_SCHEMA],
   imports: [RouterLink, TranslatePipe],
+  providers: [
+    {
+      provide: ASSISTANT_CHAT_ADAPTER,
+      useFactory: (): AssistantChatAdapter | null =>
+        getEnvOptional('ASSISTANT_CHAT_CONFIGURED') === 'true'
+          ? inject(CloudflareAssistantChatAdapter)
+          : null,
+    },
+  ],
   standalone: true,
 })
 export class AssistantChatComponent implements AfterViewInit {
@@ -152,6 +179,24 @@ export class AssistantChatComponent implements AfterViewInit {
       stopVoiceInput: this._translate.instant(T.AUI.STOP_VOICE_INPUT),
       voiceInputNotice: this._translate.instant(T.AUI.VOICE_INPUT_NOTICE),
       voiceUnsupported: this._translate.instant(T.AUI.VOICE_UNSUPPORTED),
+      voiceRequestingPermission: this._translate.instant(
+        T.AUI.VOICE_REQUESTING_PERMISSION,
+      ),
+      voiceRecording: this._translate.instant(T.AUI.VOICE_RECORDING),
+      voiceTranscribing: this._translate.instant(T.AUI.VOICE_TRANSCRIBING),
+      voiceNoAudio: this._translate.instant(T.AUI.VOICE_NO_AUDIO),
+      voicePermissionDenied: this._translate.instant(T.AUI.VOICE_PERMISSION_DENIED),
+      voiceMicrophoneMissing: this._translate.instant(T.AUI.VOICE_MICROPHONE_MISSING),
+      voiceRecordingFailed: this._translate.instant(T.AUI.VOICE_RECORDING_FAILED),
+      voiceTranscriptionFailed: this._translate.instant(T.AUI.VOICE_TRANSCRIPTION_FAILED),
+      addImages: this._translate.instant(T.AUI.ADD_IMAGES),
+      imageUploadNotice: this._translate.instant(T.AUI.IMAGE_UPLOAD_NOTICE),
+      imageUploadTooLarge: this._translate.instant(T.AUI.IMAGE_UPLOAD_TOO_LARGE),
+      imageUploadUnsupported: this._translate.instant(T.AUI.IMAGE_UPLOAD_UNSUPPORTED),
+      imageUploadLimit: this._translate.instant(T.AUI.IMAGE_UPLOAD_LIMIT),
+      imageUploadFailed: this._translate.instant(T.AUI.IMAGE_UPLOAD_FAILED),
+      removeAttachment: this._translate.instant(T.AUI.REMOVE_ATTACHMENT),
+      attachedImage: this._translate.instant(T.AUI.ATTACHED_IMAGE),
     };
   }
 }

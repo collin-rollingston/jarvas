@@ -327,17 +327,29 @@ export const createWindow = async ({
     });
   });
 
-  // Deny unnecessary permissions (webcam, microphone, geolocation, etc.)
-  // The app only needs notifications for desktop reminders
+  // The assistant may request microphone audio after an explicit user click.
+  // Keep camera access and all other non-notification permissions denied.
   const allowedPermissions = ['notifications'];
   mainWin.webContents.session.setPermissionRequestHandler(
-    (_webContents, permission, callback) => {
-      callback(allowedPermissions.includes(permission));
+    (webContents, permission, callback, details) => {
+      const isAssistantAudioRequest =
+        webContents === mainWin.webContents &&
+        permission === 'media' &&
+        details.isMainFrame &&
+        'mediaTypes' in details &&
+        details.mediaTypes?.includes('audio') === true &&
+        !details.mediaTypes.includes('video');
+      callback(allowedPermissions.includes(permission) || isAssistantAudioRequest);
     },
   );
-  mainWin.webContents.session.setPermissionCheckHandler((_webContents, permission) => {
-    return allowedPermissions.includes(permission);
-  });
+  mainWin.webContents.session.setPermissionCheckHandler(
+    (webContents, permission, _origin, details) =>
+      allowedPermissions.includes(permission) ||
+      (webContents === mainWin.webContents &&
+        permission === 'media' &&
+        details.isMainFrame &&
+        details.mediaType === 'audio'),
+  );
 
   mainWindowState.manage(mainWin);
 

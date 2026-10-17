@@ -9,6 +9,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@assistant-ui/core": "0.3.28",
     "@assistant-ui/react": "0.15.28",
     "react": "19.2.0",
     "react-dom": "19.2.0"

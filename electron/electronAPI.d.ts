@@ -29,6 +29,11 @@ import {
   AssistantAccessState,
 } from './shared-with-frontend/assistant-access.model';
 import { JiraElectronApi } from './shared-with-frontend/jira-request.model';
+import type {
+  AssistantChatCompletion,
+  AssistantChatRequestMessage,
+  AssistantChatTool,
+} from '../src/app/features/assistant-chat/assistant-chat.model';
 
 export interface ElectronAPI {
   on(channel: string, listener: (...args: unknown[]) => void): void;
@@ -105,6 +110,12 @@ export interface ElectronAPI {
    * — those take only the relative path; main resolves against its own copy.
    */
   getSyncFolderPath(): Promise<string | null>;
+
+  assistantChatCompletion(
+    messages: AssistantChatRequestMessage[],
+    tools: AssistantChatTool[],
+  ): Promise<AssistantChatCompletion>;
+  assistantChatTranscribe(audio: Uint8Array): Promise<string>;
 
   showOpenDialog(options: {
     properties: string[];

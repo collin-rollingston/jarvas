@@ -203,14 +203,22 @@ export class ShortcutService {
 
     const keys = cfg.keyboard;
     const el = ev.target as HTMLElement;
+    const isAssistantComposer = ev
+      .composedPath()
+      .some(
+        (target) =>
+          target instanceof HTMLElement &&
+          target.hasAttribute('data-assistant-chat-composer'),
+      );
     const hasBlockingOverlay =
       this._matDialog.openDialogs.length > 0 || this._hasOpenCdkOverlay();
 
     // Skip handling if no special keys are used and inside input elements or overlays.
     // Overlay detection intentionally keys off CDK CSS class names for now (see constants above).
     if (
-      !ev.metaKey &&
-      (isInputElement(el) || hasBlockingOverlay || this._isEventFromOverlay(ev))
+      isAssistantComposer ||
+      (!ev.metaKey &&
+        (isInputElement(el) || hasBlockingOverlay || this._isEventFromOverlay(ev)))
     ) {
       return;
     }
