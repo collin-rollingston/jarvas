@@ -1,7 +1,11 @@
 import { defineConfig } from 'vite';
 
-export default defineConfig({
+export default defineConfig(({ mode }) => ({
   base: './',
+  define: {
+    'process.env.NODE_ENV': JSON.stringify(mode),
+    'process.env.NEXT_PUBLIC_ASSISTANT_BASE_URL': 'undefined',
+  },
   build: {
     cssCodeSplit: false,
     lib: {
@@ -16,4 +20,4 @@ export default defineConfig({
       },
     },
   },
-});
+}));
