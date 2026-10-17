@@ -1,0 +1,208 @@
+:host {
+  display: block;
+  height: 100%;
+  color: var(--text-color-most-intense);
+  font-family: var(--font-primary-stack);
+}
+
+.assistant-chat-mount,
+.assistant-chat {
+  height: 100%;
+  min-height: 0;
+}
+
+.assistant-chat {
+  --chat-bg: var(--bg);
+  --chat-surface: var(--bg-lighter);
+  --chat-ink: var(--text-color-most-intense);
+  --chat-muted: var(--text-color-muted);
+  --chat-border: var(--separator-color);
+  --chat-accent: var(--c-primary);
+  display: flex;
+  flex-direction: column;
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 0 var(--s3);
+  background: var(--chat-bg);
+  color: var(--chat-ink);
+}
+
+.chat-heading {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  min-height: var(--s9);
+  border-bottom: 1px solid var(--chat-border);
+}
+
+.chat-mark,
+.empty-glyph {
+  color: var(--chat-accent);
+  font-size: var(--font-size-3xl);
+}
+
+.chat-heading h1,
+.connection-card h2,
+.empty-thread h2 {
+  margin: 0;
+  font-size: var(--font-size-xl);
+  font-weight: var(--font-weight-semibold);
+}
+
+.chat-heading p,
+.connection-card p,
+.empty-thread p,
+.composer-note {
+  margin: var(--s-half) 0 0;
+  color: var(--chat-muted);
+  font-size: var(--font-size-sm);
+}
+
+.connection-state {
+  margin-left: auto;
+  padding: var(--s-half) var(--s);
+  border: 1px solid var(--chat-border);
+  border-radius: var(--radius-pill);
+  color: var(--chat-muted);
+  font-size: var(--font-size-xs);
+}
+
+.connection-state.is-connected {
+  color: var(--color-success);
+}
+
+.connection-card {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s2);
+  max-width: 660px;
+  margin: var(--s6) auto 0;
+  padding: var(--s3);
+  border: 1px solid var(--chat-border);
+  border-radius: var(--radius-lg);
+  background: var(--chat-surface);
+}
+
+.connection-icon {
+  display: grid;
+  flex: 0 0 var(--s4);
+  height: var(--s4);
+  place-items: center;
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--chat-accent) 12%, transparent);
+  color: var(--chat-accent);
+  font-size: var(--font-size-lg);
+}
+
+.thread-root {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.thread-viewport {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  gap: var(--s2);
+  overflow: auto;
+  padding: var(--s3) var(--s-half) var(--s2);
+}
+
+.empty-thread {
+  margin: auto;
+  padding: var(--s4) var(--s3);
+  text-align: center;
+}
+
+.empty-glyph {
+  display: inline-block;
+  margin-bottom: var(--s2);
+}
+
+.message {
+  max-width: min(78%, 680px);
+  padding: var(--s) var(--s2);
+  border-radius: var(--radius-xl);
+  line-height: var(--line-height-normal);
+  overflow-wrap: anywhere;
+}
+
+.user-message {
+  align-self: flex-end;
+  background: var(--chat-accent);
+  color: var(--c-contrast);
+}
+
+.assistant-message {
+  align-self: flex-start;
+  border: 1px solid var(--chat-border);
+  border-radius: var(--radius-xl);
+  background: var(--chat-surface);
+}
+
+.composer-footer {
+  position: sticky;
+  bottom: 0;
+  padding: var(--s) 0 max(var(--s2), env(safe-area-inset-bottom));
+  background: var(--chat-bg);
+}
+
+.composer {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--s);
+  padding: var(--s) var(--s) var(--s) var(--s2);
+  border: 1px solid var(--chat-border);
+  border-radius: var(--radius-xl);
+  background: var(--chat-surface);
+}
+
+.composer-input {
+  flex: 1;
+  min-height: var(--s4);
+  max-height: 10rem;
+  resize: vertical;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--chat-ink);
+  font: inherit;
+}
+
+.send-button {
+  width: var(--s4);
+  height: var(--s4);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: var(--chat-accent);
+  color: var(--c-contrast);
+  font-size: var(--font-size-xl);
+}
+
+.send-button:disabled,
+.composer-input:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.composer-note {
+  text-align: center;
+}
+
+@media (max-width: 600px) {
+  .assistant-chat {
+    padding: 0 var(--s2);
+  }
+
+  .chat-heading {
+    min-height: var(--s8);
+  }
+
+  .connection-card {
+    margin-top: var(--s3);
+    padding: var(--s2);
+  }
+}

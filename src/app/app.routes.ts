@@ -13,6 +13,15 @@ import {
 import { TagTaskPageComponent } from './pages/tag-task-page/tag-task-page.component';
 
 export const APP_ROUTES: Routes = [
+  {
+    path: 'assistant',
+    loadComponent: () =>
+      import('./features/assistant-chat/assistant-chat.component').then(
+        (m) => m.AssistantChatComponent,
+      ),
+    data: { page: 'assistant', chatShell: true },
+    canActivate: [FocusOverlayOpenGuard],
+  },
   // Eagerly loaded — this is the main view
   {
     path: 'tag/:id/tasks',

@@ -45,6 +45,7 @@
 - [[3.07-Issue-Integration-Comparison]]
 - [[3.08-Sync-Integration-Comparison]]
 - [[3.09-Theming]]
+- [[3.10-Assistant-Chat]]
 
 ## [[4.00-Concepts]]
 

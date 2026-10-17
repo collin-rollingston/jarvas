@@ -82,6 +82,17 @@ async function getPlugins() {
     skipCopy: true,
   });
 
+  // The first-party chat UI is a local custom-element bundle, not an optional plugin.
+  plugins.push({
+    name: 'assistant-chat-ui',
+    path: 'packages/plugin-dev/assistant-chat-ui',
+    buildCommand: 'npm run build',
+    sourcePath: 'dist',
+    targetPath: 'src/assets/bundled-plugins/assistant-chat-ui',
+    files: ['assistant-chat-ui.js'],
+    requiredFiles: ['assistant-chat-ui.js'],
+  });
+
   for (const entry of entries) {
     if (entry.isDirectory()) {
       const pluginPath = path.join(pluginDevDir, entry.name);
@@ -94,7 +105,8 @@ async function getPlugins() {
         // Skip boilerplate and the issue-provider helper (bundled into plugins)
         if (
           entry.name === 'boilerplate-solid-js' ||
-          entry.name === 'issue-provider-kit'
+          entry.name === 'issue-provider-kit' ||
+          entry.name === 'assistant-chat-ui'
         ) {
           continue;
         }
@@ -204,7 +216,8 @@ async function buildPlugin(plugin) {
 
     // Copy files to assets if not skipped
     if (!plugin.skipCopy) {
-      const targetDir = path.join('src/assets/bundled-plugins', plugin.name);
+      const targetDir =
+        plugin.targetPath || path.join('src/assets/bundled-plugins', plugin.name);
       await fs.rm(targetDir, { recursive: true, force: true });
       await ensureDir(targetDir);
 
@@ -280,11 +293,22 @@ async function buildPlugin(plugin) {
   }
 }
 
-async function buildAll() {
-  log('🚀 Building all packages...', colors.bright);
+async function buildAll(onlyPluginName) {
+  log(
+    onlyPluginName
+      ? `🚀 Building package ${onlyPluginName}...`
+      : '🚀 Building all packages...',
+    colors.bright,
+  );
   const startTime = Date.now();
 
-  const plugins = await getPlugins();
+  const allPlugins = await getPlugins();
+  const plugins = onlyPluginName
+    ? allPlugins.filter((plugin) => plugin.name === onlyPluginName)
+    : allPlugins;
+  if (onlyPluginName && !plugins.length) {
+    throw new Error(`Unknown package requested for build: ${onlyPluginName}`);
+  }
 
   // Build plugins sequentially to avoid conflicts
   const results = [];
@@ -327,7 +351,9 @@ async function buildAll() {
 
 // Run if called directly
 if (require.main === module) {
-  buildAll().catch((error) => {
+  const onlyArgIndex = process.argv.indexOf('--only');
+  const onlyPluginName = onlyArgIndex >= 0 ? process.argv[onlyArgIndex + 1] : undefined;
+  buildAll(onlyPluginName).catch((error) => {
     log(`\n❌ Build failed: ${error.message}`, colors.red);
     process.exit(1);
   });

@@ -14,6 +14,25 @@
   min-height: -webkit-fill-available;
 }
 
+.app-container.is-assistant-chat {
+  .main-content {
+    padding-bottom: 0;
+  }
+
+  magic-side-nav {
+    display: none;
+  }
+
+  .route-wrapper {
+    overflow: hidden;
+  }
+}
+
+:host ::ng-deep .app-container.is-assistant-chat right-panel {
+  flex: 1;
+  width: 100%;
+}
+
 // Vertical action bar (opt-in via misc.isVerticalActionBar): reserve a
 // column on the right for the fixed action strip teleported by main-header
 // (desktop only). The strip is position: fixed, so this padding keeps the

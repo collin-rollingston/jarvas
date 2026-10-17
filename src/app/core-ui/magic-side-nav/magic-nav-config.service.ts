@@ -401,7 +401,15 @@ export class MagicNavConfigService {
   }
 
   private _buildMainRoutesItems(): NavItem[] {
-    const items: NavItem[] = [];
+    const items: NavItem[] = [
+      {
+        type: 'route',
+        id: 'assistant',
+        label: T.AUI.NAV_LABEL,
+        icon: 'chat',
+        route: '/assistant',
+      },
+    ];
 
     if (this.isPlannerEnabled()) {
       items.push({
